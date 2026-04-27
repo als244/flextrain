@@ -170,6 +170,7 @@ class ActiveModel:
     scratch: ScratchPool = field(init=False)
     step_count: int = 0
     _zero_grad: bool = True  # True at round 0 of each step; False after first round.
+    _is_first_plan: bool = True  # mirrors orig's ``is_first`` (orig:533).
 
     def __post_init__(self) -> None:
         device = torch.device(self.device)
@@ -786,10 +787,14 @@ class ActiveModel:
         n_home_act_slots = max(0, total_pairs - n_gpu_act_slots)
 
         if n_home_act_slots == 0:
-            return SaveLevelPlan.all_on_device(
+            plan = SaveLevelPlan.all_on_device(
                 layer_ids=[layer.layer_id for layer in self.backbone],
                 chunk_ids=[c.id for c in prepared.chunks],
             )
+            if self._is_first_plan:
+                self._log_plan_summary(prepared, plan)
+                self._is_first_plan = False
+            return plan
 
         # Run DP via the same C solver orig uses.
         tables = build_dp_tables(
@@ -817,12 +822,16 @@ class ActiveModel:
             n_gpu_act_slots,
         )
 
+        total_round_tokens = sum(c.meta.total_q for c in prepared.chunks)
         plan = plan_from_solution(
             tables,
             choices,
             n_gpu_act_slots,
             min_required_recompute_time_ms=min_required_ms,
             max_optional_recompute_time_avoided_ms=max_achievable,
+            host_act_buffer_size=self.working_set.host_act_buffer_size,
+            max_total_round_tokens=self.working_set.max_total_round_tokens,
+            total_round_tokens=total_round_tokens,
         )
 
         # Optional override: force every pair to a fixed tier (debug).
@@ -843,6 +852,13 @@ class ActiveModel:
                 estimated_recompute_time_ms=plan.estimated_recompute_time_ms,
                 estimated_fwd_time_ms=plan.estimated_fwd_time_ms,
             )
+
+        # Mirror orig:812-816: log the final (post-demotion) plan once per
+        # ActiveModel lifetime. Subsequent rounds are gated on the caller's
+        # ``verbose`` flag via ``_log_round``.
+        if self._is_first_plan:
+            self._log_plan_summary(prepared, plan)
+            self._is_first_plan = False
 
         return plan
 
@@ -1551,6 +1567,44 @@ class ActiveModel:
     # ==================================================================
     # Logging
     # ==================================================================
+
+    def _log_plan_summary(
+        self, prepared: PreparedRound, plan: SaveLevelPlan
+    ) -> None:
+        """One-shot summary of the first round's save-level plan.
+
+        Mirrors orig's first-round verbose block (orig/active_model.py:812-816)
+        plus the host-buffer accounting at orig:773-776. Logs the per-tier
+        (layer, chunk) breakdown, total host-bytes saved, and the final
+        recompute fraction.
+        """
+        tiers: dict[int, int] = {}
+        host_bytes = 0
+        # Walk in indexing order so we can re-derive home-size from the
+        # schema without a second DP-table build.
+        for layer in self.backbone:
+            for chunk in prepared.chunks:
+                lvl = plan.level_for(layer.layer_id, chunk.id)
+                tiers[lvl.value] = tiers.get(lvl.value, 0) + 1
+                if lvl.value >= 0:
+                    host_bytes += layer.schema.home_size_bytes(
+                        chunk.meta.total_q, self.dims, lvl.value
+                    )
+        breakdown = ", ".join(
+            f"level {k}: {v}"
+            for k, v in sorted(tiers.items(), key=lambda kv: -kv[0])
+        )
+        print(
+            f"[Save Level Plan] "
+            f"{len(prepared.chunks)} chunks x {len(self.backbone)} layers; "
+            f"breakdown: {breakdown}. "
+            f"Host act bytes saved: {host_bytes / (1 << 30):.2f}GiB / "
+            f"{self.working_set.host_act_buffer_size / (1 << 30):.2f}GiB. "
+            f"Final Recompute Time: {plan.estimated_recompute_time_ms:.2f}ms / "
+            f"{plan.estimated_fwd_time_ms:.2f}ms, "
+            f"Final Recompute Frac: {plan.recompute_fraction:.4f}",
+            flush=True,
+        )
 
     def _log_round(
         self,
