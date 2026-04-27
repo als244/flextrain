@@ -1,0 +1,26 @@
+[
+  {
+    "instruction": "Add 17 and 25.",
+    "output": "42"
+  },
+  {
+    "instruction": "What is 9 multiplied by 8?",
+    "output": "72"
+  },
+  {
+    "instruction": "Solve for x: x + 6 = 15.",
+    "output": "x = 9"
+  },
+  {
+    "instruction": "Convert one half to a decimal.",
+    "output": "0.5"
+  },
+  {
+    "instruction": "A triangle has angles 50 and 60 degrees. What is the third angle?",
+    "output": "70 degrees"
+  },
+  {
+    "instruction": "What is the square root of 144?",
+    "output": "12"
+  }
+]

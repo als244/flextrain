@@ -12,6 +12,7 @@ Runs CPU-only; no CUDA required.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 
@@ -24,6 +25,7 @@ if ROOT not in sys.path:
 
 from flextrain.io.sources import (  # noqa: E402
     CustomSchemaTokenSource,
+    JsonSFTTokenSource,
     RawTokenSource,
     ShardTokenSource,
     SyntheticTokenSource,
@@ -72,6 +74,65 @@ def test_raw_source_iter() -> None:
     got = list(source.iter_sequences())
     assert len(got) == 3
     assert all(len(s) == 16 for s in got)
+
+
+# ---------------------------------------------------------------------------
+# JsonSFTTokenSource
+# ---------------------------------------------------------------------------
+
+
+class _FakeTokenizer:
+    eos_token_id = 99
+
+    def encode(self, text: str, add_special_tokens: bool = False):
+        del add_special_tokens
+        return [10 + (ord(ch) % 17) for ch in text]
+
+
+def test_json_sft_source_builds_prompt_masked_sequences() -> None:
+    import tempfile
+
+    records = [
+        {"instruction": "Add 2 and 2.", "output": "4"},
+        {"instruction": "Name a primary color.", "input": "One word.", "output": "red"},
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "tiny.json")
+        with open(path, "w") as f:
+            json.dump(records, f)
+        source = JsonSFTTokenSource(
+            path,
+            tokenizer=_FakeTokenizer(),
+            min_seq_len=8,
+            max_seq_len=128,
+            loop=False,
+        )
+        batch = source.get_sequences(max_token_count=1024)
+        assert len(batch) == 2
+        assert batch[0].loss_mask is not None
+        assert bool(batch[0].loss_mask[0].item()) is False
+        assert bool(batch[0].loss_mask[-1].item()) is False
+        assert bool(batch[0].loss_mask.any().item()) is True
+
+
+def test_json_sft_source_loops_for_small_datasets() -> None:
+    import tempfile
+
+    records = [{"instruction": "Ping?", "output": "Pong."}]
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "tiny.jsonl")
+        with open(path, "w") as f:
+            for rec in records:
+                f.write(json.dumps(rec) + "\n")
+        source = JsonSFTTokenSource(
+            path,
+            tokenizer=_FakeTokenizer(),
+            min_seq_len=4,
+            max_seq_len=64,
+            loop=True,
+        )
+        batch = source.get_sequences(max_token_count=40)
+        assert len(batch) >= 2
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +285,10 @@ def _run_all() -> None:
         ("test_raw_source_iter", test_raw_source_iter),
         ("test_synthetic_source_deterministic",
          test_synthetic_source_deterministic),
+        ("test_json_sft_source_builds_prompt_masked_sequences",
+         test_json_sft_source_builds_prompt_masked_sequences),
+        ("test_json_sft_source_loops_for_small_datasets",
+         test_json_sft_source_loops_for_small_datasets),
         ("test_synthetic_source_cycles_lengths",
          test_synthetic_source_cycles_lengths),
         ("test_shard_source_parses_fake_shard",

@@ -17,6 +17,8 @@ Built-in adapters
 * :class:`RawTokenSource` — user hands us pre-tokenized tensors
   directly. Skip tokenization entirely. For benchmarking or custom
   pipelines.
+* :class:`JsonSFTTokenSource` — local JSON / JSONL instruction-tuning
+  records with prompt-masked loss.
 * :class:`SyntheticTokenSource` — random token ids at caller-given
   sequence lengths. For benchmarking throughput / scheduling
   without real data.
@@ -57,6 +59,7 @@ error messages.
 
 from __future__ import annotations
 
+import json
 import glob
 import os
 from dataclasses import dataclass
@@ -183,6 +186,163 @@ class RawTokenSource:
             out.append(self._make_seq(e))
             total += len(e.tokens)
             self._cursor += 1
+        return out
+
+
+# ---------------------------------------------------------------------------
+# JsonSFTTokenSource: local instruction/output JSON with prompt masking.
+# ---------------------------------------------------------------------------
+
+
+class JsonSFTTokenSource:
+    """Local JSON / JSONL supervised fine-tuning data."""
+
+    def __init__(
+        self,
+        path: str,
+        *,
+        tokenizer: str | Any,
+        prompt_field: str = "instruction",
+        response_field: str = "output",
+        input_field: str | None = "input",
+        min_seq_len: int = 32,
+        max_seq_len: int = 2048,
+        loop: bool = True,
+        trust_remote_code: bool = False,
+    ) -> None:
+        self.path = path
+        self.prompt_field = prompt_field
+        self.response_field = response_field
+        self.input_field = input_field
+        self.min_seq_len = min_seq_len
+        self.max_seq_len = max_seq_len
+        self.loop = loop
+        if isinstance(tokenizer, str):
+            try:
+                from transformers import AutoTokenizer  # type: ignore[import-not-found]
+            except ImportError as e:  # pragma: no cover
+                raise ImportError(
+                    "JsonSFTTokenSource needs `transformers`. "
+                    "Install via `pip install transformers`."
+                ) from e
+            self._tok = AutoTokenizer.from_pretrained(
+                tokenizer, trust_remote_code=trust_remote_code,
+            )
+        else:
+            self._tok = tokenizer
+        self._records = self._load_records(path)
+        self._cursor = 0
+
+    @staticmethod
+    def _load_records(path: str) -> list[dict[str, Any]]:
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"JSON SFT file not found: {path}")
+        if path.endswith(".jsonl"):
+            out = []
+            with open(path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    out.append(json.loads(line))
+            return out
+        with open(path) as f:
+            payload = json.load(f)
+        if not isinstance(payload, list):
+            raise ValueError(
+                f"expected a list of records in {path!r}, got {type(payload).__name__}"
+            )
+        return payload
+
+    def reset(self) -> None:
+        self._cursor = 0
+
+    def _build_prompt(self, rec: dict[str, Any]) -> tuple[str, str] | None:
+        prompt = str(rec.get(self.prompt_field, "") or "").strip()
+        response = str(rec.get(self.response_field, "") or "").strip()
+        extra = ""
+        if self.input_field:
+            extra = str(rec.get(self.input_field, "") or "").strip()
+        if not prompt or not response:
+            return None
+        if extra:
+            prompt_text = (
+                f"Instruction:\n{prompt}\n\n"
+                f"Input:\n{extra}\n\n"
+                f"Response:\n"
+            )
+        else:
+            prompt_text = f"Instruction:\n{prompt}\n\nResponse:\n"
+        return prompt_text, response
+
+    def _next_seq(self) -> Sequence | None:
+        if not self._records:
+            return None
+        while True:
+            if self._cursor >= len(self._records):
+                if not self.loop:
+                    return None
+                self._cursor = 0
+            idx = self._cursor
+            rec = self._records[idx]
+            self._cursor += 1
+            prompt_and_response = self._build_prompt(rec)
+            if prompt_and_response is None:
+                continue
+            prompt_text, response_text = prompt_and_response
+            prompt_ids = self._tok.encode(prompt_text, add_special_tokens=False)
+            response_ids = self._tok.encode(response_text, add_special_tokens=False)
+            eos_id = getattr(self._tok, "eos_token_id", None)
+            if eos_id is not None:
+                response_ids = response_ids + [int(eos_id)]
+            if not response_ids:
+                continue
+            if len(prompt_ids) >= self.max_seq_len:
+                continue
+            room = self.max_seq_len - len(prompt_ids)
+            if room <= 1:
+                continue
+            response_ids = response_ids[:room]
+            token_ids = prompt_ids + response_ids
+            if len(token_ids) < self.min_seq_len:
+                continue
+
+            tokens = torch.tensor(token_ids, dtype=torch.int64)
+            targets = torch.roll(tokens, -1)
+            loss_mask = torch.ones(len(tokens), dtype=torch.bool)
+            loss_mask[: len(prompt_ids)] = False
+            loss_mask[-1] = False
+            if not bool(loss_mask.any().item()):
+                continue
+            return Sequence(
+                tokens=tokens,
+                targets=targets,
+                loss_mask=loss_mask,
+                seq_id=idx,
+            )
+
+    def iter_sequences(self) -> Iterator[Sequence]:
+        while True:
+            seq = self._next_seq()
+            if seq is None:
+                return
+            yield seq
+
+    def get_sequences(self, max_token_count: int) -> list[Sequence]:
+        out: list[Sequence] = []
+        total = 0
+        while True:
+            seq = self._next_seq()
+            if seq is None:
+                break
+            if out and total + len(seq) > max_token_count:
+                out.append(seq)
+                total += len(seq)
+                break
+            out.append(seq)
+            total += len(seq)
+            if total >= max_token_count:
+                break
         return out
 
 
@@ -636,6 +796,7 @@ class HFTokenSource:
 __all__ = [
     "CustomSchemaTokenSource",
     "HFTokenSource",
+    "JsonSFTTokenSource",
     "RawTokenSource",
     "ShardTokenSource",
     "SyntheticTokenSource",

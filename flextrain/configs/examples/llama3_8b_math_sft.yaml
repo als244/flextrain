@@ -1,0 +1,49 @@
+# Real-checkpoint SFT example using the bundled sample dataset.
+# Point `hf_checkpoint` at a local HF model directory and run:
+#
+#   python -m flextrain train flextrain/configs/examples/llama3_8b_math_sft.yaml
+
+model:
+  arch: llama
+  vocab_size: 128256
+  n_layers: 32
+  d_model: 4096
+  n_heads: 32
+  n_kv_heads: 8
+  head_dim: 128
+  expert_dim: 14336
+  rms_norm_eps: 0.00001
+  rope_theta: 500000.0
+  is_causal: true
+
+train:
+  global_batch_tokens: 2048
+  max_seq_len: 1024
+  total_steps: 20
+  warmup_pct: 0.1
+  cooldown_pct: 0.2
+  final_lr_fraction: 0.1
+  optimizer:
+    kind: adamw
+    lr: 0.00003
+    beta1: 0.9
+    beta2: 0.95
+    eps: 0.00000001
+    weight_decay: 0.0
+
+hardware:
+  device_id: 0
+  max_gpu_mem_gib: 24.0
+  max_host_mem_gib: 110.0
+  leeway_gpu_mem_gib: 2.0
+  leeway_host_mem_gib: 10.0
+
+io:
+  hf_checkpoint: models/Llama-3-8B
+  hf_repo_id: meta-llama/Meta-Llama-3-8B
+  tokenizer: models/Llama-3-8B
+  output_dir: runs/llama3_8b_math_sft
+  data:
+    json_sft_path: data/tiny_math_sft.json
+    min_seq_len: 32
+    max_seq_len: 1024

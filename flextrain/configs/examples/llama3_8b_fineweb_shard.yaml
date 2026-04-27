@@ -40,8 +40,9 @@ hardware:
   leeway_host_mem_gib: 10.0
 
 io:
-  hf_checkpoint: meta-llama/Meta-Llama-3-8B
-  tokenizer: meta-llama/Meta-Llama-3-8B
+  hf_checkpoint: models/Llama-3-8B
+  hf_repo_id: meta-llama/Meta-Llama-3-8B
+  tokenizer: models/Llama-3-8B
   output_dir: runs/llama3_8b_fineweb
   data:
     shard_pattern: "orig/fineweb/fineweb_train_{shard_index:06d}.bin"

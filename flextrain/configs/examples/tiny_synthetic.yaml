@@ -1,5 +1,5 @@
-# Smallest runnable config — for smoke-testing the full CLI path.
-# Uses SyntheticTokenSource (no real data required).
+# Smallest runnable config for the README quickstart.
+# Uses SyntheticTokenSource with a caller-controlled fixed seq len.
 
 model:
   arch: llama
@@ -36,6 +36,8 @@ hardware:
 
 io:
   output_dir: runs/tiny_synthetic
+  save_final_checkpoint: false
+  # save_final_checkpoint: true
   data:
     synthetic: true
     synthetic_seq_len: 512

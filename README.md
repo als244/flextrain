@@ -61,15 +61,124 @@ available and silently falls back otherwise.
 If you need to skip the helper builds (e.g. iterating on Python-only
 changes), set `FLEXTRAIN_SKIP_HELPERS=1` before running `pip install`.
 
-## Quickstart: fine-tune from a HF checkpoint
+## Quickstart
 
-The recommended entry point is `flextrain.from_pretrained` — point it
-at any HF model directory and it builds the engine, picks a working-set
-config that fits your hardware, loads weights, and applies any
-arch-specific fixups. By default it sets up **full fine-tuning**;
-add `lora_targets="all"` for LoRA.
+The shortest first run is the top-level `train.py` entrypoint, where the
+user picks:
 
-### Full fine-tuning
+```bash
+python train.py \
+  --model models/Llama-3.1-8B \
+  --mode lora \
+  --seq-len 1024 \
+  --global-batch-tokens 1024
+```
+
+That gives you:
+
+* a real HF checkpoint
+* one explicit choice between `full` and `lora`
+* a real SFT run on the bundled sample dataset
+* per-step logging for loss, tok/s, and memory
+* no final checkpoint export unless you add `--save`
+* explicit setup logs before the first training step
+
+By default this command:
+
+* uses `flextrain/configs/examples/data/tiny_math_sft.json`
+* downloads the model into `models/` if needed
+* runs 20 steps
+* writes logs under `runs/<model>_<mode>_sl<seq_len>`
+
+To train on synthetic tokens instead, switch the data source:
+
+```bash
+python train.py \
+  --model models/Llama-3.1-8B \
+  --mode lora \
+  --seq-len 1024 \
+  --global-batch-tokens 1024 \
+  --data-source synthetic
+```
+
+`--synthetic-seq-len` is optional; if omitted it defaults to `--seq-len`.
+
+To train on your own dataset, keep using `--dataset`. If the file exists
+locally, FlexTrain uses it directly. If it does not exist, FlexTrain
+first tries to download/materialize it and then trains from the local
+JSONL it creates:
+
+```bash
+python train.py \
+  --model models/Llama-3.1-8B \
+  --mode lora \
+  --seq-len 1024 \
+  --global-batch-tokens 1024 \
+  --dataset open-r1/OpenR1-Math-220k
+```
+
+That download path is meant for SFT-style datasets. It normalizes common
+schemas like `instruction/output`, `prompt/completion`,
+`question/answer`, and chat-style `messages` into a local JSONL before
+training.
+
+Examples:
+
+```bash
+# Full fine-tuning
+python train.py \
+  --model models/Llama-3.1-8B \
+  --mode full \
+  --seq-len 1024 \
+  --global-batch-tokens 1024
+
+# LoRA fine-tuning
+python train.py \
+  --model models/Llama-3.1-8B \
+  --mode lora \
+  --seq-len 2048 \
+  --global-batch-tokens 2048
+```
+
+You should see setup messages like:
+
+* `Preparing model from ...`
+* `Model is ready. Building tokenizer-backed SFT data source...`
+* `Starting training loop: ...`
+
+After that, the first training step can still take a while on large
+models before the first `[step ...]` line appears.
+
+### YAML Path
+
+If you want the fully explicit YAML-driven path, use:
+
+```bash
+python -m flextrain train flextrain/configs/examples/llama3_8b_math_sft.yaml
+```
+
+### Fine-tune a local HF checkpoint
+
+If you already have a local HF model directory, the shortest path is:
+
+```bash
+python train.py \
+  --model /path/to/your/model \
+  --mode lora \
+  --seq-len 1024 \
+  --global-batch-tokens 1024
+```
+
+You can still switch to a custom dataset with `--dataset path/to/data.json`.
+If that path does not exist, FlexTrain treats `--dataset` as a dataset
+spec and materializes it first.
+
+### Python API
+
+For programmatic use, the recommended entry point is
+`flextrain.from_pretrained`. It reads a local HF model directory,
+builds the engine, picks a working-set config that fits your hardware,
+loads weights, and applies any arch-specific fixups.
 
 ```python
 import torch
@@ -88,31 +197,6 @@ am = from_pretrained(
     device="cuda:0",
 )
 
-for batch in your_dataloader:                  # see docs/dataset.md
-    seqs = [_Seq(s.tokens) for s in batch]
-    for d, s in zip(seqs, batch):
-        d.targets = s.targets
-    loss = _flextrain_step(am, seqs)
-```
-
-### LoRA fine-tuning
-
-```python
-opt = AdamW(
-    AdamWHyperparams(lr=1e-4, beta1=0.9, beta2=0.95, weight_decay=0.0),
-    state_dtype=torch.float32,
-)
-am = from_pretrained(
-    "models/Llama-3.1-8B",
-    optimizer=opt,
-    max_seq_len=1024, max_global_batch_tokens=1024,
-    max_gpu_mem_bytes=int(24 * (1 << 30)),
-    max_host_mem_bytes=int(110 * (1 << 30)),
-    device="cuda:0",
-    lora_targets="all", lora_rank=16, lora_alpha=16.0,
-)
-# from_pretrained has already initialized LoRA (A ~ N(0, 0.02), B = 0)
-# so the model starts at base behavior; just train.
 for batch in your_dataloader:
     seqs = [_Seq(s.tokens) for s in batch]
     for d, s in zip(seqs, batch):
@@ -120,13 +204,9 @@ for batch in your_dataloader:
     loss = _flextrain_step(am, seqs)
 ```
 
-Under the hood `from_pretrained` reads `config.json`, looks up the
-registered architecture, plumbs through everything that needs
-arch-specific handling (RoPE scaling for Llama 3.1+ YARN, Q/K
-halved→pair permutation, tied embeddings on small Llama-3.2
-variants, …), and hands you a configured engine. To use a
-pre-built `LlamaBlockConfig` directly instead, see
-[docs/implementing.md](docs/implementing.md).
+For LoRA, add `lora_targets="all"` (and optionally `lora_rank`,
+`lora_alpha`). `from_pretrained` initializes LoRA so the model starts
+at base behavior before the first update.
 
 ## Documentation
 
@@ -135,7 +215,7 @@ pre-built `LlamaBlockConfig` directly instead, see
 * [SFT vs pretraining](docs/sft_vs_pretraining.md) — how the two flows
   differ in `seq.targets` masking, weight init, hyperparams.
 * [Dataset format](docs/dataset.md) — token / target / loss-mask
-  conventions and how to plug in your own data.
+  conventions, plus the built-in local JSON SFT source.
 * [Weight I/O](docs/weights.md) — HF safetensors load / save, custom
   arch specs, expert-stacking hooks, post-load weight permutations.
 * [LoRA fine-tuning](docs/lora.md) — `LoRAWrapperLayer` API, MoE

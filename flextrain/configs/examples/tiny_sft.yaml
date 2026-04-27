@@ -1,0 +1,48 @@
+# Smallest real SFT config.
+# Uses a bundled instruction dataset and a public tokenizer, so users can
+# verify prompt-masked fine-tuning without preparing any data first.
+#
+# Usage:
+#   python -m flextrain train flextrain/configs/examples/tiny_sft.yaml
+
+model:
+  arch: llama
+  vocab_size: 50257
+  n_layers: 2
+  d_model: 128
+  n_heads: 4
+  n_kv_heads: 2
+  head_dim: 32
+  expert_dim: 256
+  rms_norm_eps: 0.00001
+  rope_theta: 10000.0
+  is_causal: true
+
+train:
+  global_batch_tokens: 512
+  max_seq_len: 256
+  total_steps: 8
+  warmup_pct: 0.2
+  cooldown_pct: 0.2
+  final_lr_fraction: 0.1
+  optimizer:
+    kind: adamw
+    lr: 0.001
+    beta1: 0.9
+    beta2: 0.95
+    eps: 0.00000001
+    weight_decay: 0.0
+
+hardware:
+  device_id: 0
+  max_gpu_mem_gib: 4.0
+  leeway_gpu_mem_gib: 1.0
+
+io:
+  tokenizer: gpt2
+  output_dir: runs/tiny_sft
+  data:
+    json_sft_path: data/tiny_math_sft.json
+    min_seq_len: 32
+    max_seq_len: 256
+

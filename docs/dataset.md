@@ -80,6 +80,50 @@ does for the MathInstruct dataset.
 There's a couple of starting points you can copy, depending on the
 data format you have:
 
+### Bundled local JSON SFT source
+
+For the common "instruction/output JSON file" case, the CLI now has a
+built-in adapter. Point `io.data.json_sft_path` at a local `.json` or
+`.jsonl` file and set `io.tokenizer` to the tokenizer you want to use.
+
+```yaml
+io:
+  tokenizer: gpt2
+  data:
+    json_sft_path: path/to/data.json
+    json_sft_prompt_field: instruction
+    json_sft_response_field: output
+    json_sft_input_field: input
+```
+
+Each record is tokenized as prompt + response, and the prompt tokens are
+masked out of the loss automatically.
+
+### Auto-materialized datasets via `train.py`
+
+The top-level `train.py` entrypoint keeps a single `--dataset` flag.
+If the path exists locally, it uses that JSON / JSONL file directly.
+If it does not exist, FlexTrain first tries to materialize it into a
+local JSONL file and then trains from that file:
+
+```bash
+python train.py \
+  --model models/Llama-3.1-8B \
+  --mode lora \
+  --seq-len 1024 \
+  --global-batch-tokens 1024 \
+  --dataset open-r1/OpenR1-Math-220k
+```
+
+Today that materialization path is aimed at supervised fine-tuning
+datasets. It recognizes common schemas such as:
+
+* `instruction` / `output` (+ optional `input`)
+* `prompt` / `completion`
+* `prompt` / `response`
+* `question` / `answer` (+ optional `context`)
+* chat-style `messages` / `conversations`
+
 ### Pre-tokenized binary shards (FineWeb-style)
 
 `flextrain/bench/parity.py:FineWebDocStream` yields sequences from

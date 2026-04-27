@@ -111,7 +111,7 @@ class DataConfig:
     """Token-source selection.
 
     Exactly one of ``hf_dataset`` / ``shard_pattern`` / ``synthetic``
-    / ``raw`` / ``custom`` should be set. See
+    / ``raw`` / ``custom`` / ``json_sft_path`` should be set. See
     :mod:`flextrain.io.sources` for the adapter classes.
     """
 
@@ -138,6 +138,16 @@ class DataConfig:
     # containing a list[Tensor] or a dict with tokens/targets/loss_mask.
     raw_path: str | None = None
 
+    # Local JSON / JSONL supervised fine-tuning records. Each record is
+    # expected to have a prompt-ish field (default ``instruction``) and a
+    # response field (default ``output``). We tokenize prompt and response
+    # separately, then mask loss on the prompt tokens.
+    json_sft_path: str | None = None
+    json_sft_prompt_field: str = "instruction"
+    json_sft_response_field: str = "output"
+    json_sft_input_field: str | None = "input"
+    json_sft_loop: bool = True
+
     # Custom-schema extractor -- point at a Python module:callable pair
     # that returns (Iterable[record], extract_fn). Opt-in since it
     # loads arbitrary code.
@@ -151,8 +161,11 @@ class DataConfig:
 @dataclass(frozen=True)
 class IOConfig:
     hf_checkpoint: str | None = None  # e.g. "meta-llama/Llama-3-8B" or local path
+    hf_repo_id: str | None = None  # e.g. "meta-llama/Meta-Llama-3-8B"
+    hf_revision: str | None = None
     tokenizer: str | None = None  # HF tokenizer id; defaults to hf_checkpoint
     output_dir: str = "runs/flextrain"
+    save_final_checkpoint: bool = True
     # Native FlexTrain checkpoint to resume from (takes precedence over
     # hf_checkpoint when both set).
     resume_from: str | None = None

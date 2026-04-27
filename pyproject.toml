@@ -11,6 +11,8 @@ dependencies = [
     "torch>=2.5",
     "triton>=3.0",
     "numpy",
+    "datasets",
+    "pyyaml",
     "safetensors",
     "transformers",
     "accelerate",
