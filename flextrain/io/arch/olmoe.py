@@ -1,0 +1,339 @@
+"""OLMoE-1B-7B HF <-> FlexTrain mapping.
+
+OLMoE (AllenAI) is a dense-attention + MoE-FFN architecture:
+* GQA attention (but n_heads == n_kv_heads in OLMoE-1B-7B, so effectively MHA).
+* No QK-norm, no attention biases.
+* MoE SwiGLU FFN: 64 experts, top-k=8, intermediate_size=1024.
+* RoPE base 10_000 (Llama-2 style, not Llama-3), no rope_scaling.
+* No tied embeddings (the small 1B variant has distinct embed and lm_head).
+* Load-balance aux loss coef = 0.01.
+
+HF MoE weight layout vs FlexTrain's stacked ``w_up (E, d, 2*F)`` /
+``w_down (E, F, d)``:
+
+* HF:   ``model.layers.{L}.mlp.gate.weight``           — (E, d)    router
+        ``model.layers.{L}.mlp.experts.{E}.gate_proj`` — (F, d)    per-expert gate (x1)
+        ``model.layers.{L}.mlp.experts.{E}.up_proj``   — (F, d)    per-expert value (x3)
+        ``model.layers.{L}.mlp.experts.{E}.down_proj`` — (d, F)    per-expert down
+* FT:   ``w_router (d, E)``  — HF gate transposed.
+        ``w_up (E, d, 2F)``  — per expert the packed layout is [x3, x1]
+                              (value first, gate second) to match the
+                              orig swiglu_moe kernel convention:
+                              ``concat([up.T, gate.T], dim=1)``.
+        ``w_down (E, F, d)`` — per expert: down_proj.T.
+
+The ``post_load_hook`` iterates experts, reads the four per-expert HF
+tensors, transposes+stacks them into FT's layout, and writes into
+``dest[("layer_{L}", "w_up")]`` / ``dest[("layer_{L}", "w_down")]``.
+The ArchSpec proper handles the non-MoE parts via regular
+``WeightMapEntry`` declarations.
+"""
+from __future__ import annotations
+
+import os
+from typing import Any, Mapping
+
+import torch
+from safetensors import safe_open
+
+from ..hf_weights import ArchSpec, Transform, WeightMapEntry, register_arch
+
+
+def _olmoe_post_load_hook(
+    hf_path: str, dest: Mapping, num_layers: int,
+) -> None:
+    """Stack per-expert HF tensors into FT's ``w_up``/``w_down``."""
+    # Determine num_experts from the shape of w_up in dest (first layer).
+    sample_w_up = dest.get(("layer_0", "w_up"))
+    if sample_w_up is None:
+        # Model has no MoE layers declared — nothing to do.
+        return
+    E, D, TwoF = sample_w_up.shape
+    F = TwoF // 2
+    sample_w_down = dest[("layer_0", "w_down")]
+    assert sample_w_down.shape == (E, F, D), (
+        f"w_down shape mismatch: expected ({E}, {F}, {D}), "
+        f"got {tuple(sample_w_down.shape)}"
+    )
+
+    # Build index of shards (single or multi-file).
+    idx_path = os.path.join(hf_path, "model.safetensors.index.json")
+    if os.path.isfile(idx_path):
+        import json
+        with open(idx_path) as f:
+            file_index = json.load(f)["weight_map"]
+    else:
+        # Single shard: every tensor is in model.safetensors.
+        single = os.path.join(hf_path, "model.safetensors")
+        if not os.path.isfile(single):
+            raise FileNotFoundError(
+                f"No safetensors index at {idx_path} and no single file"
+            )
+        file_index = None
+
+    def _open_for(name: str):
+        if file_index is not None:
+            shard = file_index[name]
+            return os.path.join(hf_path, shard)
+        return os.path.join(hf_path, "model.safetensors")
+
+    # Cache open handles per shard to avoid reopening.
+    # Iterate layers × experts, reading each per-expert tensor.
+    for L in range(num_layers):
+        w_up_ft = dest[(f"layer_{L}", "w_up")]
+        w_down_ft = dest[(f"layer_{L}", "w_down")]
+        for e in range(E):
+            gate_name = f"model.layers.{L}.mlp.experts.{e}.gate_proj.weight"
+            up_name = f"model.layers.{L}.mlp.experts.{e}.up_proj.weight"
+            down_name = f"model.layers.{L}.mlp.experts.{e}.down_proj.weight"
+
+            with safe_open(_open_for(gate_name), framework="pt", device="cpu") as f:
+                gate = f.get_tensor(gate_name)  # (F, d)
+            with safe_open(_open_for(up_name), framework="pt", device="cpu") as f:
+                up = f.get_tensor(up_name)      # (F, d)
+            with safe_open(_open_for(down_name), framework="pt", device="cpu") as f:
+                down = f.get_tensor(down_name)  # (d, F)
+
+            # Transpose + stack into w_up[e, :, :] = (d, 2F).
+            # Orig swiglu_moe kernel expects packed [x3, x1] = [value, gate]
+            # → concat([up.T, gate.T], dim=1). x3 (value) in first half,
+            # x1 (gate) in second half.
+            dtype = w_up_ft.dtype
+            gate_t = gate.T.contiguous().to(dtype)  # (d, F) -- x1 (gate)
+            up_t = up.T.contiguous().to(dtype)      # (d, F) -- x3 (value)
+            w_up_ft[e, :, :].copy_(torch.cat([up_t, gate_t], dim=1))
+            # Transpose down into w_down[e, :, :] = (F, d)
+            w_down_ft[e, :, :].copy_(down.T.contiguous().to(dtype))
+
+
+OLMOE_ARCH = ArchSpec(
+    hf_arch_ids=("OlmoeForCausalLM",),
+    embed=(
+        WeightMapEntry(
+            flextrain_name="w_tok_embeddings",
+            hf_name="model.embed_tokens.weight",
+            transform=Transform.NONE,
+        ),
+    ),
+    head=(
+        WeightMapEntry(
+            flextrain_name="w_final_norm",
+            hf_name="model.norm.weight",
+            transform=Transform.NONE,
+        ),
+        WeightMapEntry(
+            flextrain_name="w_head_proj",
+            hf_name="lm_head.weight",
+            transform=Transform.TRANSPOSE,
+        ),
+    ),
+    layer=(
+        WeightMapEntry(
+            flextrain_name="w_attn_norm",
+            hf_name="model.layers.{i}.input_layernorm.weight",
+            transform=Transform.NONE,
+        ),
+        WeightMapEntry(
+            flextrain_name="w_q",
+            hf_name="model.layers.{i}.self_attn.q_proj.weight",
+            transform=Transform.TRANSPOSE,
+        ),
+        WeightMapEntry(
+            flextrain_name="w_k",
+            hf_name="model.layers.{i}.self_attn.k_proj.weight",
+            transform=Transform.TRANSPOSE,
+        ),
+        WeightMapEntry(
+            flextrain_name="w_v",
+            hf_name="model.layers.{i}.self_attn.v_proj.weight",
+            transform=Transform.TRANSPOSE,
+        ),
+        WeightMapEntry(
+            flextrain_name="w_o",
+            hf_name="model.layers.{i}.self_attn.o_proj.weight",
+            transform=Transform.TRANSPOSE,
+        ),
+        # OLMoE: full-dim RMSNorm on Q and K between projection and RoPE.
+        # Weight shapes: (attn_dim,) and (kv_dim,) respectively.
+        WeightMapEntry(
+            flextrain_name="w_q_norm",
+            hf_name="model.layers.{i}.self_attn.q_norm.weight",
+            transform=Transform.NONE,
+        ),
+        WeightMapEntry(
+            flextrain_name="w_k_norm",
+            hf_name="model.layers.{i}.self_attn.k_norm.weight",
+            transform=Transform.NONE,
+        ),
+        WeightMapEntry(
+            flextrain_name="w_ffn_norm",
+            hf_name="model.layers.{i}.post_attention_layernorm.weight",
+            transform=Transform.NONE,
+        ),
+        # MoE router (gate). HF stores as (E, d); FT uses (d, E).
+        WeightMapEntry(
+            flextrain_name="w_router",
+            hf_name="model.layers.{i}.mlp.gate.weight",
+            transform=Transform.TRANSPOSE,
+        ),
+        # NOTE: w_up and w_down are stacked per-expert by the
+        # post_load_hook below. No ArchSpec entry — the engine
+        # allocates empty tensors in dest; the hook populates them.
+    ),
+    post_load_hook=_olmoe_post_load_hook,
+)
+
+register_arch(OLMOE_ARCH)
+
+
+def hf_config_to_flextrain(hf_config: Any) -> dict:
+    """OLMoE ``config.json`` → FlexTrain dims dict."""
+    get = (
+        (lambda k, default=None: getattr(hf_config, k, default))
+        if not isinstance(hf_config, dict)
+        else hf_config.get
+    )
+    n_heads = get("num_attention_heads")
+    hidden = get("hidden_size")
+    head_dim = get("head_dim") or (hidden // n_heads)
+    return {
+        "vocab_size": get("vocab_size"),
+        "n_layers": get("num_hidden_layers"),
+        "d_model": hidden,
+        "n_heads": n_heads,
+        "n_kv_heads": get("num_key_value_heads") or n_heads,
+        "head_dim": head_dim,
+        "expert_dim": get("intermediate_size"),
+        "num_shared_experts": 0,
+        "num_routed_experts": get("num_experts"),
+        "top_k": get("num_experts_per_tok"),
+        "is_causal": True,
+        "datatypes": {
+            "embed": "bfloat16",
+            "head_proj": "bfloat16",
+            "attn_proj": "bfloat16",
+            "expert_proj": "bfloat16",
+            "router": "bfloat16",
+            "norm": "bfloat16",
+            "residual": "bfloat16",
+        },
+    }
+
+
+def hf_config_to_hyperparams(hf_config: Any) -> dict:
+    """Per-layer hyperparams. OLMoE defaults: eps=1e-5, rope=10000."""
+    get = (
+        (lambda k, default=None: getattr(hf_config, k, default))
+        if not isinstance(hf_config, dict)
+        else hf_config.get
+    )
+    norm_topk = bool(get("norm_topk_prob", False))
+    return {
+        "rms_norm_eps": get("rms_norm_eps", 1e-5),
+        "rope_theta": get("rope_theta", 10_000.0),
+        "rope_scaling": get("rope_scaling"),
+        "window_size_left": -1,
+        "window_size_right": 0,
+        "load_balance_coef": get("router_aux_loss_coef", 0.01),
+        "routing_mode": "topk_then_softmax" if norm_topk else "softmax_then_topk",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Block builder + post-load permutation hook for ``flextrain.from_pretrained``.
+# ---------------------------------------------------------------------------
+
+
+def _olmoe_block_builder(layer_idx: int, ctx) -> object:
+    from flextrain.nn.layers.olmoe import OLMoEBlock, OLMoEBlockConfig
+
+    dims = ctx.dims
+    hp = ctx.hyperparams
+    block_cfg = OLMoEBlockConfig(
+        d_model=int(dims["d_model"]),
+        n_heads=int(dims["n_heads"]),
+        n_kv_heads=int(dims["n_kv_heads"]),
+        head_dim=int(dims["head_dim"]),
+        expert_dim=int(dims["expert_dim"]),
+        num_experts=int(dims["num_routed_experts"]),
+        top_k=int(dims["top_k"]),
+        rms_norm_eps=float(hp.get("rms_norm_eps", 1e-5)),
+        rope_base=float(hp.get("rope_theta", 10_000.0)),
+        load_balance_coef=float(hp.get("load_balance_coef", 0.01)),
+        routing_mode=str(hp.get("routing_mode", "softmax_then_topk")),
+        is_causal=True,
+        compute_dtype=ctx.compute_dtype,
+        master_dtype=ctx.master_dtype,
+        grad_dtype=ctx.grad_dtype,
+        norm_grad_dtype=ctx.norm_grad_dtype,
+    )
+    base = OLMoEBlock(layer_id=layer_idx, cfg=block_cfg)
+    if not ctx.lora_targets:
+        return base
+    from flextrain.nn.layers.lora_wrapper import LoRAWrapperLayer
+    return LoRAWrapperLayer(
+        base, lora_targets=ctx.lora_targets,
+        rank=ctx.lora_rank, alpha=ctx.lora_alpha,
+        dims=dict(dims, attn_dim=int(dims["n_heads"]) * int(dims["head_dim"]),
+                  kv_dim=int(dims["n_kv_heads"]) * int(dims["head_dim"])),
+        adapter_compute_dtype=ctx.lora_adapter_compute_dtype,
+        adapter_master_dtype=ctx.lora_adapter_master_dtype,
+        adapter_grad_dtype=ctx.lora_adapter_grad_dtype,
+        adapter_opt_state_dtype=ctx.lora_adapter_opt_state_dtype,
+    )
+
+
+def post_load_permute(am, hf_config, dims, hyperparams):
+    """OLMoE post-load: same Q/K halved→pair perm as Llama, plus the
+    full-row QK-norm 1-D vectors get the same perm along their single axis."""
+    import torch
+
+    head_dim = int(dims["head_dim"])
+    n_heads = int(dims["n_heads"])
+    n_kv = int(dims["n_kv_heads"])
+    n_layers = int(dims["n_layers"])
+    attn_dim = n_heads * head_dim
+    kv_dim = n_kv * head_dim
+
+    def _halved_to_pair(dim: int, head_dim: int) -> torch.Tensor:
+        half = head_dim // 2
+        out = torch.empty(dim, dtype=torch.int64)
+        for h in range(dim // head_dim):
+            base = h * head_dim
+            for i in range(half):
+                out[base + 2 * i] = base + i
+                out[base + 2 * i + 1] = base + half + i
+        return out
+
+    q_perm = _halved_to_pair(attn_dim, head_dim)
+    k_perm = _halved_to_pair(kv_dim, head_dim)
+
+    for i in range(n_layers):
+        host = am.buffers.host_params[i]
+        for name, perm in (("w_q", q_perm), ("w_k", k_perm)):
+            if name in host:
+                host[name].copy_(host[name][:, perm])
+        # Full-row QK-norm vectors share the perm along their 1-D axis.
+        if "w_q_norm" in host:
+            host["w_q_norm"].copy_(host["w_q_norm"][q_perm])
+        if "w_k_norm" in host:
+            host["w_k_norm"].copy_(host["w_k_norm"][k_perm])
+        # LoRA on Q/K mirror to column dim.
+        for name, perm in (("w_q_lora_b", q_perm), ("w_k_lora_b", k_perm)):
+            if name in host and host[name].dim() == 2:
+                host[name].copy_(host[name][:, perm])
+
+    # OLMoE has no tied embeddings (separate lm_head).
+    am._refresh_gpu_residents()
+    for name, dev_t in am.buffers.gpu_head_params.items():
+        if name in am.buffers.host_head_params:
+            dev_t.copy_(am.buffers.host_head_params[name])
+    torch.cuda.synchronize()
+
+
+def _register_builder() -> None:
+    from flextrain.api import register_block_builder
+    register_block_builder(("OlmoeForCausalLM",), _olmoe_block_builder)
+
+
+_register_builder()

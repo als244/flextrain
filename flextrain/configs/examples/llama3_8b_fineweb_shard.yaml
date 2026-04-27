@@ -1,0 +1,50 @@
+# Example: train Llama 3-8B on pre-tokenized FineWeb .bin shards.
+#
+# Usage:
+#   python -m flextrain train flextrain/configs/examples/llama3_8b_fineweb_shard.yaml
+
+model:
+  arch: llama
+  vocab_size: 128256          # Llama 3 tokenizer
+  n_layers: 32
+  d_model: 4096
+  n_heads: 32
+  n_kv_heads: 8               # 4x GQA
+  head_dim: 128
+  expert_dim: 14336           # FFN intermediate
+  rms_norm_eps: 0.00001
+  rope_theta: 500000.0        # Llama 3 RoPE base
+  is_causal: true
+
+train:
+  global_batch_tokens: 524288 # 512K tokens per optimizer step
+  max_seq_len: 2048
+  total_steps: 1000
+  warmup_pct: 0.05
+  cooldown_pct: 0.2
+  final_lr_fraction: 0.1
+  fixed_seq_len: false
+  optimizer:
+    kind: adamw
+    lr: 0.001
+    beta1: 0.95
+    beta2: 0.98
+    eps: 0.00000001
+    weight_decay: 0.0
+
+hardware:
+  device_id: 0
+  max_gpu_mem_gib: null       # use all available
+  max_host_mem_gib: null
+  leeway_gpu_mem_gib: 2.0
+  leeway_host_mem_gib: 10.0
+
+io:
+  hf_checkpoint: meta-llama/Meta-Llama-3-8B
+  tokenizer: meta-llama/Meta-Llama-3-8B
+  output_dir: runs/llama3_8b_fineweb
+  data:
+    shard_pattern: "orig/fineweb/fineweb_train_{shard_index:06d}.bin"
+    shard_num_shards: 100
+    min_seq_len: 256
+    max_seq_len: 2048

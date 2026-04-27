@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flextrain"
+version = "0.1.0"
+description = "Working-set-aware training engine for transformer language models"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.5",
+    "triton>=3.0",
+    "numpy",
+    "safetensors",
+    "transformers",
+    "accelerate",
+]
+
+[project.optional-dependencies]
+linear-attention = ["flash-linear-attention", "causal-conv1d"]
+flash-attn = ["flash_attn_interface"]
+peft = ["peft"]
+
+[tool.setuptools.packages.find]
+include = ["flextrain*"]
+exclude = ["orig*", "tests*", "docs*", "datasets*", "models*", "runs*", "parity_results*", "helpers*"]

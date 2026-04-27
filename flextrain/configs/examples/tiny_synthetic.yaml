@@ -1,0 +1,43 @@
+# Smallest runnable config — for smoke-testing the full CLI path.
+# Uses SyntheticTokenSource (no real data required).
+
+model:
+  arch: llama
+  vocab_size: 4096
+  n_layers: 2
+  d_model: 128
+  n_heads: 4
+  n_kv_heads: 2
+  head_dim: 32
+  expert_dim: 256
+  rms_norm_eps: 0.00001
+  rope_theta: 10000.0
+  is_causal: true
+
+train:
+  global_batch_tokens: 2048
+  max_seq_len: 512
+  total_steps: 5
+  warmup_pct: 0.2
+  cooldown_pct: 0.2
+  final_lr_fraction: 0.1
+  optimizer:
+    kind: adamw
+    lr: 0.001
+    beta1: 0.9
+    beta2: 0.95
+    eps: 0.00000001
+    weight_decay: 0.0
+
+hardware:
+  device_id: 0
+  max_gpu_mem_gib: 4.0
+  leeway_gpu_mem_gib: 1.0
+
+io:
+  output_dir: runs/tiny_synthetic
+  data:
+    synthetic: true
+    synthetic_seq_len: 512
+    min_seq_len: 64
+    max_seq_len: 512

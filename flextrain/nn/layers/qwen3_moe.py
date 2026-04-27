@@ -1,0 +1,339 @@
+"""Qwen3-MoE layer (e.g. Qwen3-30B-A3B, Qwen3-235B-A22B).
+
+Architectural ingredients (from HF ``Qwen3MoeDecoderLayer``):
+* GQA attention with **per-head** QK-norm (same as Qwen3-dense).
+* SwiGLU MoE FFN: ``num_experts`` routed experts, top-K per token,
+  ``norm_topk_prob=True`` by default (renormalized top-K weights).
+* No shared experts (unlike OLMoE / DeepSeek-V2).
+* RMSNorm (attn_norm, ffn_norm) eps usually ``1e-6``; RoPE theta
+  ``1_000_000.0``; all standard Qwen3 dense defaults.
+
+Construction mirrors :class:`OLMoEBlock` but with per-head QK-norm
+plumbing copied from :class:`Qwen3DenseBlock`.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Mapping, MutableMapping
+
+import torch
+
+from flextrain.core.activation_schema import (
+    ActivationField,
+    ActivationSchema,
+    concat_fields,
+)
+from flextrain.core.layer import (
+    ChunkMeta,
+    ComputeCost,
+    LayerContext,
+    MoEChunkConfig,
+    ParamSpec,
+)
+from flextrain.nn.blocks import (
+    GQAAttentionBlock,
+    GQAAttentionConfig,
+    RMSNormBlock,
+)
+from flextrain.nn.blocks.ffn_moe import MoESwiGLUConfig, MoESwiGLUFFN
+
+
+@dataclass(frozen=True)
+class Qwen3MoEBlockConfig:
+    """Per-layer config for a Qwen3-MoE layer."""
+
+    d_model: int
+    n_heads: int
+    n_kv_heads: int
+    head_dim: int
+    expert_dim: int
+    num_experts: int
+    top_k: int
+    rms_norm_eps: float = 1e-6
+    rope_base: float = 1_000_000.0
+    is_causal: bool = True
+    # Qwen3-MoE default: aux-loss coefficient 0.001 (vs. OLMoE's 0.01).
+    load_balance_coef: float = 0.001
+    # Qwen3-MoE config.json field ``norm_topk_prob`` (default True) →
+    # softmax over K after top-K selection, weights sum to 1.
+    routing_mode: str = "topk_then_softmax"
+
+    compute_dtype: torch.dtype = torch.bfloat16
+    master_dtype: torch.dtype | None = None
+    grad_dtype: torch.dtype | None = None
+    norm_grad_dtype: torch.dtype = torch.float32
+    norm_master_dtype: torch.dtype = torch.float32
+
+    def dims(self) -> dict[str, int]:
+        return {
+            "d_model": self.d_model,
+            "n_heads": self.n_heads,
+            "n_kv_heads": self.n_kv_heads,
+            "head_dim": self.head_dim,
+            "attn_dim": self.n_heads * self.head_dim,
+            "kv_dim": self.n_kv_heads * self.head_dim,
+            "expert_dim": self.expert_dim,
+            "num_experts": self.num_experts,
+            "top_k": self.top_k,
+        }
+
+
+class Qwen3MoEBlock:
+    """Qwen3-MoE full-context layer.
+
+    Per-head QK-norm (like Qwen3-dense) + MoE FFN (like OLMoE), with
+    Qwen3-MoE's ``topk_then_softmax`` router by default.
+    """
+
+    def __init__(self, layer_id: int, cfg: Qwen3MoEBlockConfig) -> None:
+        self.layer_id = layer_id
+        self.cfg = cfg
+        self._dims = cfg.dims()
+
+        self.attn_norm = RMSNormBlock(
+            prefix="attn_norm",
+            eps=cfg.rms_norm_eps,
+            param_compute_dtype=cfg.compute_dtype,
+            param_master_dtype=cfg.norm_master_dtype,
+            param_grad_dtype=cfg.norm_grad_dtype,
+        )
+        self.attn = GQAAttentionBlock(
+            GQAAttentionConfig(
+                d_model=cfg.d_model,
+                n_heads=cfg.n_heads,
+                n_kv_heads=cfg.n_kv_heads,
+                head_dim=cfg.head_dim,
+                rope_base=cfg.rope_base,
+                is_causal=cfg.is_causal,
+                qk_norm=True,
+                rms_norm_eps=cfg.rms_norm_eps,
+                compute_dtype=cfg.compute_dtype,
+                master_dtype=cfg.master_dtype,
+                grad_dtype=cfg.grad_dtype,
+            )
+        )
+        # Qwen3 per-head QK-norm (weight vector sized ``head_dim``).
+        self.q_norm = RMSNormBlock(
+            prefix="q_norm",
+            eps=cfg.rms_norm_eps,
+            per_head=True,
+            heads_dim_name="n_heads",
+            weight_dim_name="head_dim",
+            param_compute_dtype=cfg.compute_dtype,
+            param_master_dtype=cfg.norm_master_dtype,
+            param_grad_dtype=cfg.norm_grad_dtype,
+        )
+        self.k_norm = RMSNormBlock(
+            prefix="k_norm",
+            eps=cfg.rms_norm_eps,
+            per_head=True,
+            heads_dim_name="n_kv_heads",
+            weight_dim_name="head_dim",
+            param_compute_dtype=cfg.compute_dtype,
+            param_master_dtype=cfg.norm_master_dtype,
+            param_grad_dtype=cfg.norm_grad_dtype,
+        )
+        self.attn.set_qk_norm(self.q_norm, self.k_norm)
+
+        self.ffn_norm = RMSNormBlock(
+            prefix="ffn_norm",
+            eps=cfg.rms_norm_eps,
+            param_compute_dtype=cfg.compute_dtype,
+            param_master_dtype=cfg.norm_master_dtype,
+            param_grad_dtype=cfg.norm_grad_dtype,
+        )
+        self.ffn = MoESwiGLUFFN(
+            MoESwiGLUConfig(
+                d_model=cfg.d_model,
+                expert_dim=cfg.expert_dim,
+                num_experts=cfg.num_experts,
+                top_k=cfg.top_k,
+                load_balance_coef=cfg.load_balance_coef,
+                routing_mode=cfg.routing_mode,
+                compute_dtype=cfg.compute_dtype,
+                master_dtype=cfg.master_dtype,
+                grad_dtype=cfg.grad_dtype,
+            )
+        )
+
+        self.moe_chunk_config = MoEChunkConfig(
+            num_experts=cfg.num_experts, top_k=cfg.top_k,
+        )
+
+        x_inp_field = ActivationField(
+            "x_inp",
+            lambda n, d: (n, cfg.d_model),
+            cfg.compute_dtype,
+            tier=0,
+        )
+        self.schema = ActivationSchema(
+            fields=concat_fields(
+                [
+                    self.attn_norm.fields(),
+                    (x_inp_field,),
+                    self.attn.fields(),
+                    self.q_norm.fields(),
+                    self.k_norm.fields(),
+                    self.ffn_norm.fields(),
+                    self.ffn.fields(),
+                ]
+            ),
+            max_tier=3,
+        )
+        self.param_spec = ParamSpec.merge(
+            [
+                self.attn_norm.param_spec(),
+                self.q_norm.param_spec(),
+                self.k_norm.param_spec(),
+                self.attn.param_spec(),
+                self.ffn_norm.param_spec(),
+                self.ffn.param_spec(),
+            ]
+        )
+
+    # ------------------------------------------------------------------
+    # Layer Protocol
+    # ------------------------------------------------------------------
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        chunk: ChunkMeta,
+        weights: Mapping[str, torch.Tensor],
+        slot,
+        ctx: LayerContext,
+    ) -> torch.Tensor:
+        slot.x_inp.copy_(x)
+        x_temp = ctx.scratch(x.shape, x.dtype)
+        attn_norm_output = self.attn_norm.fwd(
+            x, weights, slot.attn_norm_rstd, output=x_temp,
+        )
+        attn_output_with_residual = self.attn.fwd(
+            x, attn_norm_output, chunk, weights, slot, ctx,
+        )
+        ffn_norm_output = self.ffn_norm.fwd(
+            attn_output_with_residual.view(-1, self.cfg.d_model),
+            weights, slot.ffn_norm_rstd, output=x_temp,
+        )
+        layer_output = self.ffn.fwd(
+            ffn_norm_output, weights, attn_output_with_residual,
+            out_tensor=x, slot=slot, ctx=ctx, chunk=chunk,
+            layer_id=self.layer_id,
+        )
+        return layer_output
+
+    def forward_recompute(
+        self,
+        slot,
+        chunk: ChunkMeta,
+        weights: Mapping[str, torch.Tensor],
+        ctx: LayerContext,
+    ) -> None:
+        cfg = self.cfg
+        x_inp = slot.x_inp
+
+        if not slot.has("xq"):
+            attn_norm_output = self.attn_norm.fwd_from_rstd(
+                x_inp, weights, slot.attn_norm_rstd,
+            )
+            self.attn.fwd_recompute_qo(
+                attn_norm_output, chunk, weights, slot, x_inp,
+            )
+            slot.aux["recompute_attn_norm_output"] = attn_norm_output
+
+        if not slot.has("attn_result"):
+            self.attn.fwd_recompute_attn(chunk, slot, ctx)
+
+        if not slot.has("xo"):
+            self.attn.fwd_recompute_o(x_inp, weights, slot)
+
+        if not slot.has("x_up"):
+            ffn_norm_output = self.ffn_norm.fwd_from_rstd(
+                slot.xo.view(-1, cfg.d_model), weights, slot.ffn_norm_rstd,
+            )
+            self.ffn.fwd_recompute_x_up(
+                ffn_norm_output, weights, slot, chunk,
+                layer_id=self.layer_id,
+            )
+            slot.aux["recompute_ffn_norm_output"] = ffn_norm_output
+
+    def backward(
+        self,
+        dx: torch.Tensor,
+        chunk: ChunkMeta,
+        weights: Mapping[str, torch.Tensor],
+        grads: MutableMapping[str, torch.Tensor],
+        slot,
+        ctx: LayerContext,
+    ) -> torch.Tensor:
+        cfg = self.cfg
+
+        if "recompute_ffn_norm_output" not in slot.aux:
+            slot.aux["recompute_ffn_norm_output"] = self.ffn_norm.fwd_from_rstd(
+                slot.xo.view(-1, cfg.d_model), weights, slot.ffn_norm_rstd,
+            )
+
+        ffn_norm_upstream = self.ffn.bwd(
+            dx, weights, grads, slot, ctx, chunk,
+            layer_id=self.layer_id,
+        )
+
+        ffn_norm_fwd_output = slot.aux.pop("recompute_ffn_norm_output")
+        dx, _ = self.ffn_norm.bwd(
+            ffn_norm_upstream,
+            slot.xo.view(-1, cfg.d_model),
+            weights, grads, slot.ffn_norm_rstd,
+            dx_accumulator=dx,
+            recompute_output=False,
+            recomputed_output_tensor=None,
+        )
+
+        attn_norm_fwd_output = slot.aux.pop(
+            "recompute_attn_norm_output", None
+        )
+        if attn_norm_fwd_output is None:
+            attn_norm_fwd_output = self.attn_norm.fwd_from_rstd(
+                slot.x_inp, weights, slot.attn_norm_rstd,
+            )
+
+        dx_attn_norm_up = self.attn.bwd(
+            dx, chunk, weights, grads, slot, ctx,
+            attn_norm_output=attn_norm_fwd_output,
+        )
+        dx, _ = self.attn_norm.bwd(
+            dx_attn_norm_up,
+            slot.x_inp,
+            weights, grads, slot.attn_norm_rstd,
+            dx_accumulator=dx,
+            recompute_output=False,
+            recomputed_output_tensor=None,
+        )
+
+        self.attn.bwd_accumulate_qkv_grads(
+            attn_norm_fwd_output, grads, slot,
+        )
+        del attn_norm_fwd_output
+        return dx
+
+    def compute_cost(self, chunk: ChunkMeta) -> ComputeCost:
+        max_tier = self.schema.max_tier
+        return ComputeCost.sum(
+            [
+                self.attn_norm.compute_cost(
+                    chunk.total_q, self._dims, max_tier,
+                ),
+                self.attn.compute_cost(chunk, max_tier=max_tier),
+                self.q_norm.compute_cost(
+                    chunk.total_q, self._dims, max_tier,
+                ),
+                self.k_norm.compute_cost(
+                    chunk.total_q, self._dims, max_tier,
+                ),
+                self.ffn_norm.compute_cost(
+                    chunk.total_q, self._dims, max_tier,
+                ),
+                self.ffn.compute_cost(chunk, max_tier=max_tier),
+            ],
+            max_tier=max_tier,
+        )

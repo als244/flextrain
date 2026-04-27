@@ -1,0 +1,263 @@
+"""Qwen3-MoE HF <-> FlexTrain mapping.
+
+Covers the MoE variants (Qwen3-30B-A3B, Qwen3-235B-A22B, etc.). Shares
+attention with Qwen3-dense (GQA + per-head QK-norm) but replaces the
+dense SwiGLU FFN with a stacked-expert MoE FFN.
+
+HF expert layout: ``model.layers.{L}.mlp.experts.{e}.{gate,up,down}_proj.weight``
+with shapes (F, d), (F, d), (d, F) — identical to OLMoE. FlexTrain
+stacks these into ``w_up (E, d, 2F)`` (packed ``[up, gate]`` = ``[x3, x1]``)
+and ``w_down (E, F, d)``. Router is ``w_router (d, E)`` (HF's
+``mlp.gate.weight`` transposed).
+"""
+from __future__ import annotations
+
+import json
+import os
+from typing import Any, Mapping
+
+import torch
+from safetensors import safe_open
+
+from ..hf_weights import ArchSpec, Transform, WeightMapEntry, register_arch
+
+
+def _qwen3_moe_post_load_hook(
+    hf_path: str, dest: Mapping, num_layers: int,
+) -> None:
+    """Stack per-expert HF tensors into FT's ``w_up``/``w_down``. The
+    packing order is ``[up, gate]`` so the orig swiglu_moe kernel
+    reads ``x3`` (value) from the first half and ``x1`` (gate) from
+    the second half."""
+    sample_w_up = dest.get(("layer_0", "w_up"))
+    if sample_w_up is None:
+        return
+    E, D, TwoF = sample_w_up.shape
+    F = TwoF // 2
+    sample_w_down = dest[("layer_0", "w_down")]
+    assert sample_w_down.shape == (E, F, D), (
+        f"w_down shape mismatch: expected ({E}, {F}, {D}), "
+        f"got {tuple(sample_w_down.shape)}"
+    )
+
+    idx_path = os.path.join(hf_path, "model.safetensors.index.json")
+    if os.path.isfile(idx_path):
+        with open(idx_path) as f:
+            file_index = json.load(f)["weight_map"]
+    else:
+        single = os.path.join(hf_path, "model.safetensors")
+        if not os.path.isfile(single):
+            raise FileNotFoundError(
+                f"No safetensors index at {idx_path} and no single file"
+            )
+        file_index = None
+
+    def _open_for(name: str):
+        if file_index is not None:
+            shard = file_index[name]
+            return os.path.join(hf_path, shard)
+        return os.path.join(hf_path, "model.safetensors")
+
+    for L in range(num_layers):
+        w_up_ft = dest[(f"layer_{L}", "w_up")]
+        w_down_ft = dest[(f"layer_{L}", "w_down")]
+        for e in range(E):
+            gate_name = f"model.layers.{L}.mlp.experts.{e}.gate_proj.weight"
+            up_name = f"model.layers.{L}.mlp.experts.{e}.up_proj.weight"
+            down_name = f"model.layers.{L}.mlp.experts.{e}.down_proj.weight"
+
+            with safe_open(_open_for(gate_name), framework="pt", device="cpu") as f:
+                gate = f.get_tensor(gate_name)
+            with safe_open(_open_for(up_name), framework="pt", device="cpu") as f:
+                up = f.get_tensor(up_name)
+            with safe_open(_open_for(down_name), framework="pt", device="cpu") as f:
+                down = f.get_tensor(down_name)
+
+            dtype = w_up_ft.dtype
+            gate_t = gate.T.contiguous().to(dtype)
+            up_t = up.T.contiguous().to(dtype)
+            w_up_ft[e, :, :].copy_(torch.cat([up_t, gate_t], dim=1))  # [x3, x1]
+            w_down_ft[e, :, :].copy_(down.T.contiguous().to(dtype))
+
+
+QWEN3_MOE_ARCH = ArchSpec(
+    hf_arch_ids=("Qwen3MoeForCausalLM",),
+    embed=(
+        WeightMapEntry(
+            flextrain_name="w_tok_embeddings",
+            hf_name="model.embed_tokens.weight",
+            transform=Transform.NONE,
+        ),
+    ),
+    head=(
+        WeightMapEntry(
+            flextrain_name="w_final_norm",
+            hf_name="model.norm.weight",
+            transform=Transform.NONE,
+        ),
+        WeightMapEntry(
+            flextrain_name="w_head_proj",
+            hf_name="lm_head.weight",
+            transform=Transform.TRANSPOSE,
+        ),
+    ),
+    layer=(
+        WeightMapEntry(
+            flextrain_name="w_attn_norm",
+            hf_name="model.layers.{i}.input_layernorm.weight",
+            transform=Transform.NONE,
+        ),
+        WeightMapEntry(
+            flextrain_name="w_q_norm",
+            hf_name="model.layers.{i}.self_attn.q_norm.weight",
+            transform=Transform.NONE,
+        ),
+        WeightMapEntry(
+            flextrain_name="w_k_norm",
+            hf_name="model.layers.{i}.self_attn.k_norm.weight",
+            transform=Transform.NONE,
+        ),
+        WeightMapEntry(
+            flextrain_name="w_q",
+            hf_name="model.layers.{i}.self_attn.q_proj.weight",
+            transform=Transform.TRANSPOSE,
+        ),
+        WeightMapEntry(
+            flextrain_name="w_k",
+            hf_name="model.layers.{i}.self_attn.k_proj.weight",
+            transform=Transform.TRANSPOSE,
+        ),
+        WeightMapEntry(
+            flextrain_name="w_v",
+            hf_name="model.layers.{i}.self_attn.v_proj.weight",
+            transform=Transform.TRANSPOSE,
+        ),
+        WeightMapEntry(
+            flextrain_name="w_o",
+            hf_name="model.layers.{i}.self_attn.o_proj.weight",
+            transform=Transform.TRANSPOSE,
+        ),
+        WeightMapEntry(
+            flextrain_name="w_ffn_norm",
+            hf_name="model.layers.{i}.post_attention_layernorm.weight",
+            transform=Transform.NONE,
+        ),
+        WeightMapEntry(
+            flextrain_name="w_router",
+            hf_name="model.layers.{i}.mlp.gate.weight",
+            transform=Transform.TRANSPOSE,
+        ),
+        # w_up / w_down populated by post_load_hook.
+    ),
+    post_load_hook=_qwen3_moe_post_load_hook,
+)
+
+register_arch(QWEN3_MOE_ARCH)
+
+
+def hf_config_to_flextrain(hf_config: Any) -> dict:
+    get = (
+        (lambda k, default=None: getattr(hf_config, k, default))
+        if not isinstance(hf_config, dict)
+        else hf_config.get
+    )
+    n_heads = get("num_attention_heads")
+    hidden = get("hidden_size")
+    head_dim = get("head_dim") or (hidden // n_heads)
+    # Qwen3-MoE uses ``moe_intermediate_size`` for the per-expert dim.
+    expert_dim = get("moe_intermediate_size") or get("intermediate_size")
+    return {
+        "vocab_size": get("vocab_size"),
+        "n_layers": get("num_hidden_layers"),
+        "d_model": hidden,
+        "n_heads": n_heads,
+        "n_kv_heads": get("num_key_value_heads") or n_heads,
+        "head_dim": head_dim,
+        "expert_dim": expert_dim,
+        "num_shared_experts": 0,
+        "num_routed_experts": get("num_experts"),
+        "top_k": get("num_experts_per_tok"),
+        "is_causal": True,
+        "datatypes": {
+            "embed": "bfloat16",
+            "head_proj": "bfloat16",
+            "attn_proj": "bfloat16",
+            "expert_proj": "bfloat16",
+            "router": "bfloat16",
+            "norm": "bfloat16",
+            "residual": "bfloat16",
+        },
+    }
+
+
+def hf_config_to_hyperparams(hf_config: Any) -> dict:
+    get = (
+        (lambda k, default=None: getattr(hf_config, k, default))
+        if not isinstance(hf_config, dict)
+        else hf_config.get
+    )
+    rope_params = get("rope_parameters") or {}
+    rope_theta = rope_params.get("rope_theta") or get("rope_theta", 1_000_000.0)
+    norm_topk = bool(get("norm_topk_prob", True))
+    return {
+        "rms_norm_eps": get("rms_norm_eps", 1e-6),
+        "rope_theta": rope_theta,
+        "rope_scaling": rope_params.get("rope_scaling") or get("rope_scaling"),
+        "window_size_left": -1,
+        "window_size_right": 0,
+        "load_balance_coef": get("router_aux_loss_coef", 0.001),
+        "routing_mode": "topk_then_softmax" if norm_topk else "softmax_then_topk",
+    }
+
+
+def _qwen3_moe_block_builder(layer_idx: int, ctx) -> object:
+    from flextrain.nn.layers.qwen3_moe import Qwen3MoEBlock, Qwen3MoEBlockConfig
+
+    dims = ctx.dims
+    hp = ctx.hyperparams
+    block_cfg = Qwen3MoEBlockConfig(
+        d_model=int(dims["d_model"]),
+        n_heads=int(dims["n_heads"]),
+        n_kv_heads=int(dims["n_kv_heads"]),
+        head_dim=int(dims["head_dim"]),
+        expert_dim=int(dims["expert_dim"]),
+        num_experts=int(dims["num_routed_experts"]),
+        top_k=int(dims["top_k"]),
+        rms_norm_eps=float(hp.get("rms_norm_eps", 1e-6)),
+        rope_base=float(hp.get("rope_theta", 1_000_000.0)),
+        load_balance_coef=float(hp.get("load_balance_coef", 0.001)),
+        routing_mode=str(hp.get("routing_mode", "topk_then_softmax")),
+        is_causal=True,
+        compute_dtype=ctx.compute_dtype,
+        master_dtype=ctx.master_dtype,
+        grad_dtype=ctx.grad_dtype,
+        norm_grad_dtype=ctx.norm_grad_dtype,
+    )
+    base = Qwen3MoEBlock(layer_id=layer_idx, cfg=block_cfg)
+    if not ctx.lora_targets:
+        return base
+    from flextrain.nn.layers.lora_wrapper import LoRAWrapperLayer
+    return LoRAWrapperLayer(
+        base, lora_targets=ctx.lora_targets,
+        rank=ctx.lora_rank, alpha=ctx.lora_alpha,
+        dims=dict(dims, attn_dim=int(dims["n_heads"]) * int(dims["head_dim"]),
+                  kv_dim=int(dims["n_kv_heads"]) * int(dims["head_dim"])),
+        adapter_compute_dtype=ctx.lora_adapter_compute_dtype,
+        adapter_master_dtype=ctx.lora_adapter_master_dtype,
+        adapter_grad_dtype=ctx.lora_adapter_grad_dtype,
+        adapter_opt_state_dtype=ctx.lora_adapter_opt_state_dtype,
+    )
+
+
+def post_load_permute(am, hf_config, dims, hyperparams):
+    """Qwen3-MoE: same as Qwen3-dense (Q/K halved→pair + per-head_dim QK-norm)."""
+    from flextrain.io.arch.qwen3 import post_load_permute as _qwen3_perm
+    _qwen3_perm(am, hf_config, dims, hyperparams)
+
+
+def _register_builder() -> None:
+    from flextrain.api import register_block_builder
+    register_block_builder(("Qwen3MoeForCausalLM",), _qwen3_moe_block_builder)
+
+
+_register_builder()
