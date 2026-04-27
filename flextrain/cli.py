@@ -379,17 +379,16 @@ def _get_model_flops_per_token(model_cfg, seq_len: int, *, using_lora: bool = Fa
 
     ctx_dim = n_kv_heads * head_dim
     attn_dim = n_heads * head_dim
-    # Active params per layer (attention + ffn routed).
+    # MoE is gated on top_k > 0 (number of routed experts per token). The
+    # arch registry sets num_shared_experts=1 for plain dense MLPs — that
+    # is one shared MLP, not a shared expert that stacks on top of routed
+    # ones. Conflating the two double-counts the dense MLP FLOPs.
+    is_moe = top_k > 0
+    mlp_experts = num_shared + top_k if is_moe else 1
     active_params_per_layer = (
         2 * d_model * attn_dim
         + 2 * d_model * ctx_dim
-        + 3 * (num_shared + max(top_k, 1 if num_shared else 0)) * d_model * expert_dim
-        if top_k > 0 or num_shared > 0
-        else (
-            2 * d_model * attn_dim
-            + 2 * d_model * ctx_dim
-            + 3 * d_model * expert_dim
-        )
+        + 3 * mlp_experts * d_model * expert_dim
     )
     matmul_flops_per_layer = matmul_factor * seq_len * active_params_per_layer
     # Attention: causal halves the work (only T²/2 pairs). Per-pair
