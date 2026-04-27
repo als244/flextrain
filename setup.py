@@ -13,7 +13,6 @@ packages because they ship native code and are useful on their own.
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -30,42 +29,23 @@ HELPERS_DIR = REPO_ROOT / "helpers"
 HELPER_PACKAGES = ("matmul_dispatcher", "transmission_scheduler")
 
 
-def _pip_cmd() -> list[str]:
-    candidates = [
-        str(Path(sys.executable).with_name("pip")),
-        str(Path(sys.executable).with_name(f"pip{sys.version_info.major}")),
-        str(
-            Path(sys.executable).with_name(
-                f"pip{sys.version_info.major}.{sys.version_info.minor}"
-            )
-        ),
-        shutil.which("pip"),
-        shutil.which(f"pip{sys.version_info.major}"),
-        shutil.which(f"pip{sys.version_info.major}.{sys.version_info.minor}"),
-    ]
-    for candidate in candidates:
-        if candidate and os.path.exists(candidate):
-            return [candidate]
-
-    try:
-        subprocess.check_call([sys.executable, "-m", "ensurepip", "--upgrade"])
-        return [sys.executable, "-m", "pip"]
-    except Exception as e:  # pragma: no cover
-        raise RuntimeError(
-            "Could not find a working pip executable for helper installs. "
-            "Install pip in the target environment or install helpers manually."
-        ) from e
-
-
 def _build_helper(name: str) -> None:
     pkg_dir = HELPERS_DIR / name
     if not pkg_dir.exists():
         raise RuntimeError(f"Missing helper package: {pkg_dir}")
     print(f"[flextrain setup] building helper: {name} ({pkg_dir})", flush=True)
-    # Use pip rather than `python setup.py install` so the helper goes
-    # into the same environment cleanly. Editable so future edits to the
-    # helper sources are picked up without reinstall.
-    subprocess.check_call(_pip_cmd() + ["install", "-e", str(pkg_dir)], cwd=str(pkg_dir))
+    setup_py = pkg_dir / "setup.py"
+    if not setup_py.exists():
+        raise RuntimeError(f"Missing helper setup.py: {setup_py}")
+    # Install the helper directly via setuptools instead of nesting
+    # another pip invocation. Some target environments can execute a
+    # `pip` script without having an importable `pip` module, which
+    # breaks recursive `pip install -e ...` calls during editable
+    # builds.
+    subprocess.check_call(
+        [sys.executable, str(setup_py), "develop", "--no-deps"],
+        cwd=str(pkg_dir),
+    )
 
 
 def _build_all_helpers() -> None:
