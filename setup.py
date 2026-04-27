@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import sysconfig
 from pathlib import Path
 
 from setuptools import setup
@@ -27,6 +28,22 @@ from setuptools.command.editable_wheel import editable_wheel
 REPO_ROOT = Path(__file__).resolve().parent
 HELPERS_DIR = REPO_ROOT / "helpers"
 HELPER_PACKAGES = ("matmul_dispatcher", "transmission_scheduler")
+HELPER_PTH_NAME = "flextrain_helpers.pth"
+
+
+def _write_helper_pth() -> None:
+    purelib = Path(sysconfig.get_path("purelib"))
+    purelib.mkdir(parents=True, exist_ok=True)
+    pth_path = purelib / HELPER_PTH_NAME
+    helper_paths = [
+        str((HELPERS_DIR / name).resolve())
+        for name in HELPER_PACKAGES
+    ]
+    payload = "".join(f"{path}\n" for path in helper_paths)
+    if pth_path.exists() and pth_path.read_text() == payload:
+        return
+    pth_path.write_text(payload)
+    print(f"[flextrain setup] wrote helper path file: {pth_path}", flush=True)
 
 
 def _build_helper(name: str) -> None:
@@ -37,13 +54,12 @@ def _build_helper(name: str) -> None:
     setup_py = pkg_dir / "setup.py"
     if not setup_py.exists():
         raise RuntimeError(f"Missing helper setup.py: {setup_py}")
-    # Install the helper directly via setuptools instead of nesting
-    # another pip invocation. Some target environments can execute a
-    # `pip` script without having an importable `pip` module, which
-    # breaks recursive `pip install -e ...` calls during editable
-    # builds.
+    # Build the helper's native extension in place instead of nesting
+    # another package install. This avoids recursive pip/setuptools
+    # editable-install paths, which can fail in environments where
+    # `python -m pip` is unavailable inside the build hook.
     subprocess.check_call(
-        [sys.executable, str(setup_py), "develop", "--no-deps"],
+        [sys.executable, str(setup_py), "build_ext", "--inplace"],
         cwd=str(pkg_dir),
     )
 
@@ -54,6 +70,7 @@ def _build_all_helpers() -> None:
         return
     for name in HELPER_PACKAGES:
         _build_helper(name)
+    _write_helper_pth()
 
 
 class _BuildPyWithHelpers(build_py):
