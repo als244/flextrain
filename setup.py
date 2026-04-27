@@ -21,6 +21,7 @@ from setuptools import setup
 from setuptools.command.build_py import build_py
 from setuptools.command.develop import develop
 from setuptools.command.install import install
+from setuptools.command.editable_wheel import editable_wheel
 
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -68,10 +69,17 @@ class _InstallWithHelpers(install):
         super().run()
 
 
+class _EditableWheelWithHelpers(editable_wheel):
+    def run(self) -> None:
+        _build_all_helpers()
+        super().run()
+
+
 setup(
     cmdclass={
         "build_py": _BuildPyWithHelpers,
         "develop": _DevelopWithHelpers,
         "install": _InstallWithHelpers,
+        "editable_wheel": _EditableWheelWithHelpers,
     },
 )
