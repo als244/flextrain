@@ -569,7 +569,7 @@ class MoESwiGLUFFN:
                     # immediately into rank-r accumulators (still inside
                     # this loop iteration; no lifetime issues).
                     lora_per_expert_callback("g_down", eid, fwd_act, exp_upstream)
-            else:
+            elif grads.get("g_down") is not None:
                 g_down_e = grads["g_down"][eid, :, :]
                 dispatcher.matmul(
                     stream_ptr,
@@ -577,6 +577,8 @@ class MoESwiGLUFFN:
                     C=g_down_e, D=g_down_e,
                     beta=1.0, alpha=1.0,
                 )
+            # else: w_down is frozen (LoRA-only on attn, MoE base frozen) —
+            # buffer manager skipped grad allocation; no wgrad to write.
 
             # d) dx_pre = dx_up_up @ w_up.T (overwrites exp_upstream to
             # carry the pre-scatter gradient for the gather step below).
@@ -589,7 +591,7 @@ class MoESwiGLUFFN:
             if "g_up" in skip_grads:
                 if lora_per_expert_callback is not None:
                     lora_per_expert_callback("g_up", eid, exp_inp, dx_up_up)
-            else:
+            elif grads.get("g_up") is not None:
                 g_up_e = grads["g_up"][eid, :, :]
                 dispatcher.matmul(
                     stream_ptr,
@@ -597,6 +599,7 @@ class MoESwiGLUFFN:
                     C=g_up_e, D=g_up_e,
                     beta=1.0, alpha=1.0,
                 )
+            # else: frozen — see g_down branch above.
 
         del scattered_x
 
@@ -653,13 +656,14 @@ class MoESwiGLUFFN:
                 lora_per_expert_callback(
                     "g_router", -1, ffn_norm_output, dlogits,
                 )
-        else:
+        elif grads.get("g_router") is not None:
             dispatcher.matmul(
                 stream_ptr,
                 A=ffn_norm_output.T, B=dlogits,
                 C=grads["g_router"], D=grads["g_router"],
                 beta=1.0, alpha=1.0,
             )
+        # else: w_router frozen (LoRA on attn only). No wgrad to write.
 
         return ffn_norm_upstream
 

@@ -633,15 +633,40 @@ def _qwen3_5_moe_block_builder(layer_idx: int, ctx) -> object:
 
     if not ctx.lora_targets:
         return base
-    from flextrain.nn.layers.lora_wrapper import LoRAWrapperLayer
+    from flextrain.nn.layers.lora_wrapper import (
+        LoRAWrapperLayer, _discover_lora_eligible_names,
+    )
+    layer_dims = dict(
+        dims,
+        attn_dim=int(dims["n_heads"]) * int(dims["head_dim"]),
+        kv_dim=int(dims["n_kv_heads"]) * int(dims["head_dim"]),
+    )
+    # Hybrid backbone: linear-attn layers have no w_q/w_k/w_v/w_o, so an
+    # explicit target list like ("w_q","w_k","w_v","w_o") would error
+    # there. Filter the user's targets against this layer's own
+    # LoRA-eligible names, mirroring HF PEFT's per-layer auto-skipping.
+    if ctx.lora_targets != "all" and ctx.lora_targets is not None:
+        eligible = set(_discover_lora_eligible_names(base.param_spec, layer_dims))
+        kept = tuple(t for t in ctx.lora_targets if t in eligible)
+        if not kept:
+            # No LoRA targets apply to this layer (e.g. attn-only LoRA on
+            # a linear-attn layer). Still mark all base params frozen so
+            # working_set + buffers skip grad / opt-state allocation —
+            # matches the behavior of LoRAWrapperLayer when targets are
+            # present (it freezes ALL base tensors, not just targets).
+            from dataclasses import replace as _replace
+            from flextrain.core.layer import ParamSpec
+            base.param_spec = ParamSpec(tensors=tuple(
+                _replace(t, frozen=True) for t in base.param_spec.tensors
+            ))
+            return base
+        targets_for_layer: object = kept
+    else:
+        targets_for_layer = ctx.lora_targets
     return LoRAWrapperLayer(
-        base, lora_targets=ctx.lora_targets,
+        base, lora_targets=targets_for_layer,
         rank=ctx.lora_rank, alpha=ctx.lora_alpha,
-        dims=dict(
-            dims,
-            attn_dim=int(dims["n_heads"]) * int(dims["head_dim"]),
-            kv_dim=int(dims["n_kv_heads"]) * int(dims["head_dim"]),
-        ),
+        dims=layer_dims,
         adapter_compute_dtype=ctx.lora_adapter_compute_dtype,
         adapter_master_dtype=ctx.lora_adapter_master_dtype,
         adapter_grad_dtype=ctx.lora_adapter_grad_dtype,

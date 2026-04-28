@@ -58,6 +58,20 @@ part of the schema.
 """
 
 
+# Per-slot byte alignment for the host activation buffer + GPU activation
+# ring. Slots are packed back-to-back; if a slot's total byte size is not
+# aligned to the LCM of all field dtypes' itemsizes, the next slot's
+# views (e.g. ``buffer[off:off+nbytes].view(torch.float32)``) blow up
+# with ``storage_offset() must be divisible by 4`` once a prior slot
+# ends with a bf16/int16 field at an odd ``num_tokens``. fp32 is the
+# largest field dtype in any current schema, so 4 bytes is sufficient.
+_SLOT_ALIGN_BYTES = 4
+
+
+def _round_up(n: int, align: int) -> int:
+    return (n + align - 1) // align * align
+
+
 @dataclass(frozen=True)
 class ActivationField:
     """One declared activation tensor.
@@ -173,17 +187,34 @@ class ActivationSchema:
         self, num_tokens: int, dims: Mapping[str, int], level: int
     ) -> int:
         """Bytes this layer/chunk needs in the host-pinned buffer at the given
-        save level. Replaces ``get_act_slot_size``."""
-        return sum(
+        save level.
+
+        Rounded up to ``_SLOT_ALIGN_BYTES`` so the next slot's first field
+        (often fp32 ``attn_norm_rstd``) lands at a dtype-aligned storage
+        offset — without padding, a slot ending in a bf16 field with odd
+        ``num_tokens`` (e.g. ``x_shared_gate (T, 1)`` with T odd) leaves
+        the cursor at an offset that's 2 mod 4 and the subsequent
+        ``buffer.view(torch.float32)`` blows up at line 334's
+        ``view().reshape()``.
+        """
+        raw = sum(
             f.byte_size(num_tokens, dims)
             for f in self.persistent_fields_at_level(level)
         )
+        return _round_up(raw, _SLOT_ALIGN_BYTES)
 
     def device_size_bytes(self, num_tokens: int, dims: Mapping[str, int]) -> int:
         """Bytes this layer/chunk needs in the GPU activation slot. ALL fields
         (every tier) live on device during forward; selection only matters for
-        send-home."""
-        return sum(f.byte_size(num_tokens, dims) for f in self.fields)
+        send-home.
+
+        Rounded up to ``_SLOT_ALIGN_BYTES`` for the same reason as
+        :meth:`home_size_bytes` — the GPU activation ring stores slots
+        back-to-back at ``i * max_act_slot_bytes``, so if the per-slot
+        size isn't dtype-aligned, slot 1 onward gets misaligned views.
+        """
+        raw = sum(f.byte_size(num_tokens, dims) for f in self.fields)
+        return _round_up(raw, _SLOT_ALIGN_BYTES)
 
     def offloaded_bytes_at_level(
         self, num_tokens: int, dims: Mapping[str, int], level: int
@@ -326,6 +357,16 @@ class ActivationSlot:
         for f in fields:
             shape = f.shape(num_tokens, dims)
             nbytes = f.byte_size(num_tokens, dims)
+            # Each field's view requires storage_offset divisible by its
+            # dtype itemsize. Within-slot fields are usually naturally
+            # aligned (bf16 fields have nbytes = 2 * T * even = 4 * T *
+            # half_even for even non-token dims), but for robustness pad
+            # explicitly: a future schema with an odd-aligned bf16 field
+            # followed by an fp32 field would otherwise crash. Cheap; no
+            # perf impact since alignment padding is at most 3 bytes.
+            align = f.dtype.itemsize
+            if offset % align != 0:
+                offset = _round_up(offset, align)
             if offset + nbytes > buffer.numel():
                 raise ValueError(
                     f"buffer too small: field {f.name!r} needs {nbytes}B at "
@@ -334,6 +375,11 @@ class ActivationSlot:
             view = buffer[offset : offset + nbytes].view(f.dtype).reshape(shape)
             tensors[f.name] = view
             offset += nbytes
+        # Round the final cursor to slot alignment so the caller's
+        # ``bytes_used`` matches what ``home_size_bytes`` reports —
+        # otherwise ``BufferManager._host_act_cursor`` and the schema
+        # disagree about slot boundaries by up to 3 bytes per slot.
+        offset = _round_up(offset, _SLOT_ALIGN_BYTES)
         return cls(schema, level, tensors), offset
 
     def view_for(self, num_tokens: int, dims: Mapping[str, int]) -> "ActivationSlot":
@@ -368,6 +414,36 @@ class ActivationSlot:
 # ---------------------------------------------------------------------------
 
 
+def _match_to(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
+    """Return a view of ``src`` whose shape matches ``dst``.
+
+    The GPU activation ring is sized at ``max_chunk_size`` for predictable
+    layout; the host slot is sized at the chunk's actual ``num_tokens``
+    for memory efficiency. For most fields ``view_for`` already narrowed
+    the GPU slot's ``token_axis`` dim to match. But fields with
+    ``token_axis=None`` whose shape *does* depend on ``num_tokens`` (e.g.
+    MoE ``scattered_router_weights`` of shape ``(T*top_k, 1)``,
+    ``x_up`` of shape ``(T*top_k, 2*expert_dim)``) bypass that narrowing
+    by design: the block does its own ``[:T*top_k, :]`` slicing at
+    runtime. For ``send_home`` / ``fetch_home`` we slice the source down
+    to the destination's first-dim extent — the ``[:T_actual*top_k]``
+    prefix is the only valid content on device anyway.
+    """
+    if src.shape == dst.shape:
+        return src
+    # Slice each leading dim where the source is larger than the dest.
+    out = src
+    for axis, (s, d) in enumerate(zip(src.shape, dst.shape)):
+        if s != d:
+            if s < d:
+                raise ValueError(
+                    f"send_home/fetch_home: source shape {tuple(src.shape)} "
+                    f"smaller than dest {tuple(dst.shape)} at axis {axis}"
+                )
+            out = out.narrow(axis, 0, d)
+    return out
+
+
 def send_home(
     home_slot: ActivationSlot,
     computed_slot: ActivationSlot,
@@ -383,9 +459,9 @@ def send_home(
     if home_slot.schema is not computed_slot.schema:
         raise ValueError("home and computed slots must share a schema")
     for f in home_slot.schema.offloadable_fields_at_level(level):
-        home_slot._tensors[f.name].copy_(
-            computed_slot._tensors[f.name], non_blocking=non_blocking
-        )
+        dst = home_slot._tensors[f.name]
+        src = _match_to(computed_slot._tensors[f.name], dst)
+        dst.copy_(src, non_blocking=non_blocking)
 
 
 def fetch_home(
@@ -400,9 +476,11 @@ def fetch_home(
     if dest_slot.schema is not home_slot.schema:
         raise ValueError("dest and home slots must share a schema")
     for f in dest_slot.schema.offloadable_fields_at_level(level):
-        dest_slot._tensors[f.name].copy_(
-            home_slot._tensors[f.name], non_blocking=non_blocking
-        )
+        dst = dest_slot._tensors[f.name]
+        # Home tensor is at chunk-actual T*top_k; dest (GPU) is at
+        # max_chunk*top_k. Narrow dest to home's extent before copy.
+        dst_view = _match_to(dst, home_slot._tensors[f.name])
+        dst_view.copy_(home_slot._tensors[f.name], non_blocking=non_blocking)
 
 
 # ---------------------------------------------------------------------------

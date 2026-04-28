@@ -731,6 +731,11 @@ class BufferManager:
         ``(None, 0)``-equivalent handled by the engine's ``if level == -1``
         branch before calling here (we don't want to waste the offset
         math).
+
+        Sized to the chunk's actual ``num_tokens`` (memory-efficient on
+        the bandwidth-constrained host). The GPU activation ring is
+        sized for ``max_chunk_size``; ``send_home`` slices the GPU
+        source to match the host destination's per-field extents.
         """
         if self.host_act_buffer is None:
             raise RuntimeError(
