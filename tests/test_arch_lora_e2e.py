@@ -171,9 +171,13 @@ ARCHES: dict[str, ArchSpec] = {
     "qwen3-moe-30b": ArchSpec(
         name="qwen3-moe-30b", hf_dir="Qwen3-30B-A3B",
         ft_to_hf=dict(ATTN_ONLY_TARGETS),
-        seq_len=2048, global_batch_tokens=4096, steps=20,
-        gpu_gib=78.0, host_gib=320.0, tolerance=0.20,
-        notes="Big MoE; needs >=80 GB GPU.",
+        seq_len=2048, global_batch_tokens=65536, steps=5,
+        gpu_gib=22.5, host_gib=110.0, tolerance=0.20,
+        notes=(
+            "Qwen3-MoE 30B-A3B (128 experts, top-K=8, 48 layers). "
+            "Attn-only LoRA at batch=65536 fits 24 GiB GPU + 117 GiB host. "
+            "Same shape as Qwen3.5-MoE-35B-A3B run."
+        ),
     ),
     "qwen3.5-moe-35b": ArchSpec(
         name="qwen3.5-moe-35b", hf_dir="Qwen3.5-35B-A3B",
