@@ -361,6 +361,16 @@ def from_pretrained(
     # and producing the no-recompute symptom).
     if hw_cost is None:
         hw_cost = HardwareCost(peak_tflops=60.0, pcie_bw_gbps=20.0)
+    if verbose:
+        # cudaHostRegister of large host buffers (host_act_buffer +
+        # host params/grads/opt-state) is silent and can take 10-60s.
+        # Print a heartbeat so users running under nsys / nvprof don't
+        # mistake the silent window for a hang.
+        print(
+            "[from_pretrained] Building engine + pinning host buffers "
+            "(this can take 10-60s for large models)...",
+            flush=True,
+        )
     am = ActiveModel(
         embed=embed, backbone=backbone, head=head, optimizer=optimizer,
         working_set=working_set,
@@ -368,14 +378,23 @@ def from_pretrained(
         dims=dims, device=device,
         force_saved_act_level=force_saved_act_level,
     )
+    if verbose:
+        print("[from_pretrained] Engine ready.", flush=True)
 
     # 6. Load + permute weights.
     if load_weights:
+        if verbose:
+            print(
+                f"[from_pretrained] Loading HF safetensors from {model_path}...",
+                flush=True,
+            )
         am.load_hf(model_path, strict=strict)
         # Arch-specific post-load fixups (Q/K halved→pair, tied head, ...).
         post_load = getattr(arch_module, "post_load_permute", None)
         if post_load is not None:
             post_load(am, hf_config, dims, hyperparams)
+        if verbose:
+            print("[from_pretrained] Weights loaded.", flush=True)
 
     # 7. LoRA auto-init: ``A ~ N(0, lora_a_std)``, ``B = 0`` so the LoRA
     # delta starts at zero (model behaves identically to the base at
