@@ -211,6 +211,7 @@ def from_pretrained(
     load_weights: bool = True,
     strict: bool = False,
     verbose: bool = False,
+    min_chunk_size: int | None = None,
 ) -> ActiveModel:
     """Build a configured :class:`ActiveModel` for an HF model directory.
 
@@ -346,6 +347,7 @@ def from_pretrained(
         mem_bw_gbps=mem_bw_gbps,
         fixed_seq_len=fixed_seq_len,
         verbose=verbose,
+        min_chunk_size=min_chunk_size,
     )
 
     # 5. Build engine. ``hw_cost`` must come from the caller — either
@@ -491,6 +493,8 @@ _ARCH_MODULE_OVERRIDES: dict[str, str] = {
     "MistralForCausalLM": "mistral",
     "Qwen2ForCausalLM": "qwen2",
     "Qwen3ForCausalLM": "qwen3",
+    "Qwen3_5ForCausalLM": "qwen3_5",
+    "Qwen3_5ForConditionalGeneration": "qwen3_5",
     "Qwen3MoeForCausalLM": "qwen3_moe",
     "Qwen3NextForCausalLM": "qwen3_next",
     "OlmoeForCausalLM": "olmoe",

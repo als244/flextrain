@@ -24,18 +24,18 @@ Architecture (per Qwen3-Next, also Qwen 3.5 / 3.6 hybrid layers):
 
 Activation schema (max_tier=3):
 
-* Tier 0 — always saved (small):
-    ``a`` (T, n_v_heads),  ``b`` (T, n_v_heads),
-    ``z`` (T, n_v_heads * head_v_dim),
-    ``conv_in`` (T, conv_dim),         -- pre-conv mixed_qkv (for conv bwd)
-* Tier 1 — flash-attn-equivalent state:
-    ``q``, ``k``, ``v``, ``g``, ``A``  -- needed by FLA bwd
-    ``core_attn_out``                  -- FLA fwd output, before norm
-* Tier 3 — large outputs reconstructable from tier 0/1:
-    ``post_conv``                      -- silu(conv1d(conv_in)) [recomputable]
-
-For the first cut we keep everything at tier 0 / 1 and skip the recompute
-path; the engine still rotates through these activations correctly.
+* Tier 0 — always saved (correctness-required, no recompute path):
+    ``lin_a`` (T, n_v_heads), ``lin_b`` (T, n_v_heads)        -- raw a/b
+    ``lin_g`` / ``lin_g_post`` (T, n_v_heads) fp32           -- gate scalars
+    ``lin_q_rstd`` / ``lin_k_rstd`` (T, n_v_heads) fp32       -- l2-norm rstds
+    ``lin_z`` (T, n_v_heads, head_v_dim)                      -- gated-RMSNorm gate
+* Tier 2 — recomputable via ``fwd_recompute_fla`` from tier-3 + Q/K/V:
+    ``lin_q``, ``lin_k``, ``lin_v`` (post-GVA, post-l2norm-input)
+    ``lin_A_int``                                             -- FLA scratch
+    ``lin_core_out``                                          -- FLA output
+* Tier 3 — recomputable via ``fwd_recompute_post_conv`` from x_inp:
+    ``lin_conv_in``                                           -- pre-conv qkv concat
+    ``lin_post_conv_pre_silu``                                -- conv output (pre-silu)
 """
 from __future__ import annotations
 
@@ -232,26 +232,31 @@ class GatedDeltaNetBlock:
             # l2 norm explicitly. We save only the rstd (small, fp32)
             # and recompute the normalized q/k in bwd from the saved
             # un-normalized q_h/k_h.
+            # After GVA repeat_interleave, q_h / k_h have shape
+            # ``(T, num_v_heads, head_k_dim)`` so l2norm_fwd produces
+            # rstds of shape ``(T, num_v_heads)``. (For Qwen3.5-2B with
+            # grp=1 this happens to equal num_k_heads; for 9B with
+            # grp=2 it's num_v_heads.)
             ActivationField(
                 "lin_q_rstd",
-                lambda n, d: (n, cfg.num_k_heads),
+                lambda n, d: (n, cfg.num_v_heads),
                 torch.float32, tier=0,
             ),
             ActivationField(
                 "lin_k_rstd",
-                lambda n, d: (n, cfg.num_k_heads),
+                lambda n, d: (n, cfg.num_v_heads),
                 torch.float32, tier=0,
             ),
-            # ==================================================
-            # Tier 1: gate vector for the gated RMSNorm.
-            # ``z`` flows through gated-RMSNorm bwd directly so
-            # we save it. Larger than tier-0 fields but still
-            # smaller than the full conv input.
-            # ==================================================
+            # Gated-RMSNorm gate. ``z`` flows through gated-RMSNorm
+            # bwd directly and there is no recompute path for it
+            # (it's a separate projection ``x @ W_qkvz`` slice that
+            # we'd need to redo, but the recompute helpers don't
+            # produce z). So tier 0 — required-for-correctness, not
+            # an optional save.
             ActivationField(
                 "lin_z",
                 lambda n, d: (n, cfg.num_v_heads, cfg.head_v_dim),
-                bf, tier=1,
+                bf, tier=0,
             ),
             # ==================================================
             # Tier 2: post-conv Q/K/V, FLA scratch, FLA core output.
@@ -975,13 +980,42 @@ class GatedDeltaNetBlock:
     def compute_cost(self, chunk: ChunkMeta, max_tier: int) -> ComputeCost:
         cfg = self.cfg
         T = chunk.total_q
-        # Rough order: conv O(T * conv_dim * K), three projections, FLA.
-        # FLA is roughly proportional to T * n_v_heads * (K * V).
-        flops = (
-            T * cfg.conv_dim * cfg.conv_kernel_size +
-            T * cfg.d_model * cfg.proj_qkvz_dim * 2 +
-            T * cfg.d_model * cfg.proj_ba_dim * 2 +
-            T * cfg.value_dim * cfg.d_model * 2 +
-            T * cfg.num_v_heads * cfg.head_k_dim * cfg.head_v_dim * 8
+        # Forward FLOP decomposition:
+        #   proj      : x @ W_qkvz + x @ W_ba   (matmul, factor 2)
+        #   conv      : depthwise conv1d         (mul + add, factor 2)
+        #   fla       : chunk-gated-delta-rule  (rough constant factor)
+        #   out_proj  : core_out @ W_out        (matmul, factor 2)
+        # Out-proj and gated-RMSNorm are NOT in any recompute path — bwd
+        # uses saved ``lin_core_out`` and saved ``lin_z`` directly to
+        # compute their gradients without re-running the forward op,
+        # so they don't appear in ``avoided``.
+        proj = (
+            2 * T * cfg.d_model * cfg.proj_qkvz_dim
+            + 2 * T * cfg.d_model * cfg.proj_ba_dim
         )
-        return ComputeCost(flops_by_tier={t: flops for t in range(max_tier + 1)})
+        conv = 2 * T * cfg.conv_dim * cfg.conv_kernel_size
+        fla = T * cfg.num_v_heads * cfg.head_k_dim * cfg.head_v_dim * 8
+        out_proj = 2 * T * cfg.value_dim * cfg.d_model
+        total = proj + conv + fla + out_proj
+
+        # avoided_recompute_flops[L] = forward FLOPs we DON'T have to
+        # rerun in bwd if we saved at tier L. Recompute paths:
+        #   Tier 0/1 dropped: not allowed -- z, lin_q_rstd etc. are
+        #     correctness-required, no recompute path exists.
+        #   Tier 2 saved: ``fwd_recompute_fla`` skipped (FLA not redone).
+        #   Tier 3 saved: also ``fwd_recompute_post_conv`` skipped
+        #     (projections + conv1d + silu not redone).
+        avoided = [0] * (max_tier + 1)
+        if max_tier >= 2:
+            avoided[2] = fla
+        if max_tier >= 3:
+            avoided[3] = fla + conv + proj
+        # Make monotone non-decreasing for any tiers in between (the DP
+        # solver requires this; tier 1 inherits tier 0's value).
+        for t in range(1, max_tier + 1):
+            if avoided[t] < avoided[t - 1]:
+                avoided[t] = avoided[t - 1]
+        return ComputeCost(
+            total_fwd_flops=total,
+            avoided_recompute_flops=tuple(avoided),
+        )

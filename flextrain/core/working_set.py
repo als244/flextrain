@@ -702,7 +702,11 @@ def determine_working_set_config(
         )
 
     if min_chunk_size is not None:
-        init_target_min_chunk = max(min_chunk_size, init_target_min_chunk)
+        # Caller-supplied min_chunk_size overrides the AI-bound
+        # heuristic. Useful for inference / unit-test forwards on
+        # short inputs, where the throughput-oriented AI lower bound
+        # would reject every divisor of the actual batch size.
+        init_target_min_chunk = min_chunk_size
 
     init_chunk_size_options = sorted(get_divisors(target_tokens_per_round), reverse=True)
 
