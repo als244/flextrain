@@ -212,6 +212,7 @@ def download_dataset(
     target_path: str | os.PathLike,
     *,
     split: str = "train",
+    config: str | None = None,
     force: bool = False,
     verbose: bool = True,
 ) -> str:
@@ -266,11 +267,15 @@ def download_dataset(
         ) from e
 
     if verbose:
+        cfg_str = f", config={config}" if config else ""
         print(
-            f"[download] loading HF dataset {dataset_spec} (split={split})...",
+            f"[download] loading HF dataset {dataset_spec} (split={split}{cfg_str})...",
             flush=True,
         )
-    ds = load_dataset(dataset_spec, split=split)
+    if config is not None:
+        ds = load_dataset(dataset_spec, config, split=split)
+    else:
+        ds = load_dataset(dataset_spec, split=split)
 
     kept = 0
     skipped = 0
