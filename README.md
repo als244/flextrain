@@ -6,8 +6,30 @@ activations between GPU and host RAM via a working-set planner + DP
 solver, so an 8B model trains end-to-end on a 24 GiB GPU without
 DeepSpeed or FSDP.
 
-Supported architectures: Llama-3, Qwen2/3, Qwen3-MoE, OLMoE, Qwen3-Next,
-Gemma 2/3. See [`docs/architectures.md`](docs/architectures.md).
+Supported architectures: Llama-3, Qwen2/3, Qwen3-MoE, Qwen3.5,
+Qwen3.5-MoE / Qwen3.6-MoE, OLMoE, Qwen3-Next, Gemma 2/3. See
+[`docs/architectures.md`](docs/architectures.md).
+
+### Verified end-to-end (RTX 3090 24 GiB GPU + 117 GiB host)
+
+Each model below has been verified with greedy generation (coherent
+output, hits EOS naturally) and a 5-step LoRA-all training smoke
+(loss curve descending, no NaN/inf):
+
+| Model | Params | Arch | LoRA loss curve (5 steps) |
+|---|---|---|---|
+| Llama-3.2-1B | 1B | dense | (in test_arch_lora_e2e) |
+| OLMoE-1B-7B | 7B / 1B-active | MoE (64 experts) | 1.56 → 1.30; full FT 1.56 → 1.06 |
+| Qwen3-8B | 8B | dense, QK-norm | 1.41 → 1.04 |
+| Qwen3.5-9B | 9B | hybrid linear+full attn, dense MLP | 1.68 → 1.07 |
+| Qwen3.6-27B | 27B | hybrid linear+full attn, dense MLP | 2.83 → 1.54 |
+| Qwen3-30B-A3B | 30B / 3B-active | MoE (128 experts) | 1.31 → 0.99 |
+| Qwen3.5-MoE-35B-A3B | 35B / 3B-active | hybrid + MoE (256+1 experts) | 2.54 → 1.10 |
+
+Additional models supported by the existing arch loaders (require a
+larger machine to actually train): Qwen3.5-27B, Qwen3.6-35B-A3B,
+Qwen3.5-122B-A10B, Qwen3.5-397B-A17B, Qwen3-Coder-30B-A3B-Instruct
+(no new wiring needed; they reuse `Qwen3_5*` / `Qwen3Moe*` arch ids).
 
 ## Install
 
