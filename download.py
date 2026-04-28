@@ -9,18 +9,55 @@ Designed for the air-gapped-compute-node workflow: run this on a login
 node with internet, then pass the resulting paths to ``train.py`` on the
 compute node.
 
-The actual download logic lives in :mod:`flextrain.io.download` so this
-file stays a thin argparse shim and ``train.py`` can share the same
-implementation.
+Standalone import policy
+------------------------
+This file MUST be runnable on head / login nodes without GPU and
+without a working CUDA / Triton stack. The actual download logic lives
+in ``flextrain/io/download.py``, but importing that submodule normally
+triggers ``flextrain/__init__.py`` (which pulls in the engine, ops
+kernels, the matmul-dispatcher workspace init, etc.). To avoid that,
+we load the download module's source file directly via ``importlib``,
+bypassing the package's top-level side effects.
 """
 
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import os
 import sys
 
-from flextrain.io.download import download_dataset, download_model
+
+def _load_download_module():
+    """Import flextrain/io/download.py without triggering
+    ``flextrain/__init__.py`` or ``flextrain/io/__init__.py``. Those
+    init files import the engine + ops kernels + matmul_dispatcher,
+    which fail on head nodes without a GPU. The download module
+    itself only uses the stdlib + ``huggingface_hub`` + ``datasets``
+    (the latter two lazy-imported inside the functions), so once it's
+    loaded directly there are no further GPU dependencies.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    src = os.path.join(here, "flextrain", "io", "download.py")
+    if not os.path.isfile(src):
+        raise FileNotFoundError(
+            f"download module source not found at {src!r}. "
+            "Run from the repo root."
+        )
+    spec = importlib.util.spec_from_file_location(
+        "flextrain_download_standalone", src,
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"could not build module spec for {src!r}")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_dl = _load_download_module()
+download_model = _dl.download_model
+download_dataset = _dl.download_dataset
 
 
 def _build_parser() -> argparse.ArgumentParser:
