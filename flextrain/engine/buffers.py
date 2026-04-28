@@ -412,10 +412,11 @@ class BufferManager:
             head_dim = int(self.dims["head_dim"])
 
         if verbose:
+            import sys
             print(
                 f"[BufferManager] Pinning host master/grad/opt for "
                 f"{len(self.layer_param_specs)} backbone layers...",
-                flush=True,
+                flush=True, file=sys.stderr,
             )
         # ---- Allocate host master params / grads / opt for every layer ----
         # All host-side allocation goes through self.host_backend so we
@@ -442,10 +443,11 @@ class BufferManager:
                 (layer_idx + 1) % 8 == 0
                 or layer_idx + 1 == len(self.layer_param_specs)
             ):
+                import sys
                 print(
                     f"[BufferManager]   layer {layer_idx + 1}/"
                     f"{len(self.layer_param_specs)} pinned",
-                    flush=True,
+                    flush=True, file=sys.stderr,
                 )
 
         # embed
@@ -585,21 +587,32 @@ class BufferManager:
         # ---- Host activation buffer (routed through host backend) ----
         if working_set.host_act_buffer_size > 0:
             if verbose:
+                import sys
                 print(
                     f"[BufferManager] Pinning host activation buffer "
                     f"({working_set.host_act_buffer_size / (1 << 30):.2f} GiB)..."
                     " This is one big cudaHostRegister and can take 10-30s.",
-                    flush=True,
+                    flush=True, file=sys.stderr,
                 )
             self.host_act_buffer = self.host_backend.allocate_tensor(
                 (working_set.host_act_buffer_size,), torch.uint8
             )
             if verbose:
-                print("[BufferManager] Host activation buffer pinned.", flush=True)
+                import sys
+                print(
+                    "[BufferManager] Host activation buffer pinned.",
+                    flush=True, file=sys.stderr,
+                )
         else:
             self.host_act_buffer = None
 
         # ---- Embed + head resident GPU buffers (small, always resident) ----
+        if verbose:
+            import sys
+            print(
+                "[BufferManager] Allocating GPU embed+head buffers...",
+                flush=True, file=sys.stderr,
+            )
         self.gpu_embed_params = {}
         self.gpu_embed_grads = {}
         if embed_param_spec is not None:
@@ -620,6 +633,12 @@ class BufferManager:
             )
 
         # ---- KV context ----
+        if verbose:
+            import sys
+            print(
+                "[BufferManager] Allocating KV context windows...",
+                flush=True, file=sys.stderr,
+            )
         context_window = max(working_set.max_seq_len, working_set.max_chunk_size)
         self.kv_fwd = KVContextWindow.create(
             max_context_tokens=context_window,
@@ -631,6 +650,12 @@ class BufferManager:
         # Back-compat alias for layers that read dk / dv as separate tensors.
         self.kv_bwd_dk = self.kv_fwd.dk
         self.kv_bwd_dv = self.kv_fwd.dv
+        if verbose:
+            import sys
+            print(
+                "[BufferManager] BufferManager construction complete.",
+                flush=True, file=sys.stderr,
+            )
 
     # ------------------------------------------------------------------
     # Accessors

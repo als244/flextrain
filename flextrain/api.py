@@ -366,10 +366,11 @@ def from_pretrained(
         # host params/grads/opt-state) is silent and can take 10-60s.
         # Print a heartbeat so users running under nsys / nvprof don't
         # mistake the silent window for a hang.
+        import sys
         print(
             "[from_pretrained] Building engine + pinning host buffers "
             "(this can take 10-60s for large models)...",
-            flush=True,
+            flush=True, file=sys.stderr,
         )
     am = ActiveModel(
         embed=embed, backbone=backbone, head=head, optimizer=optimizer,
@@ -380,14 +381,27 @@ def from_pretrained(
         verbose_init=verbose,
     )
     if verbose:
-        print("[from_pretrained] Engine ready.", flush=True)
+        import sys, torch as _t
+        try:
+            free_b, total_b = _t.cuda.mem_get_info(am.device)
+            mem_msg = (
+                f"GPU mem after engine init: {(total_b - free_b) / (1 << 30):.2f} GiB used / "
+                f"{total_b / (1 << 30):.2f} GiB total."
+            )
+        except Exception:
+            mem_msg = ""
+        print(
+            f"[from_pretrained] Engine ready. {mem_msg}".rstrip(),
+            flush=True, file=sys.stderr,
+        )
 
     # 6. Load + permute weights.
     if load_weights:
         if verbose:
+            import sys
             print(
                 f"[from_pretrained] Loading HF safetensors from {model_path}...",
-                flush=True,
+                flush=True, file=sys.stderr,
             )
         am.load_hf(model_path, strict=strict)
         # Arch-specific post-load fixups (Q/K halved→pair, tied head, ...).
@@ -395,7 +409,8 @@ def from_pretrained(
         if post_load is not None:
             post_load(am, hf_config, dims, hyperparams)
         if verbose:
-            print("[from_pretrained] Weights loaded.", flush=True)
+            import sys
+            print("[from_pretrained] Weights loaded.", flush=True, file=sys.stderr)
 
     # 7. LoRA auto-init: ``A ~ N(0, lora_a_std)``, ``B = 0`` so the LoRA
     # delta starts at zero (model behaves identically to the base at
