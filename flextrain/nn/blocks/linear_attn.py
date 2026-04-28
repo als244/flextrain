@@ -626,41 +626,25 @@ class GatedDeltaNetBlock:
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Backward of ``o_normed = silu(z) * rmsnorm(o, w) * w``.
 
-        Returns ``(do, dz, dw)``. Pure tensor math, no autograd. Used by
-        :meth:`bwd` to avoid re-running the gated-norm forward.
-        """
-        D = o.shape[-1]
-        o_f = o.float()
-        z_f = z.float()
-        do_f = do_normed.float()
-        w_f = weight.float()
+        Returns ``(do, dz, dw)``. Delegates to the fused
+        :func:`flextrain_gated_rmsnorm_bwd` Triton kernel — keeps all
+        per-(T, H, D) intermediates inside SRAM and only writes the
+        three outputs back to HBM, avoiding the ~10 fp32 (T, H, D)
+        intermediates the python path materialized.
 
-        # Forward intermediates (cheap, no kernels involved).
-        rms_sqr = (o_f * o_f).mean(dim=-1, keepdim=True).add_(eps)
-        rstd = rms_sqr.rsqrt()
-        normed = o_f * rstd                           # rmsnorm(o)
-        sig_z = z_f.sigmoid()
-        silu_z = z_f * sig_z                          # silu(z)
-        # o_normed = silu(z) * normed * w (broadcast over heads).
-        # We have do_normed; split through the silu(z) gate first.
-        d_silu_z = do_f * (normed * w_f)              # (T, H, D)
-        d_normed_w = do_f * silu_z                    # (T, H, D)
-        # silu(z) bwd: silu' = sigmoid(z) * (1 + z*(1-sigmoid(z)))
-        dsig = sig_z * (1.0 + z_f * (1.0 - sig_z))
-        dz_f = d_silu_z * dsig
-        # rmsnorm w bwd: o_normed_pre_silu = w * normed.
-        # d_normed_w = do_f * silu(z); we then split:
-        #   dw += sum_{T,H} (d_normed_w * normed)
-        #   d_normed = d_normed_w * w
-        dw_per_dim = (d_normed_w * normed).sum(dim=(0, 1))     # (head_v_dim,)
-        d_normed = d_normed_w * w_f                            # (T, H, D)
-        # rmsnorm fwd: normed = o * rstd.  o_f -> normed.
-        # d/do  normed_i = rstd * δ_ij - rstd^3 * o_i * o_j / D
-        # so do = rstd * d_normed - (rstd^3 / D) * o * sum(d_normed * o)
-        dot = (d_normed * o_f).sum(dim=-1, keepdim=True)
-        rstd3 = rstd * rstd * rstd
-        do_f_out = rstd * d_normed - (rstd3 / D) * o_f * dot
-        return do_f_out.to(o.dtype), dz_f.to(z.dtype), dw_per_dim.to(weight.dtype)
+        Math (verified by ``tests/test_gated_rmsnorm_bwd.py`` against
+        ``torch.autograd.grad`` on a pure-pytorch reference):
+
+            d_normed = dy * silu(z) * w
+            dot      = sum_d d_normed * o
+            do       = rstd * d_normed - (rstd^3 / D) * o * dot
+            dz       = dy * normed * w * silu'(z)
+            dw[d]    = sum_{T,H} dy * silu(z) * normed[..., d]
+        """
+        from flextrain.ops import flextrain_gated_rmsnorm_bwd
+        return flextrain_gated_rmsnorm_bwd(
+            do_normed, o, z, weight, eps,
+        )
 
     def _fla_autograd_fn(self):
         """A ``torch.autograd.Function`` wrapper around FLA's
@@ -900,12 +884,16 @@ class GatedDeltaNetBlock:
         # cat reverse → d_post_conv (T, conv_dim).
         d_post_conv = torch.cat([d_q_p, d_k_p, d_v_p], dim=-1)
 
-        # 6. silu bwd applied to post_conv_pre_silu.
-        # silu' = sigmoid(z) * (1 + z*(1-sigmoid(z)))
-        z_silu = post_conv_pre_silu.float()
-        sig_zs = z_silu.sigmoid()
-        dsilu = sig_zs * (1.0 + z_silu * (1.0 - sig_zs))
-        d_post_conv_pre_silu = (d_post_conv.float() * dsilu).to(dtype)
+        # 6. silu bwd applied to post_conv_pre_silu via fused Triton
+        # kernel. Computes d_post_conv_pre_silu = d_post_conv *
+        # silu'(post_conv_pre_silu) without materializing the
+        # ``sig_zs`` / ``dsilu`` intermediates that the python path
+        # would (~3 GiB at T=32768 conv_dim=8192). All math is in fp32
+        # in SRAM; output written directly to HBM in compute_dtype.
+        from flextrain.ops import flextrain_silu_bwd
+        d_post_conv_pre_silu = flextrain_silu_bwd(
+            post_conv_pre_silu, d_post_conv,
+        )
 
         # 7. Depthwise conv1d bwd.  fwd: post_conv = conv1d(conv_in.T)[..., :T].
         # We pad on the left by K-1 then truncate to T at the right (causal).

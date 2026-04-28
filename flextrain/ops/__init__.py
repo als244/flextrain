@@ -23,6 +23,7 @@ from ._kernels.cross_entropy import (
     flextrain_softmax_cross_entropy_loss,
 )
 from ._kernels.embed import flextrain_embedding_bwd
+from ._kernels.gated_rmsnorm import flextrain_gated_rmsnorm_bwd
 from ._kernels.moe import (
     flextrain_copy_expert_counts,
     flextrain_fused_topk_softmax,
@@ -48,6 +49,7 @@ from ._kernels.rope_partial import (
     flextrain_rope_partial_fwd,
 )
 from ._kernels.sample_top_p import flextrain_sample_top_p
+from ._kernels.silu_bwd import flextrain_silu_bwd
 from ._kernels.softmax import flextrain_softmax
 from ._kernels.swiglu import flextrain_swiglu_bwd, flextrain_swiglu_fwd
 
@@ -71,6 +73,7 @@ __all__ = [
     "flextrain_copy_expert_counts",
     "flextrain_cross_entropy_loss",
     "flextrain_embedding_bwd",
+    "flextrain_gated_rmsnorm_bwd",
     "flextrain_fused_topk_softmax",
     "flextrain_load_balance_bwd",
     "flextrain_moe_gather",
@@ -87,6 +90,7 @@ __all__ = [
     "flextrain_rope_partial_bwd",
     "flextrain_rope_partial_fwd",
     "flextrain_sample_top_p",
+    "flextrain_silu_bwd",
     "flextrain_softmax",
     "flextrain_softmax_cross_entropy_loss",
     "flextrain_swiglu_bwd",

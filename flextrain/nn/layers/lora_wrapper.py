@@ -401,30 +401,71 @@ class LoRAWrapperLayer:
         """Return a new weights dict with ``W' = W + A @ B * scale`` for
         every LoRA target. Non-target weights pass through unchanged.
 
-        For 3-D MoE expert stacks ``W: (E, d_in, d_out)``,
-        ``A: (E, d_in, r)``, ``B: (E, r, d_out)``: per-expert
-        ``W'[e] = W[e] + A[e] @ B[e] * scale`` via batched matmul.
+        2-D path: standard ``W' = W + (A @ B) * scale`` via PyTorch
+        matmul. The intermediate delta tensor is small enough not to
+        matter.
+
+        3-D MoE expert stack path (``W: (E, d_in, d_out)``,
+        ``A: (E, d_in, r)``, ``B: (E, r, d_out)``): we used to do
+        ``torch.bmm(A, B) * scale`` which materializes a full
+        ``(E, d_in, d_out)`` delta — at fp32 (the default LoRA
+        adapter dtype matching HF PEFT) this is 1 GiB for
+        Qwen3.5-MoE-35B's ``w_up`` (E=256, d_in=512, d_out=1024) and
+        OOMs a 24 GiB GPU. The fix: allocate ``eff`` as a single
+        ``(E, d_in, d_out)`` tensor in W's dtype (typically bf16),
+        then loop over experts using the cuBLASLt dispatcher's fused
+        ``D = alpha * (A_e @ B_e) + beta * C`` to write
+        ``eff[e] = scale * (A[e] @ B[e]) + W[e]`` directly. Same final
+        bytes as before but avoids the fp32 intermediate; total is
+        ~256 MiB per LoRA target at bf16 vs the prior >1.5 GiB peak.
+
+        The dispatcher requires A/B/C/D share dtype, so we cast A and
+        B to W's dtype per-expert. For typical attn LoRA on dense
+        layers the master/grad dtypes default to bf16 so this is a
+        no-op; for fp32 LoRA masters (HF PEFT parity) the cast happens
+        at compute time and the higher-precision update flows through
+        the optimizer step on host masters as usual.
         """
+        from flextrain.ops import dispatcher
         eff = dict(weights)
+        stream_ptr = torch.cuda.current_stream().cuda_stream
         for cfg in self.targets:
             W = weights[cfg.target_name]
             A = weights[cfg.a_name]
             B = weights[cfg.b_name]
-            # If A/B are higher precision than W, the LoRA delta is
-            # computed at the higher precision and cast back to W's
-            # dtype so the base block's matmul receives the expected
-            # dtype. (HF PEFT does the analogous thing in the unmerged
-            # path: the LoRA branch runs in fp32 and the result is
-            # cast to bf16 before adding to the base output.)
             if W.dim() == 2:
+                # Small-ish delta; PyTorch matmul is fine and avoids the
+                # extra dispatcher-allocator path. Keep as-is.
                 delta = (A @ B) * cfg.scale
+                eff[cfg.target_name] = (W + delta.to(W.dtype)).contiguous()
             elif W.dim() == 3:
-                delta = torch.bmm(A, B) * cfg.scale
+                E, d_in, d_out = W.shape
+                # Pre-allocate one full effective buffer in W's dtype.
+                # PyTorch's caching allocator reuses these between
+                # successive layer forwards, so the steady-state cost
+                # is one (E, d_in, d_out) buffer per LoRA target —
+                # not multiplied by E.
+                eff_W = torch.empty(
+                    (E, d_in, d_out), dtype=W.dtype, device=W.device,
+                )
+                # Ensure A, B match W's dtype (dispatcher requires
+                # all four tensors share dtype). Cheap when already
+                # equal; allocates per-expert otherwise.
+                A_w = A if A.dtype == W.dtype else A.to(W.dtype)
+                B_w = B if B.dtype == W.dtype else B.to(W.dtype)
+                for e in range(E):
+                    # eff_W[e] = scale * (A[e] @ B[e]) + W[e]
+                    dispatcher.matmul(
+                        stream_ptr,
+                        A=A_w[e], B=B_w[e],
+                        C=W[e], D=eff_W[e],
+                        alpha=cfg.scale, beta=1.0,
+                    )
+                eff[cfg.target_name] = eff_W
             else:
                 raise ValueError(
                     f"LoRA: unexpected W rank {W.dim()} for {cfg.target_name!r}"
                 )
-            eff[cfg.target_name] = (W + delta.to(W.dtype)).contiguous()
         return eff
 
     # ------------------------------------------------------------------
@@ -432,18 +473,26 @@ class LoRAWrapperLayer:
     # ------------------------------------------------------------------
 
     def forward(self, x, chunk: ChunkMeta, weights, slot, ctx: LayerContext):
-        # No slot.aux state — bwd reads A/B from `weights` directly and
-        # rebuilds ``eff`` lazily. This avoids the issue where the
-        # engine's activation prefetch creates a fresh ``ActivationSlot``
-        # (with empty ``aux``) when restoring offloaded activations,
-        # which would lose any state stashed in fwd.
+        # Forward builds ``eff`` (W + A@B*scale) once and the saved
+        # activations get to see it. We do NOT cache eff across fwd+bwd:
+        # the engine's activation prefetch creates a fresh
+        # ``ActivationSlot`` (with empty ``aux``) when restoring
+        # offloaded activations, so any stash in ``slot.aux`` here is
+        # lost by the time bwd runs.
         eff = self._build_effective_weights(weights)
         return self.base.forward(x, chunk, eff, slot, ctx)
 
     def forward_recompute(self, slot, chunk, weights, ctx) -> None:
-        # Recompute uses the effective weights — rebuild fresh each call
-        # to avoid the cross-layer OOM that storing them would cause.
+        # Recompute happens during the bwd phase. We stash ``eff`` on
+        # ``slot.aux`` so the immediately-following ``backward_dgrad``
+        # / ``backward_wgrad`` pair can reuse it without rebuilding —
+        # rebuilding 3-D MoE eff is expensive (256 sequential
+        # dispatcher calls per LoRA target) and doubles peak memory.
+        # The slot used here is the SAME ``dev_slot`` the engine then
+        # passes to ``backward`` (active_model.py:1292/1300), so
+        # stashing on slot.aux is safe.
         eff = self._build_effective_weights(weights)
+        slot.aux["__lora_eff__"] = eff
         self.base.forward_recompute(slot, chunk, eff, ctx)
 
     # ------------------------------------------------------------------
@@ -518,8 +567,14 @@ class LoRAWrapperLayer:
         """Wrap the base's ``backward_dgrad``. ``skip_target_names`` is
         widened to include both this wrapper's LoRA targets AND
         whatever the engine already wanted to skip (the LoRA fast-path
-        set inside this wrapper specifically)."""
-        eff = self._build_effective_weights(weights)
+        set inside this wrapper specifically).
+
+        Reuses ``slot.aux["__lora_eff__"]`` if ``forward_recompute``
+        stashed one there earlier in this same bwd phase.
+        """
+        eff = slot.aux.get("__lora_eff__")
+        if eff is None:
+            eff = self._build_effective_weights(weights)
         # The base also needs slow-path scratch grad buffers for any
         # LoRA target that can't take the fast path. With the current
         # set _FAST_PATH_TARGETS this is empty for all supported
@@ -630,8 +685,14 @@ class LoRAWrapperLayer:
         """Wrap the base's ``backward_wgrad``. The base sees
         ``eff`` (effective weights) and ``combined_grads`` (with
         scratch slots for slow-path projections), and skips the
-        addmm for any name in our fast-path LoRA target set."""
-        eff = self._build_effective_weights(weights)
+        addmm for any name in our fast-path LoRA target set.
+
+        Reuses ``slot.aux["__lora_eff__"]`` if ``forward_recompute``
+        / ``backward_dgrad`` already populated one this bwd phase.
+        """
+        eff = slot.aux.get("__lora_eff__")
+        if eff is None:
+            eff = self._build_effective_weights(weights)
         scratch_grads = intermediates.aux.get(
             "lora_slow_scratch_grads", {}
         )
@@ -643,6 +704,11 @@ class LoRAWrapperLayer:
             intermediates, eff, combined_grads, slot, ctx,
             skip_target_names=skip_for_base,
         )
+        # Release the cached eff at the end of the bwd pair so the
+        # caching allocator can reuse the (E, d_in, d_out) buffer for
+        # the next layer. Without this the cache would persist across
+        # all 40 layers' bwd calls and defeat the memory savings.
+        slot.aux.pop("__lora_eff__", None)
 
     # ------------------------------------------------------------------
     # accumulate_lora_grads: the actual LoRA Wgrad math.
