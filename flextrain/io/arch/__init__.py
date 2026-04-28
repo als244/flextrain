@@ -21,10 +21,11 @@ from . import olmoe  # noqa: F401
 from . import qwen2  # noqa: F401
 from . import qwen3  # noqa: F401
 from . import qwen3_5  # noqa: F401
+from . import qwen3_5_moe  # noqa: F401
 from . import qwen3_moe  # noqa: F401
 from . import qwen3_next  # noqa: F401
 
 __all__ = [
     "gemma2", "gemma3", "llama", "olmoe", "qwen2",
-    "qwen3", "qwen3_5", "qwen3_moe", "qwen3_next",
+    "qwen3", "qwen3_5", "qwen3_5_moe", "qwen3_moe", "qwen3_next",
 ]

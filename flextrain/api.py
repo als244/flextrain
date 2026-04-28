@@ -523,6 +523,8 @@ _ARCH_MODULE_OVERRIDES: dict[str, str] = {
     "Qwen3_5ForConditionalGeneration": "qwen3_5",
     "Qwen3MoeForCausalLM": "qwen3_moe",
     "Qwen3NextForCausalLM": "qwen3_next",
+    "Qwen3_5MoeForCausalLM": "qwen3_5_moe",
+    "Qwen3_5MoeForConditionalGeneration": "qwen3_5_moe",
     "OlmoeForCausalLM": "olmoe",
     "Gemma2ForCausalLM": "gemma2",
     "Gemma3ForCausalLM": "gemma3",

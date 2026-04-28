@@ -46,11 +46,15 @@ def _qwen3_next_post_load_hook(
 
     Same convention as Gemma 2 — see ``_gemma2_post_load_hook``.
     """
-    # ----- (1) RMSNorm γ shift: HF stores γ_canonical - 1. -----
+    # ----- (1) RMSNorm γ shift: HF stores γ_canonical - 1 for the
+    # NON-GATED norms (Qwen3NextRMSNorm uses ``init.zeros_`` + forward
+    # ``output * (1 + weight)``). The GATED norm (Qwen3NextRMSNormGated,
+    # used as ``linear_attn.norm`` aka ``w_lin_norm``) uses
+    # ``init.ones_`` + plain ``weight * x`` — store γ_canonical directly
+    # and must NOT be shifted.
     _norm_field_names = (
-        "w_attn_norm",          # input_layernorm
+        "w_attn_norm",          # input_layernorm  (Qwen3NextRMSNorm)
         "w_ffn_norm",           # post_attention_layernorm
-        "w_lin_norm",           # linear_attn.norm
         "w_q_norm",             # full-attn per-head q_norm
         "w_k_norm",             # full-attn per-head k_norm
     )
