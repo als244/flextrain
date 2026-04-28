@@ -1,278 +1,164 @@
 # FlexTrain
 
-A flexible-precision, working-set-aware training engine for transformer
-language models. Built around AdaWS-style activation/parameter rotation
-between GPU and host memory, with hand-written Triton kernels for the
-hot paths and an explicit per-block "activation slot" abstraction that
-makes recomputation, offloading, and mixed precision composable.
+Train transformer LLMs on hardware where the model doesn't fit in GPU
+memory. FlexTrain rotates parameters, gradients, optimizer state, and
+activations between GPU and host RAM via a working-set planner + DP
+solver, so an 8B model trains end-to-end on a 24 GiB GPU without
+DeepSpeed or FSDP.
 
-FlexTrain trains pretrained HF models (Llama-3, Qwen2/3, Qwen3-MoE,
-OLMoE, Qwen3-Next, Gemma 2/3 — see [supported architectures](docs/architectures.md))
-on hardware whose GPU memory is much smaller than the model — without
-reaching for FSDP or DeepSpeed.
+Supported architectures: Llama-3, Qwen2/3, Qwen3-MoE, OLMoE, Qwen3-Next,
+Gemma 2/3. See [`docs/architectures.md`](docs/architectures.md).
 
-## Status
-
-| Capability | Status |
-|------------|--------|
-| Llama-3.1-8B end-to-end on a 24 GiB GPU | ✓ |
-| OLMoE-1B-7B end-to-end (HF weights, real data) | ✓ |
-| Qwen3-MoE small-init parity vs naive PyTorch | ✓ |
-| Qwen3-Next (alternating linear+full attention) | fwd+bwd blocks landed; full-arch end-to-end pending |
-| Hybrid Muon + AdamW optimizer | ✓ (per-tensor classification) |
-| MoE expert offloading | ✓ |
-| LoRA fine-tuning (dense + per-expert MoE) | ✓ (Llama-3.1-8B E2E vs HF PEFT, OLMoE-1B-7B E2E) |
-| Gemma 2 / 3 | pending |
-| DDP / ZeRO-1 | pending |
-
-See [docs/SESSION_NOTES.md](docs/SESSION_NOTES.md) for a running log of
-decisions, findings, and known gaps.
-
-## Installation
-
-FlexTrain needs a CUDA-enabled PyTorch and a matching Triton. Use any
-PyTorch build that targets your driver — there's no hard pin on a CUDA
-version. Two C helpers ship in-tree under `helpers/` and are built
-automatically by `pip install`:
-
-* `matmul_dispatcher` — cuBLASLt dispatcher (CMake + CUDA, needs a C++17
-  compiler and the CUDA toolkit's `cublasLt` / `cudart` available to
-  CMake's `find_package(CUDAToolkit)`).
-* `transmission_scheduler` — DP solver used by the working-set planner
-  (a plain C extension).
+## Install
 
 ```bash
-# 1. Set up a conda env with PyTorch + Triton.
 conda create -n flextrain python=3.12
 conda activate flextrain
 pip install torch triton
-
-# 2. Install FlexTrain (also builds the two helpers under helpers/).
 pip install -e .
-
-# 3. (Optional) For Qwen3-Next / Qwen3.5 / Qwen3.6 hybrid linear-attention layers.
-pip install -e ".[linear-attention]"
 ```
 
-For Hopper / Blackwell GPUs you'll also want Flash Attention 3
-(`pip install -e ".[flash-attn]"`) — the engine prefers it when
-available and silently falls back otherwise.
-
-If you need to skip the helper builds (e.g. iterating on Python-only
-changes), set `FLEXTRAIN_SKIP_HELPERS=1` before running `pip install`.
+The install builds two in-tree C/CUDA helpers (`matmul_dispatcher`,
+`transmission_scheduler`); set `FLEXTRAIN_SKIP_HELPERS=1` to skip them
+when iterating on Python-only code. Optional extras:
+`-e ".[flash-attn]"` (Hopper/Blackwell), `-e ".[linear-attention]"`
+(Qwen3-Next).
 
 ## Quickstart
 
-The shortest first run is the top-level `train.py` entrypoint, where the
-user picks:
-
 ```bash
 python train.py \
-  --model models/Llama-3.1-8B \
+  --model meta-llama/Llama-3.1-8B \
   --mode lora \
   --seq-len 1024 \
   --global-batch-tokens 1024
 ```
 
-That gives you:
+Auto-discovers your GPU + host memory budgets, probes hardware
+(sustained TFLOPS / PCIe / mem bandwidth), downloads the model into
+`models/` if needed, runs 20 steps on a tiny bundled SFT dataset, and
+logs to `runs/<model>_<mode>_sl<seq_len>`.
 
-* a real HF checkpoint
-* one explicit choice between `full` and `lora`
-* a real SFT run on the bundled sample dataset
-* per-step logging for loss, tok/s, and memory
-* no final checkpoint export unless you add `--save`
-* explicit setup logs before the first training step
+Common flags:
 
-By default this command:
+| flag | what it does |
+|---|---|
+| `--mode {full,lora}` | full fine-tune or LoRA |
+| `--use-muon` | use HybridMuonAdamW for `--mode full` (Muon on dense projections, AdamW elsewhere) |
+| `--data-source {synthetic,json_sft}` | synthetic tokens or SFT JSONL |
+| `--dataset path/or/repo` | local JSONL, HF repo, or http(s) URL |
+| `--max-gpu-mem-gib N` / `--max-host-mem-gib N` | override auto-discovered budgets |
+| `--force-save-level {0,1,2,3}` | force activation save-tier (debug) |
+| `--save` | export `final.safetensors` after training |
 
-* uses `flextrain/configs/examples/data/tiny_math_sft.json`
-* downloads the model into `models/` if needed
-* runs 20 steps
-* writes logs under `runs/<model>_<mode>_sl<seq_len>`
+Run `python train.py --help` for the full list.
 
-To train on synthetic tokens instead, switch the data source:
+### Learning rate schedule
 
-```bash
-python train.py \
-  --model models/Llama-3.1-8B \
-  --mode lora \
-  --seq-len 1024 \
-  --global-batch-tokens 1024 \
-  --data-source synthetic
-```
+Every run uses linear warmup → constant peak → cosine cooldown. Tune via:
 
-`--synthetic-seq-len` is optional; if omitted it defaults to `--seq-len`.
+| flag | default | what |
+|---|---|---|
+| `--lr` | 3e-5 (full), 1e-4 (lora), 1e-3 (`--use-muon`) | peak (max) LR |
+| `--lr-warmup-pct` | 0.1 | fraction of steps spent ramping 0 → peak |
+| `--lr-cooldown-start-pct` | 0.8 | fraction at which cosine cooldown begins |
+| `--lr-final-pct` | 0.1 | final LR as a fraction of peak |
 
-To train on your own dataset, keep using `--dataset`. If the file exists
-locally, FlexTrain uses it directly. If it does not exist, FlexTrain
-first tries to download/materialize it and then trains from the local
-JSONL it creates:
+Example with a tighter warmup and a deeper cooldown:
 
 ```bash
-python train.py \
-  --model models/Llama-3.1-8B \
-  --mode lora \
-  --seq-len 1024 \
-  --global-batch-tokens 1024 \
-  --dataset open-r1/OpenR1-Math-220k
+python train.py --model models/Llama-3.1-8B --mode full \
+  --seq-len 1024 --global-batch-tokens 524288 \
+  --lr 5e-5 --lr-warmup-pct 0.03 --lr-final-pct 0.01
 ```
 
-That download path is meant for SFT-style datasets. It normalizes common
-schemas like `instruction/output`, `prompt/completion`,
-`question/answer`, and chat-style `messages` into a local JSONL before
-training.
+## Air-gapped compute nodes
 
-Examples:
+If your training nodes have no internet, pre-stage the model + dataset
+on a login node with `download.py`, then point `train.py` at the local
+paths:
 
 ```bash
-# Full fine-tuning
-python train.py \
-  --model models/Llama-3.1-8B \
-  --mode full \
-  --seq-len 1024 \
-  --global-batch-tokens 1024
+# Login node (has internet):
+python download.py model meta-llama/Llama-3.1-8B --target models/Llama-3.1-8B
+python download.py dataset HuggingFaceH4/no_robots --target datasets/no_robots.jsonl
 
-# LoRA fine-tuning
-python train.py \
-  --model models/Llama-3.1-8B \
-  --mode lora \
-  --seq-len 2048 \
-  --global-batch-tokens 2048
+# Compute node (no internet):
+python train.py --model models/Llama-3.1-8B \
+                --data-source json_sft \
+                --dataset datasets/no_robots.jsonl \
+                --seq-len 1024 --global-batch-tokens 1024
 ```
 
-You should see setup messages like:
+The dataset path normalizes common SFT schemas (`instruction/output`,
+`prompt/completion`, chat-style `messages`, ...) into FlexTrain's JSONL
+format. `download.py model --allow-patterns '*.safetensors' '*.json'`
+skips redundant `pytorch_model.bin` shards.
 
-* `Preparing model from ...`
-* `Model is ready. Building tokenizer-backed SFT data source...`
-* `Starting training loop: ...`
-
-After that, the first training step can still take a while on large
-models before the first `[step ...]` line appears.
-
-### YAML Path
-
-If you want the fully explicit YAML-driven path, use:
-
-```bash
-python -m flextrain train flextrain/configs/examples/llama3_8b_math_sft.yaml
-```
-
-### Fine-tune a local HF checkpoint
-
-If you already have a local HF model directory, the shortest path is:
-
-```bash
-python train.py \
-  --model /path/to/your/model \
-  --mode lora \
-  --seq-len 1024 \
-  --global-batch-tokens 1024
-```
-
-You can still switch to a custom dataset with `--dataset path/to/data.json`.
-If that path does not exist, FlexTrain treats `--dataset` as a dataset
-spec and materializes it first.
-
-### Python API
-
-For programmatic use, the recommended entry point is
-`flextrain.from_pretrained`. It reads a local HF model directory,
-builds the engine, picks a working-set config that fits your hardware,
-loads weights, and applies any arch-specific fixups.
+## Python API
 
 ```python
-import torch
 from flextrain import from_pretrained
-from flextrain.bench.parity import _Seq, _flextrain_step
+from flextrain.core.hw_probe import probe_hardware
 from flextrain.optim.adamw import AdamW, AdamWHyperparams
 
-opt = AdamW(AdamWHyperparams(lr=3e-5))
+probe = probe_hardware()  # ~14s; sustained TFLOPS / PCIe / mem-bw
 am = from_pretrained(
     "models/Llama-3.1-8B",
-    optimizer=opt,
+    optimizer=AdamW(AdamWHyperparams(lr=3e-5)),
     max_seq_len=1024,
     max_global_batch_tokens=1024,
     max_gpu_mem_bytes=int(24 * (1 << 30)),
     max_host_mem_bytes=int(110 * (1 << 30)),
-    device="cuda:0",
+    hw_cost=probe.hw_cost,
+    mem_bw_gbps=probe.mem_bw_gbps,
 )
 
 for batch in your_dataloader:
-    seqs = [_Seq(s.tokens) for s in batch]
-    for d, s in zip(seqs, batch):
-        d.targets = s.targets
-    loss = _flextrain_step(am, seqs)
+    am.fwd_bwd(batch)
+    am.step()
 ```
 
-For LoRA, add `lora_targets="all"` (and optionally `lora_rank`,
-`lora_alpha`). `from_pretrained` initializes LoRA so the model starts
-at base behavior before the first update.
-
-## Documentation
-
-* [Architectures](docs/architectures.md) — what's supported, with HF
-  config keys.
-* [SFT vs pretraining](docs/sft_vs_pretraining.md) — how the two flows
-  differ in `seq.targets` masking, weight init, hyperparams.
-* [Dataset format](docs/dataset.md) — token / target / loss-mask
-  conventions, plus the built-in local JSON SFT source.
-* [Weight I/O](docs/weights.md) — HF safetensors load / save, custom
-  arch specs, expert-stacking hooks, post-load weight permutations.
-* [LoRA fine-tuning](docs/lora.md) — `LoRAWrapperLayer` API, MoE
-  per-expert LoRA, runnable Llama-3.2-1B example, HF PEFT parity.
-* [Implementing a new block / layer / model](docs/implementing.md) —
-  the protocol contracts (ParamSpec, ActivationSchema, Layer protocol),
-  save levels, save-tier conventions, when to use `slot.aux`,
-  `chunk.extra`, etc.
-* [Datatypes](docs/dtypes.md) — compute / master / grad / opt-state
-  dtypes, where each is honored, and recommended defaults per role.
-* [Optimizers](docs/optimizers.md) — AdamW, Muon, HybridMuonAdamW.
-* [Working set tuning](docs/working_set.md) — `n_gpu_layers`,
-  `n_gpu_grads`, `n_gpu_opt_layers`, save levels, target tokens.
+For LoRA, pass `lora_targets="all"` (and optionally `lora_rank`,
+`lora_alpha`).
 
 ## Layout
 
 ```
 flextrain/
-  core/         # Layer/Block protocols, ActivationSchema, save-level solver
-  engine/       # ActiveModel (the trainer), buffer manager, host backends
-  nn/
-    blocks/     # composable units (attention, FFN, MoE FFN, RMSNorm, RoPE,
-                # gated-DeltaNet, etc.)
-    layers/     # full transformer layers (Llama, Qwen3, Qwen3-MoE,
-                # OLMoE, Qwen3-Next, ...)
-  optim/        # AdamW, Muon, HybridMuonAdamW
-  ops/          # FlexTrain-owned Triton kernels
-    _kernels/   # private impl modules
-  io/
-    arch/       # per-architecture HF weight maps + config adapters
-    hf_weights.py
-  bench/        # parity testing + microbenchmarks
-  cli.py        # CLI wrapper for HF training (alpha)
-tests/
-docs/
-orig/           # reference port from the AdaWS prototype (not on PYTHONPATH
-                # for new code; only some test references reach into orig
-                # for cross-checks against the original Python layers)
+  core/      Layer/Block protocols, ActivationSchema, save-level DP solver,
+             working-set sizer, hardware probe
+  engine/    ActiveModel trainer, buffer manager, streams/events
+  nn/        blocks/ (attention, FFN, MoE, RoPE, ...) + layers/ (full models)
+  optim/     AdamW, Muon, HybridMuonAdamW
+  ops/       FlexTrain-owned Triton kernels
+  io/        HF weight load/save, per-arch adapters, download helpers
+  bench/     parity tests + microbenchmarks
+train.py     end-to-end CLI
+download.py  pre-stage models/datasets for air-gapped nodes
 ```
+
+## Documentation
+
+| | |
+|---|---|
+| [architectures.md](docs/architectures.md) | supported HF configs |
+| [working_set.md](docs/working_set.md) | how the planner picks chunk size, GPU layer counts, save tiers |
+| [sft_vs_pretraining.md](docs/sft_vs_pretraining.md) | targets / loss-mask conventions |
+| [dataset.md](docs/dataset.md) | data format + built-in JSON SFT source |
+| [weights.md](docs/weights.md) | HF safetensors I/O, custom archs |
+| [lora.md](docs/lora.md) | LoRA, MoE per-expert LoRA, HF PEFT parity |
+| [implementing.md](docs/implementing.md) | adding a new block / layer / model |
+| [dtypes.md](docs/dtypes.md) | compute / master / grad / opt-state dtypes |
+| [optimizers.md](docs/optimizers.md) | AdamW / Muon / HybridMuonAdamW |
 
 ## Tests
 
-The most rigorous correctness gates:
+Each test is a standalone script (no test runner yet):
 
-* `tests/test_save_level_parity.py` — bit-identical loss curves across
-  save levels. Catches silent activation-recompute bugs.
-* `tests/test_olmoe_1b7b_training.py` — OLMoE-1B-7B end-to-end on
-  real HF weights + real data; FT step-0 matches HF transformers.
-* `tests/test_random_init_pretraining.py` — cold-start regime on real
-  Llama-3 tokens.
-* `tests/test_muon_offloading_pretraining*.py` — Muon + offloading
-  parity for both dense and MoE.
-* `tests/test_olmoe_engine_parity.py`,
-  `tests/test_qwen3_moe_engine_parity.py` — small-init engine parity
-  for MoE archs vs naive PyTorch.
-* `tests/test_gated_deltanet_*.py` — Qwen3-Next linear-attention block
-  parity (fwd + bwd).
-
-Run individually with `python tests/<name>.py`. There is no test runner
-config yet — each test is a standalone script.
+```bash
+python tests/test_save_level_parity.py        # bit-identical loss across save tiers
+python tests/test_olmoe_1b7b_training.py      # OLMoE 1B-7B end-to-end on HF weights
+python tests/test_random_init_pretraining.py  # cold-start on real Llama-3 tokens
+python tests/test_muon_offloading_pretraining_moe.py  # Muon + offload parity
+```

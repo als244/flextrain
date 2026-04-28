@@ -5,7 +5,6 @@ import importlib
 import json
 import os
 import time
-from collections.abc import Iterable
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -14,66 +13,30 @@ import torch
 
 from flextrain import from_pretrained
 from flextrain.config import IOConfig
+from flextrain.io.download import (
+    download_dataset,
+    download_model,
+    hf_checkpoint_is_complete,
+)
 from flextrain.io.hf_weights import select_arch
 from flextrain.io.sources import JsonSFTTokenSource, SyntheticTokenSource
 from flextrain.optim.adamw import AdamW, AdamWHyperparams
-
-
-def _hf_checkpoint_is_complete(local_path: str) -> bool:
-    if not os.path.isdir(local_path):
-        return False
-    cfg_path = os.path.join(local_path, "config.json")
-    if not os.path.isfile(cfg_path):
-        return False
-    single_path = os.path.join(local_path, "model.safetensors")
-    if os.path.isfile(single_path):
-        return True
-    index_path = os.path.join(local_path, "model.safetensors.index.json")
-    if not os.path.isfile(index_path):
-        return False
-    with open(index_path) as f:
-        index_payload = json.load(f)
-    weight_map = index_payload.get("weight_map", {})
-    if not weight_map:
-        return False
-    shard_files = {str(name) for name in weight_map.values()}
-    return all(
-        os.path.isfile(os.path.join(local_path, shard_name))
-        for shard_name in shard_files
-    )
+from flextrain.optim.hybrid import HybridMuonAdamW, HybridMuonAdamWHyperparams
+from flextrain.optim.muon import MuonHyperparams
 
 
 def _maybe_download_hf_snapshot(io_cfg: IOConfig) -> None:
+    """If ``io_cfg`` points at a missing/incomplete local snapshot AND we
+    know the source repo, download it. Compute-node-only deployments
+    should pre-fetch via ``download.py model ...`` so this path is a
+    no-op."""
     local_path = io_cfg.hf_checkpoint
     repo_id = io_cfg.hf_repo_id
     if not local_path or not repo_id:
         return
-    if _hf_checkpoint_is_complete(local_path):
+    if hf_checkpoint_is_complete(local_path):
         return
-
-    target = Path(local_path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    reason = "not found" if not os.path.exists(local_path) else "incomplete"
-    print(
-        f"Local HF checkpoint {reason} at {local_path}. "
-        f"Downloading {repo_id}...",
-        flush=True,
-    )
-    try:
-        from huggingface_hub import snapshot_download  # type: ignore[import-not-found]
-    except ImportError as e:  # pragma: no cover
-        raise ImportError(
-            "Auto-download needs `huggingface_hub`. "
-            "Install via `pip install huggingface_hub`."
-        ) from e
-
-    snapshot_download(
-        repo_id=repo_id,
-        revision=io_cfg.hf_revision,
-        local_dir=str(target),
-        local_dir_use_symlinks=False,
-    )
-    print(f"Downloaded {repo_id} to {local_path}", flush=True)
+    download_model(repo_id, local_path, revision=io_cfg.hf_revision)
 
 
 def _resolve_model(model_arg: str) -> tuple[str, str | None]:
@@ -85,163 +48,22 @@ def _resolve_model(model_arg: str) -> tuple[str, str | None]:
     return os.path.join("models", model_arg), None
 
 
-def _flatten_message_content(content: Any) -> str:
-    if isinstance(content, str):
-        return content.strip()
-    if isinstance(content, Iterable) and not isinstance(content, (bytes, bytearray, dict)):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, str):
-                text = item.strip()
-            elif isinstance(item, dict):
-                if item.get("type") == "text":
-                    text = str(item.get("text", "")).strip()
-                else:
-                    text = ""
-            else:
-                text = ""
-            if text:
-                parts.append(text)
-        return "\n".join(parts).strip()
-    return ""
-
-
-def _normalize_chat_record(rec: dict[str, Any]) -> dict[str, str] | None:
-    messages = rec.get("messages") or rec.get("conversations")
-    if not isinstance(messages, list):
-        return None
-
-    normalized: list[tuple[str, str]] = []
-    for msg in messages:
-        if not isinstance(msg, dict):
-            continue
-        role = str(msg.get("role", "") or msg.get("from", "")).strip().lower()
-        if role == "human":
-            role = "user"
-        elif role == "gpt":
-            role = "assistant"
-        text = _flatten_message_content(msg.get("content", msg.get("value")))
-        if role and text:
-            normalized.append((role, text))
-
-    last_assistant = None
-    for i in range(len(normalized) - 1, -1, -1):
-        if normalized[i][0] == "assistant":
-            last_assistant = i
-            break
-    if last_assistant is None or last_assistant == 0:
-        return None
-
-    role_names = {
-        "system": "System",
-        "user": "User",
-        "assistant": "Assistant",
-    }
-    prompt_lines = [
-        f"{role_names.get(role, role.title())}:\n{text}"
-        for role, text in normalized[:last_assistant]
-    ]
-    response = normalized[last_assistant][1].strip()
-    if not prompt_lines or not response:
-        return None
-    return {
-        "instruction": "\n\n".join(prompt_lines),
-        "output": response,
-        "input": "",
-    }
-
-
-def _normalize_sft_record(rec: Any) -> dict[str, str] | None:
-    if not isinstance(rec, dict):
-        return None
-    candidates = [
-        ("instruction", "output", "input"),
-        ("prompt", "completion", "input"),
-        ("prompt", "response", "input"),
-        ("question", "answer", "context"),
-        ("query", "response", "context"),
-    ]
-    for prompt_key, response_key, input_key in candidates:
-        prompt = str(rec.get(prompt_key, "") or "").strip()
-        response = str(rec.get(response_key, "") or "").strip()
-        if prompt and response:
-            return {
-                "instruction": prompt,
-                "output": response,
-                "input": str(rec.get(input_key, "") or "").strip(),
-            }
-    return _normalize_chat_record(rec)
-
-
-def _materialize_hf_dataset(dataset_spec: str) -> str:
-    try:
-        from datasets import load_dataset  # type: ignore[import-not-found]
-    except ImportError as e:  # pragma: no cover
-        raise ImportError(
-            "Auto-downloading datasets needs `datasets`. "
-            "Install via `pip install datasets`."
-        ) from e
-
-    cache_dir = Path("datasets")
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    dataset_name = dataset_spec.rstrip("/").split("/")[-1] or "dataset"
-    output_path = cache_dir / f"{dataset_name}.jsonl"
-    if output_path.is_file():
-        return str(output_path.resolve())
-
-    print(
-        f"Dataset not found locally at {dataset_spec}. "
-        f"Downloading Hugging Face dataset {dataset_spec}...",
-        flush=True,
-    )
-    ds = load_dataset(dataset_spec, split="train")
-
-    kept = 0
-    skipped = 0
-    with output_path.open("w") as f:
-        for rec in ds:
-            normalized = _normalize_sft_record(rec)
-            if normalized is None:
-                skipped += 1
-                continue
-            f.write(json.dumps(normalized) + "\n")
-            kept += 1
-
-    if kept == 0:
-        output_path.unlink(missing_ok=True)
-        raise ValueError(
-            f"Could not build SFT examples from {dataset_spec!r}. "
-            "Expected records like instruction/output, prompt/completion, "
-            "question/answer, or chat-style messages."
-        )
-    print(
-        f"Materialized {kept} records from {dataset_spec} to {output_path} "
-        f"(skipped {skipped} unsupported rows).",
-        flush=True,
-    )
-    return str(output_path.resolve())
-
-
 def _resolve_dataset(dataset_arg: str) -> str:
+    """Mirror the air-gap-friendly path: if ``dataset_arg`` is already a
+    local file just use it; otherwise route through the shared download
+    helper, which writes to ``datasets/<name>.jsonl``. To pre-stage on a
+    login node use ``download.py dataset <spec> --target ...``.
+    """
     if os.path.isfile(dataset_arg):
         return os.path.abspath(dataset_arg)
+    cache_dir = Path("datasets")
+    cache_dir.mkdir(parents=True, exist_ok=True)
     if dataset_arg.startswith(("http://", "https://")):
-        target_dir = Path("datasets")
-        target_dir.mkdir(parents=True, exist_ok=True)
         filename = dataset_arg.rstrip("/").split("/")[-1] or "dataset.jsonl"
-        target_path = target_dir / filename
-        if not target_path.is_file():
-            try:
-                from urllib.request import urlretrieve
-            except ImportError as e:  # pragma: no cover
-                raise ImportError("Could not import urllib.request") from e
-            print(
-                f"Dataset not found locally. Downloading {dataset_arg} to {target_path}...",
-                flush=True,
-            )
-            urlretrieve(dataset_arg, target_path)
-        return str(target_path.resolve())
-    return _materialize_hf_dataset(dataset_arg)
+    else:
+        dataset_name = dataset_arg.rstrip("/").split("/")[-1] or "dataset"
+        filename = f"{dataset_name}.jsonl"
+    return download_dataset(dataset_arg, cache_dir / filename)
 
 
 def _load_hf_config_json(model_dir: str) -> dict[str, Any]:
@@ -343,10 +165,10 @@ def _run_training_loop(am, source, *, model_cfg, args, output_dir: str, save_arc
     )
 
     total_steps = args.steps
-    warmup_steps = int(total_steps * 0.1)
-    cooldown_start = int(total_steps * 0.8)
+    warmup_steps = int(total_steps * args.lr_warmup_pct)
+    cooldown_start = int(total_steps * args.lr_cooldown_start_pct)
     max_lr = am.optimizer.hp.lr
-    final_lr = max_lr * 0.1
+    final_lr = max_lr * args.lr_final_pct
 
     train_start = time.time()
     smoothed_loss = None
@@ -486,10 +308,37 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--lr",
         type=float,
         default=None,
-        help="Override learning rate. Defaults: 3e-5 for full, 1e-4 for lora.",
+        help="Override peak (max) learning rate. Defaults: 3e-5 for full, 1e-4 for lora, 1e-3 for --use-muon.",
+    )
+    p.add_argument(
+        "--lr-warmup-pct",
+        type=float,
+        default=0.1,
+        help="Fraction of total steps used for linear warmup from 0 to peak LR. Default: 0.1.",
+    )
+    p.add_argument(
+        "--lr-cooldown-start-pct",
+        type=float,
+        default=0.8,
+        help="Fraction of total steps at which cosine cooldown begins. Default: 0.8.",
+    )
+    p.add_argument(
+        "--lr-final-pct",
+        type=float,
+        default=0.1,
+        help="Final LR as a fraction of peak LR after cooldown. Default: 0.1.",
     )
     p.add_argument("--lora-rank", type=int, default=16, help="LoRA rank when --mode lora. Default: 16.")
     p.add_argument("--lora-alpha", type=float, default=16.0, help="LoRA alpha when --mode lora. Default: 16.0.")
+    p.add_argument(
+        "--use-muon",
+        action="store_true",
+        help=(
+            "Use HybridMuonAdamW for --mode full: Muon updates 2-D dense "
+            "projections (Q/K/V/O, MLP up/gate/down), AdamW updates 1-D / "
+            "norms / routers / embeddings / head. Incompatible with --mode lora."
+        ),
+    )
     p.add_argument("--device-id", type=int, default=0, help="CUDA device id. Default: 0.")
     p.add_argument(
         "--max-gpu-mem-gib", type=float, default=None,
@@ -551,6 +400,11 @@ def main(argv: list[str] | None = None) -> int:
     model_cfg = SimpleNamespace(**dims)
 
     if args.mode == "lora":
+        if args.use_muon:
+            raise SystemExit(
+                "--use-muon is for full fine-tuning only; LoRA always uses AdamW "
+                "on the small adapter parameters."
+            )
         optimizer = AdamW(
             AdamWHyperparams(
                 lr=args.lr or 1e-4,
@@ -562,6 +416,21 @@ def main(argv: list[str] | None = None) -> int:
             state_dtype=torch.float32,
         )
         lora_targets = "all"
+    elif args.use_muon:
+        # HybridMuonAdamW dispatches per-tensor: Muon for 2-D dense
+        # projections (Q/K/V/O, MLP up/gate/down), AdamW for 1-D / norms /
+        # routers / embeddings / head. Both share LR by default.
+        lr = args.lr or 1e-3
+        optimizer = HybridMuonAdamW(
+            HybridMuonAdamWHyperparams(
+                lr=lr,
+                adamw=AdamWHyperparams(
+                    lr=lr, beta1=0.9, beta2=0.95, eps=1e-8, weight_decay=0.0,
+                ),
+                muon=MuonHyperparams(lr=lr),
+            ),
+        )
+        lora_targets = None
     else:
         optimizer = AdamW(
             AdamWHyperparams(
@@ -610,7 +479,7 @@ def main(argv: list[str] | None = None) -> int:
     device_str = f"cuda:{args.device_id}"
     print(
         "Probing hardware (sustained matmul + memory bandwidth + PCIe; "
-        "~5s)...",
+        "~14s)...",
         flush=True,
     )
     from flextrain.core.hw_probe import probe_hardware

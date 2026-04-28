@@ -68,15 +68,6 @@ class HardwareProbeResult:
     mem_bw_total_seconds: float
 
 
-def _calibrate_reps(
-    one_call_seconds: float, target_seconds: float, *, min_reps: int
-) -> int:
-    """How many reps to schedule so total runtime ~= ``target_seconds``."""
-    if one_call_seconds <= 0:
-        return min_reps
-    return max(min_reps, int(target_seconds / one_call_seconds) + 1)
-
-
 def _bench_matmul_sustained(
     n: int,
     *,
@@ -84,7 +75,7 @@ def _bench_matmul_sustained(
     device: torch.device,
     target_seconds: float,
     n_warmup: int,
-    min_reps: int,
+    min_reps_per_half: int,
 ) -> tuple[float, float, float, float, float]:
     """Run an n x n bf16 matmul long enough for steady-state to settle.
 
@@ -93,10 +84,17 @@ def _bench_matmul_sustained(
     total_seconds)``. Use ``second_half`` as the DP-solver input -- it
     excludes the boost-clock window at the top of the run.
 
-    Implementation: warmup, then time one matmul to estimate per-call
-    cost, then schedule ``ceil(target_seconds / per_call)`` reps. Reps
-    are split into two equal halves; we time them separately so the
-    caller can detect throttling (first-half >> second-half).
+    Implementation: warmup, then run two wall-clock-bounded halves of
+    ``target_seconds / 2`` each. Each half launches matmuls in a tight
+    loop until the elapsed wall time crosses the budget, syncing once
+    at the end. This avoids per-call calibration: on fast hardware
+    (H100, ~0.18 ms per 4096^3 matmul) we naturally fit ~8000 reps in
+    1.5 s; on slow hardware we still run for the full target time,
+    just with fewer reps.
+
+    ``min_reps_per_half`` is a floor used only when the device is so
+    slow that even a single sync'd matmul exceeds the per-half budget
+    (rare; e.g. if you bumped ``n`` aggressively).
     """
     A = torch.randn(n, n, dtype=dtype, device=device)
     B = torch.randn(n, n, dtype=dtype, device=device)
@@ -105,39 +103,44 @@ def _bench_matmul_sustained(
         _ = torch.matmul(A, B)
     torch.cuda.synchronize(device)
 
-    # Calibrate per-call time with a single sync'd matmul.
-    cal_start = time.perf_counter_ns()
-    _ = torch.matmul(A, B)
-    torch.cuda.synchronize(device)
-    one_call = (time.perf_counter_ns() - cal_start) / 1e9
-    n_reps = _calibrate_reps(one_call, target_seconds, min_reps=min_reps)
-    # Make n_reps even so the halves are the same size.
-    if n_reps % 2:
-        n_reps += 1
+    half_budget_seconds = target_seconds / 2.0
 
-    # First half.
-    half = n_reps // 2
-    start_h1 = time.perf_counter_ns()
-    for _ in range(half):
-        _ = torch.matmul(A, B)
-    torch.cuda.synchronize(device)
-    end_h1 = time.perf_counter_ns()
+    def _run_half() -> tuple[int, float]:
+        """Launch matmuls until the wall budget expires; sync once at the
+        end. Returns ``(n_reps, elapsed_seconds)`` where ``elapsed`` is
+        measured wall-to-wall around the launches and the trailing sync.
+        """
+        reps = 0
+        start = time.perf_counter_ns()
+        deadline_ns = start + int(half_budget_seconds * 1e9)
+        # Burst-then-sync: launch matmuls in batches of ~50 between
+        # wall-clock checks. Checking the clock every iteration adds
+        # measurable overhead on fast kernels (~hundreds of ns each).
+        burst = 50
+        while True:
+            for _ in range(burst):
+                _ = torch.matmul(A, B)
+            reps += burst
+            if (
+                time.perf_counter_ns() >= deadline_ns
+                and reps >= min_reps_per_half
+            ):
+                break
+        torch.cuda.synchronize(device)
+        elapsed = (time.perf_counter_ns() - start) / 1e9
+        return reps, elapsed
 
-    # Second half.
-    for _ in range(half):
-        _ = torch.matmul(A, B)
-    torch.cuda.synchronize(device)
-    end_h2 = time.perf_counter_ns()
+    reps_h1, h1 = _run_half()
+    reps_h2, h2 = _run_half()
 
-    total = (end_h2 - start_h1) / 1e9
-    h1 = (end_h1 - start_h1) / 1e9
-    h2 = (end_h2 - end_h1) / 1e9
+    total = h1 + h2
+    n_reps = reps_h1 + reps_h2
 
     flops_per_call = 2.0 * n * n * n
-    tflops_overall = (flops_per_call * n_reps / total) / 1e12
-    tflops_h1 = (flops_per_call * half / h1) / 1e12 if h1 > 0 else 0.0
-    tflops_h2 = (flops_per_call * half / h2) / 1e12 if h2 > 0 else 0.0
-    per_call_overall = total / n_reps
+    tflops_overall = (flops_per_call * n_reps / total) / 1e12 if total > 0 else 0.0
+    tflops_h1 = (flops_per_call * reps_h1 / h1) / 1e12 if h1 > 0 else 0.0
+    tflops_h2 = (flops_per_call * reps_h2 / h2) / 1e12 if h2 > 0 else 0.0
+    per_call_overall = total / n_reps if n_reps > 0 else 0.0
 
     del A, B
     return per_call_overall, tflops_overall, tflops_h1, tflops_h2, total
@@ -150,12 +153,13 @@ def _bench_mem_bandwidth_sustained(
     device: torch.device,
     target_seconds: float,
     n_warmup: int,
-    min_reps: int,
+    min_reps_per_half: int,
 ) -> tuple[float, float]:
     """Memory-bandwidth probe (``(1, n) @ (n, n)`` matmul). Returns
-    ``(gbps_second_half, total_seconds)``. Same time-bounded /
-    second-half-average strategy as :func:`_bench_matmul_sustained` --
-    memory bandwidth on a clocked-down GPU is also lower than peak.
+    ``(gbps_second_half, total_seconds)``. Same wall-clock-bounded
+    strategy as :func:`_bench_matmul_sustained` -- memory bandwidth on
+    a clocked-down GPU is also lower than peak, so we want sustained
+    numbers.
     """
     A = torch.randn(1, n, dtype=dtype, device=device)
     B = torch.randn(n, n, dtype=dtype, device=device)
@@ -164,35 +168,36 @@ def _bench_mem_bandwidth_sustained(
         _ = torch.matmul(A, B)
     torch.cuda.synchronize(device)
 
-    cal_start = time.perf_counter_ns()
-    _ = torch.matmul(A, B)
-    torch.cuda.synchronize(device)
-    one_call = (time.perf_counter_ns() - cal_start) / 1e9
-    n_reps = _calibrate_reps(one_call, target_seconds, min_reps=min_reps)
-    if n_reps % 2:
-        n_reps += 1
+    half_budget_seconds = target_seconds / 2.0
 
-    half = n_reps // 2
-    # Skip the first half (warmup-after-warmup); time only the second.
-    for _ in range(half):
-        _ = torch.matmul(A, B)
-    torch.cuda.synchronize(device)
+    def _run_half() -> tuple[int, float]:
+        reps = 0
+        start = time.perf_counter_ns()
+        deadline_ns = start + int(half_budget_seconds * 1e9)
+        burst = 50
+        while True:
+            for _ in range(burst):
+                _ = torch.matmul(A, B)
+            reps += burst
+            if (
+                time.perf_counter_ns() >= deadline_ns
+                and reps >= min_reps_per_half
+            ):
+                break
+        torch.cuda.synchronize(device)
+        elapsed = (time.perf_counter_ns() - start) / 1e9
+        return reps, elapsed
 
-    start_h2 = time.perf_counter_ns()
-    for _ in range(half):
-        _ = torch.matmul(A, B)
-    torch.cuda.synchronize(device)
-    end_h2 = time.perf_counter_ns()
+    # Discard first half (boost-clock window); measure second half.
+    _reps_h1, h1 = _run_half()
+    reps_h2, h2 = _run_half()
 
-    h2 = (end_h2 - start_h2) / 1e9
-    per_call = h2 / half
+    per_call = h2 / reps_h2 if reps_h2 > 0 else 0.0
     bytes_touched = dtype.itemsize * (n * n + 2 * n)
-    gbps = (bytes_touched / per_call) / 1e9
+    gbps = (bytes_touched / per_call) / 1e9 if per_call > 0 else 0.0
 
-    # Total runtime including the discarded first half.
-    # (Approximated as 2x the timed half; close enough for a log line.)
     del A, B
-    return gbps, h2 * 2
+    return gbps, h1 + h2
 
 
 def _bench_pcie_concurrent(
@@ -244,27 +249,32 @@ def probe_hardware(
     matmul_n: int = 4096,
     mem_bw_n: int = 8192,
     transfer_mib: int = 256,
-    matmul_target_seconds: float = 3.0,
-    mem_bw_target_seconds: float = 2.0,
+    matmul_target_seconds: float = 10.0,
+    mem_bw_target_seconds: float = 4.0,
     n_matmul_warmup: int = 5,
     n_mem_bw_warmup: int = 5,
-    min_matmul_reps: int = 50,
-    min_mem_bw_reps: int = 50,
+    min_matmul_reps_per_half: int = 50,
+    min_mem_bw_reps_per_half: int = 50,
     n_transfer_warmup: int = 2,
     n_transfer_reps: int = 5,
 ) -> HardwareProbeResult:
     """Probe sustained (post-throttle) compute + memory + PCIe bandwidth.
 
     Total wall time is roughly ``matmul_target_seconds + mem_bw_target_seconds``
-    plus a small PCIe component (defaults: ~5s). Tuned so consumer GPUs
+    plus a small PCIe component (defaults: ~14s). Tuned so consumer GPUs
     have time to drop from boost clocks to sustained clocks before the
     measurement window closes -- if you only ran for ~50ms you'd see
     boost-clock TFLOPS, which is misleading for sizing the DP solver.
 
-    Set ``matmul_target_seconds`` higher if you suspect the GPU takes
-    longer than 3s to thermally settle (multi-GPU rigs with shared
-    cooling, datacenter cards under heavy ambient load). Each second of
-    target time is roughly one second of GPU activity.
+    Each probe runs in two equal-budget wall-clock halves: matmuls
+    launch in tight bursts until each half's budget expires, with a
+    sync at the end. The first half captures the boost-to-base clock
+    transition, the second is steady state -- the second-half
+    throughput is what feeds ``hw_cost``.
+
+    Set ``matmul_target_seconds`` higher (e.g. 30+) if you suspect the
+    GPU takes longer than 5 s to thermally settle (multi-GPU rigs with
+    shared cooling, datacenter cards under heavy ambient load).
 
     Returns a :class:`HardwareProbeResult` whose ``hw_cost`` field
     contains the second-half (sustained) numbers; the per-half
@@ -281,13 +291,15 @@ def probe_hardware(
     ) = _bench_matmul_sustained(
         matmul_n, dtype=dtype, device=device,
         target_seconds=matmul_target_seconds,
-        n_warmup=n_matmul_warmup, min_reps=min_matmul_reps,
+        n_warmup=n_matmul_warmup,
+        min_reps_per_half=min_matmul_reps_per_half,
     )
 
     mem_bw_gbps, mem_bw_total = _bench_mem_bandwidth_sustained(
         mem_bw_n, dtype=dtype, device=device,
         target_seconds=mem_bw_target_seconds,
-        n_warmup=n_mem_bw_warmup, min_reps=min_mem_bw_reps,
+        n_warmup=n_mem_bw_warmup,
+        min_reps_per_half=min_mem_bw_reps_per_half,
     )
 
     transfer_bytes = transfer_mib * (1 << 20)
