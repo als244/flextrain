@@ -159,13 +159,16 @@ ARCHES: dict[str, ArchSpec] = {
         gpu_gib=70.0, host_gib=180.0,
     ),
     "olmoe-1b-7b": ArchSpec(
-        name="olmoe-1b-7b", hf_dir="OLMoE-1B-7B-0924",
+        name="olmoe-1b-7b", hf_dir="OLMoE-1B-7B",
         ft_to_hf=dict(ATTN_ONLY_TARGETS),
-        seq_len=2048, global_batch_tokens=4096, steps=30,
-        gpu_gib=40.0, host_gib=120.0, tolerance=0.20,
+        seq_len=2048, global_batch_tokens=8192, steps=5,
+        gpu_gib=22.5, host_gib=110.0, tolerance=0.20,
         notes=(
-            "Attention-only LoRA (HF PEFT shares an adapter across the "
-            "batched OlmoeExperts op; FT uses per-expert adapters)."
+            "OLMoE 1B-active / 7B-total (16 layers, 64 experts, top-K=8). "
+            "Fits 24 GiB GPU + 117 GiB host. ft_to_hf=ATTN_ONLY because "
+            "HF PEFT shares an adapter across the batched OlmoeExperts "
+            "op while FT uses per-expert adapters; the FT worker still "
+            "runs LoRA-all in --mode smoke."
         ),
     ),
     "qwen3-moe-30b": ArchSpec(
@@ -175,20 +178,21 @@ ARCHES: dict[str, ArchSpec] = {
         gpu_gib=22.5, host_gib=110.0, tolerance=0.20,
         notes=(
             "Qwen3-MoE 30B-A3B (128 experts, top-K=8, 48 layers). "
-            "Attn-only LoRA at batch=65536 fits 24 GiB GPU + 117 GiB host. "
-            "Same shape as Qwen3.5-MoE-35B-A3B run."
+            "FT-side LoRA-all at batch=65536 fits 24 GiB GPU + 117 GiB host. "
+            "ft_to_hf=ATTN_ONLY only affects the (currently disabled) "
+            "HF PEFT parity side -- the FT worker always runs LoRA-all "
+            "in --mode smoke."
         ),
     ),
     "qwen3.5-moe-35b": ArchSpec(
         name="qwen3.5-moe-35b", hf_dir="Qwen3.5-35B-A3B",
         ft_to_hf=dict(ATTN_ONLY_TARGETS),
-        seq_len=512, global_batch_tokens=512, steps=5,
+        seq_len=2048, global_batch_tokens=65536, steps=5,
         gpu_gib=22.5, host_gib=110.0, tolerance=0.20,
         notes=(
             "Hybrid linear-attn + full-attn MoE; 256 routed experts, "
-            "top-K=8, shared expert with sigmoid gate. Attn-only LoRA "
-            "on full-attention layers (every 4th layer). Working set "
-            "fits within 24 GiB GPU + 117 GiB host."
+            "top-K=8, shared expert with sigmoid gate. FT-side LoRA-all "
+            "at batch=65536 fits 24 GiB GPU + 117 GiB host."
         ),
     ),
 }
