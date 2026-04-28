@@ -797,6 +797,20 @@ def determine_working_set_config(
     else:
         chunk_size_options = init_chunk_size_options
 
+    # Augment with divisors of ``max_global_batch_tokens`` that are <=
+    # ``target_tokens_per_round``. These give a *zero-tail* round
+    # structure (``round_tokens`` divides the step cleanly), which is
+    # what we want when ``target_tokens_per_round`` doesn't itself
+    # divide ``max_global_batch_tokens`` — the original divisor list
+    # has the divisor-of-divisor pathology that causes the tail-filter
+    # to reject every option.
+    batch_divs = [
+        d for d in get_divisors(max_global_batch_tokens)
+        if d <= target_tokens_per_round
+    ]
+    merged = set(chunk_size_options) | set(batch_divs)
+    chunk_size_options = sorted(merged, reverse=True)
+
     chunk_size_options = [
         d for d in chunk_size_options if d >= init_target_min_chunk
     ]
