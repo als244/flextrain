@@ -135,6 +135,18 @@ ARCHES: dict[str, ArchSpec] = {
             "ATTN_ONLY_TARGETS reasoning as 2B."
         ),
     ),
+    "qwen3.6-27b": ArchSpec(
+        name="qwen3.6-27b", hf_dir="Qwen3.6-27B",
+        ft_to_hf=dict(ATTN_ONLY_TARGETS),
+        seq_len=2048, global_batch_tokens=8192, steps=5,
+        gpu_gib=22.5, host_gib=110.0, tolerance=0.20,
+        notes=(
+            "Qwen3.6-27B dense; reuses Qwen3_5 arch_id "
+            "(Qwen3_5ForConditionalGeneration). 64 layers, "
+            "linear-attn grp=3 GVA (n_v=48, n_k=16). "
+            "Multimodal wrapper, tie_word_embeddings=False."
+        ),
+    ),
     "qwen2.5-1.5b": ArchSpec(
         name="qwen2.5-1.5b", hf_dir="Qwen2.5-1.5B",
         seq_len=2048, global_batch_tokens=8192, steps=50,
