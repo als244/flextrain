@@ -15,7 +15,7 @@ or :func:`get_divisors`) are kept beside the solver in
 from __future__ import annotations
 
 import bisect
-from typing import Mapping
+from typing import Mapping, Sequence
 
 import torch
 
@@ -183,12 +183,20 @@ def min_act_slot_size_bytes(model_dims: Mapping, chunk_size: int) -> int:
 
 
 def transformer_saved_act_sizes(
-    model_dims: Mapping, chunk_size: int
+    model_dims: Mapping, chunk_size: int,
 ) -> tuple[int, ...]:
     """Per-tier home-bytes for one (chunk, layer) -- length 4 for the
     paper's standard 4-tier schema (min, attn-only, attn+xq+xo, full).
     Mirrors ``orig/awsm_transformer/saved_activations_policy.py``
     ``get_transformer_saved_act_sizes``.
+
+    NOTE: this is a hand-coded estimate that assumes the pure-attention
+    transformer schema. For hybrid (linear+full attention) backbones,
+    pass actual layer ``ActivationSchema`` objects to the working-set
+    solver via ``layer_schemas=`` instead — the solver uses
+    ``schema.home_size_bytes`` directly when available, which captures
+    arch-specific tier-0 fields (e.g. linear-attn ``lin_z`` /
+    ``lin_q_rstd`` / ...).
     """
     d = model_dims["d_model"]
     n_h = model_dims["n_heads"]

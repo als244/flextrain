@@ -447,6 +447,7 @@ def determine_working_set_config(
     layer_param_specs: Sequence | None = None,
     embed_param_spec: object = None,
     head_param_spec: object = None,
+    layer_schemas: Sequence | None = None,
 ) -> WorkingSetConfig:
     """Solve the working set: pick chunk size, tokens-per-round, and
     GPU-resident layer counts. Native v2 implementation -- no ``orig`` import.
@@ -463,7 +464,32 @@ def determine_working_set_config(
     :func:`size_working_set_for_engine` is the right tool when the
     backbone has mixed layer types -- it uses ``max(...)`` per-layer
     quantity so every reserved slot fits the worst-case layer.
+
+    ``layer_schemas`` (optional): when callers have built the actual
+    backbone layers before solving the working set (the
+    ``from_pretrained`` flow does), pass the per-layer
+    :class:`ActivationSchema` list here. The solver replaces the
+    hand-coded :func:`transformer_saved_act_sizes` level-0 estimate
+    with the maximum ``schema.home_size_bytes(num_tokens, dims, 0)``
+    across layers, which captures arch-specific tier-0 fields (e.g.
+    linear-attn ``lin_z`` / ``lin_*_rstd``) that the dense-transformer
+    heuristic doesn't model. Without this, hybrid linear+full
+    architectures (Qwen3-Next / Qwen3.5 / Qwen3.5-MoE / Qwen3.6 /
+    Qwen3.6-MoE) under-size the host activation buffer by 1.5-2x and
+    ``plan_from_solution`` raises at the first round.
     """
+    def _min_act_slot_bytes(c: int) -> int:
+        """Per-slot home bytes at level 0 — schema-driven when
+        ``layer_schemas`` is provided, falling back to the dense-
+        transformer estimate otherwise. We take ``max`` across layers
+        because ``BufferManager`` sizes every host slot to the
+        worst-case layer."""
+        if layer_schemas is not None and len(layer_schemas) > 0:
+            return max(
+                int(s.home_size_bytes(c, model_dims, 0))
+                for s in layer_schemas
+            )
+        return int(transformer_saved_act_sizes(model_dims, c)[0])
     if num_local_layers is None:
         num_local_layers = model_dims["n_layers"]
 
@@ -841,6 +867,7 @@ def determine_working_set_config(
         max_chunk_size=max_chunk_size,
         min_chunk_size=min_chunk_size,
         verbose=verbose,
+        min_act_slot_fn=_min_act_slot_bytes,
     )
 
     if best_option is None:
@@ -886,8 +913,7 @@ def determine_working_set_config(
     max_host_act_buffer = host_act_slots * full_act_slot
     host_act_buffer_size_bytes = min(max_host_act_buffer, remaining_host_mem_bytes)
 
-    saved_act_sizes = transformer_saved_act_sizes(model_dims, target_chunk_size)
-    min_act_slot = saved_act_sizes[0]
+    min_act_slot = _min_act_slot_bytes(target_chunk_size)
 
     est_total_host_bytes = host_act_buffer_size_bytes + baseline.required_host_bytes
 
@@ -993,6 +1019,7 @@ def _pick_chunk_size(
     max_chunk_size: int | None,
     min_chunk_size: int | None,
     verbose: bool,
+    min_act_slot_fn=None,
 ) -> dict | None:
     """Greedy chunk-size selection. Mirrors orig:476-653.
 
@@ -1171,8 +1198,10 @@ def _pick_chunk_size(
             gpu_act_workspace // full_act if full_act > 0 else 0,
         ))
 
-        saved_act_sizes = transformer_saved_act_sizes(model_dims, chunk_size)
-        min_act_slot = saved_act_sizes[0]
+        if min_act_slot_fn is not None:
+            min_act_slot = int(min_act_slot_fn(chunk_size))
+        else:
+            min_act_slot = int(transformer_saved_act_sizes(model_dims, chunk_size)[0])
         if remaining_host_mem_bytes < min_act_slot * (total_act_slots - gpu_act_slots):
             continue
 

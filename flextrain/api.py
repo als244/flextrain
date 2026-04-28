@@ -374,6 +374,14 @@ def from_pretrained(
         layer_param_specs=[layer.param_spec for layer in backbone],
         embed_param_spec=embed.param_spec,
         head_param_spec=head.param_spec,
+        # Hand actual schemas so the host-buffer sizing uses real
+        # arch-specific tier-0 byte counts (linear-attn ``lin_z`` /
+        # ``lin_*_rstd`` etc.) rather than the dense-transformer
+        # heuristic in ``transformer_saved_act_sizes``. Critical for
+        # hybrid backbones (Qwen3-Next / Qwen3.5 / Qwen3.5-MoE /
+        # Qwen3.6 / Qwen3.6-MoE) where the heuristic undersizes by
+        # 1.5-2x and ``plan_from_solution`` raises mid-step.
+        layer_schemas=[layer.schema for layer in backbone],
     )
 
     # 5. Build engine. ``hw_cost`` must come from the caller — either
