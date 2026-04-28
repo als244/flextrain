@@ -193,9 +193,6 @@ class ActiveModel:
             verbose=self.verbose_init,
         )
 
-        if self.verbose_init:
-            import sys
-            print("[ActiveModel] Creating CUDA stream bundle...", flush=True, file=sys.stderr)
         # MoE layers (future) can pass with_secondary=True; dense defaults.
         with_secondary = any(
             getattr(layer, "uses_secondary_stream", False)
@@ -204,27 +201,11 @@ class ActiveModel:
         self.streams = StreamBundle.create(
             device=device, with_secondary=with_secondary
         )
-        if self.verbose_init:
-            import sys
-            print("[ActiveModel] Creating event book...", flush=True, file=sys.stderr)
         self.events = EventBook()
-        if self.verbose_init:
-            import sys
-            print("[ActiveModel] Creating scratch pool...", flush=True, file=sys.stderr)
         self.scratch = ScratchPool(device)
 
         # Initial param prefetch into the first N_P GPU slots.
-        if self.verbose_init:
-            import sys
-            print(
-                "[ActiveModel] Starting initial param prefetch (host->device DMA "
-                "for embed + head + first N_P backbone layers)...",
-                flush=True, file=sys.stderr,
-            )
         self._initial_param_prefetch()
-        if self.verbose_init:
-            import sys
-            print("[ActiveModel] Initial param prefetch complete.", flush=True, file=sys.stderr)
 
     # ------------------------------------------------------------------
     # Construction helpers

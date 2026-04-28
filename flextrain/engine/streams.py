@@ -49,11 +49,29 @@ except OSError:
     _NVTX_LIB = None
 
 
+# Declare ``nvtxNameCuStreamA(CUstream, const char*)`` argtypes explicitly.
+# Without this, ctypes defaults to ``c_int`` (32-bit) for the stream handle
+# and truncates the pointer-sized ``cudaStream_t`` value torch hands us via
+# ``stream.cuda_stream``. The truncated pointer dereferences to garbage
+# inside NVTX -> SIGSEGV. The bug is silent without a profiler attached
+# because NVTX is a no-op stub in that case (it never dereferences); nsys /
+# nv-nsight loads the real NVTX library which actually walks the handle.
+if _NVTX_LIB is not None:
+    try:
+        _NVTX_LIB.nvtxNameCuStreamA.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+        _NVTX_LIB.nvtxNameCuStreamA.restype = None
+    except AttributeError:  # pragma: no cover
+        # Symbol missing -> NVTX too old. Disable naming entirely.
+        _NVTX_LIB = None
+
+
 def _name_stream(stream: torch.cuda.Stream, name: str) -> None:
     if _NVTX_LIB is None:
         return
     try:
-        _NVTX_LIB.nvtxNameCuStreamA(stream.cuda_stream, name.encode("utf-8"))
+        _NVTX_LIB.nvtxNameCuStreamA(
+            ctypes.c_void_p(stream.cuda_stream), name.encode("utf-8")
+        )
     except Exception:  # pragma: no cover
         # NVTX naming is purely cosmetic; never let a failure break training.
         pass
