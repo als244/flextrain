@@ -150,10 +150,17 @@ class SwiGLUFFN:
         weights: Mapping[str, torch.Tensor],
         grads: MutableMapping[str, torch.Tensor],
         slot,
+        *,
+        skip_grads: frozenset[str] = frozenset(),
+        capture_xy: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
     ) -> torch.Tensor:
         """FFN backward. Accumulates ``g_1 / g_2 / g_3`` and returns
         ``dx_ffn_norm_up`` (gradient w.r.t. the FFN-norm output, so callers
         can pass it to RMSNorm backward).
+
+        ``skip_grads`` can include ``"g_2"`` to gate the inline SwiGLU
+        down-projection Wgrad addmm (LoRA fast path). ``g_1/g_3`` skip
+        is in :meth:`bwd_accumulate_w1_w3_grads`.
 
         Mirrors ``orig/dense_layer.py:193-226``.
         """
@@ -167,10 +174,20 @@ class SwiGLUFFN:
         )
 
         # 3. g_2 += SwiGLU(x1, x3)^T @ dy
-        torch.addmm(
-            grads["g_2"], fwd_act_swiglu.T, dy_resid,
-            alpha=1.0, beta=1.0, out=grads["g_2"],
-        )
+        if "g_2" in skip_grads:
+            if capture_xy is not None:
+                # Clone fwd_act_swiglu and dy_resid: both might be reused or
+                # mutated downstream. fwd_act_swiglu lives only inside this
+                # function's scope (built fresh each call), but dy_resid is
+                # the layer's residual upstream and gets mutated by
+                # ffn_norm.bwd's dx_accumulator path -- without cloning the
+                # captured tensor would track that mutation.
+                capture_xy["g_2"] = (fwd_act_swiglu.clone(), dy_resid.clone())
+        else:
+            torch.addmm(
+                grads["g_2"], fwd_act_swiglu.T, dy_resid,
+                alpha=1.0, beta=1.0, out=grads["g_2"],
+            )
 
         # 4. dx_ffn_norm_up = dx1_up @ w_1^T + dx3_up @ w_3^T
         dx_ffn_norm_up = torch.matmul(dx1_up, weights["w_1"].T)
@@ -190,20 +207,33 @@ class SwiGLUFFN:
         ffn_norm_output: torch.Tensor,
         grads: MutableMapping[str, torch.Tensor],
         slot,
+        *,
+        skip_grads: frozenset[str] = frozenset(),
+        capture_xy: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
     ) -> None:
         """Weight grads for w_1 and w_3 after RMSNorm bwd (which needs the
         recomputed norm output as its left operand).
 
+        ``skip_grads`` / ``capture_xy``: see
+        :meth:`GQAAttentionBlock.bwd_accumulate_qkv_grads`. Same LoRA
+        fast-path contract -- skipped names get their ``(X, dY)``
+        handed back via ``capture_xy`` instead of an addmm.
+
         Mirrors ``orig/dense_layer.py:221-222``.
         """
-        torch.addmm(
-            grads["g_1"], ffn_norm_output.T, slot.aux["bwd_dx1_up"],
-            alpha=1.0, beta=1.0, out=grads["g_1"],
-        )
-        torch.addmm(
-            grads["g_3"], ffn_norm_output.T, slot.aux["bwd_dx3_up"],
-            alpha=1.0, beta=1.0, out=grads["g_3"],
-        )
+        for name, dy_key in (
+            ("g_1", "bwd_dx1_up"),
+            ("g_3", "bwd_dx3_up"),
+        ):
+            dy = slot.aux[dy_key]
+            if name in skip_grads:
+                if capture_xy is not None:
+                    capture_xy[name] = (ffn_norm_output, dy)
+            else:
+                torch.addmm(
+                    grads[name], ffn_norm_output.T, dy,
+                    alpha=1.0, beta=1.0, out=grads[name],
+                )
         del slot.aux["bwd_dx1_up"]
         del slot.aux["bwd_dx3_up"]
 

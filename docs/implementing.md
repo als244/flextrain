@@ -87,6 +87,19 @@ class Layer(Protocol):
         self, dx, chunk, weights, grads, slot, ctx,
     ) -> torch.Tensor: ...
 
+    # Optional split. Layers MAY also implement these two methods so the
+    # engine can call dgrad alone (LoRA fast path -- skip the per-projection
+    # Wgrad matmul on frozen base weights). When implemented, ``backward``
+    # is a delegating shim over them. See "Optional: split backward" below.
+    def backward_dgrad(
+        self, dx, chunk, weights, slot, ctx,
+    ) -> tuple[torch.Tensor, BackwardIntermediates]: ...
+
+    def backward_wgrad(
+        self, intermediates, weights, grads, slot, ctx, *,
+        skip_target_names: frozenset[str] = frozenset(),
+    ) -> None: ...
+
     def compute_cost(self, chunk) -> ComputeCost: ...
 ```
 
@@ -131,6 +144,56 @@ Returns: `dx` for the preceding layer.
 Side effect: accumulates weight grads into `grads[g_<param_name>]`
 in-place. Naming convention: `g_<param_name without leading w_>`,
 matching `state_key` / `flextrain.optim.base`.
+
+### Optional: split backward into `backward_dgrad` / `backward_wgrad`
+
+Layers MAY implement an optional split form of backward that lets the
+engine call **dgrad alone** for layers whose Wgrad would be wasted
+work (LoRA's frozen base weights). When the split is implemented, the
+canonical pattern is for the monolithic `backward(...)` to be a
+delegating shim:
+
+```python
+def backward(self, dx, chunk, weights, grads, slot, ctx):
+    upstream_dx, inter = self.backward_dgrad(dx, chunk, weights, slot, ctx)
+    self.backward_wgrad(inter, weights, grads, slot, ctx)
+    return upstream_dx
+```
+
+This guarantees zero-behavior-change for any caller that doesn't opt
+into the split — the engine, parity benches, tests all keep going
+through `backward(...)` exactly as before.
+
+`backward_dgrad(dx, chunk, weights, slot, ctx)` returns
+`(upstream_dx, BackwardIntermediates)`. The intermediates payload
+carries:
+* `proj_inputs_and_grads[name] = (X, dY)` for each LoRA-targetable
+  projection — same `(X, dY)` the layer would have used for its
+  `dW = X^T @ dY` accumulation. Names match `TensorSpec.name`
+  (`"w_q"`, `"w_o"`, `"w_1"`, `"w_up"`, etc.). For MoE projections
+  the tensors are 3-D `(num_experts, T_e, dim)`.
+* `aux` — opaque to LoRA, used by the layer to ferry layer-internal
+  state (e.g. recomputed RMSNorm outputs) from dgrad to wgrad.
+
+`backward_wgrad(intermediates, weights, grads, slot, ctx, *, skip_target_names=frozenset())`
+accumulates `dL/dW` into `grads`, **except** for projections whose
+`name` is in `skip_target_names`. The engine passes a non-empty skip
+set when the layer is wrapped by `LoRAWrapperLayer`; LoRA then takes
+the same `(X, dY)` from the intermediates and runs its rank-r
+matmuls directly into the LoRA `g_a, g_b` accumulators, never
+materializing `dW` for the frozen base.
+
+When NOT to bother: small layers (norms, linear-attention internal
+state) where Wgrad is already cheap and not LoRA-targeted. Just keep
+the monolithic `backward(...)`.
+
+The migration is staged across phases (see
+[`docs/lora_fast_backward.md`](lora_fast_backward.md)). Phase 1
+(currently shipped for Llama) introduces the split with bit-identical
+behavior — `backward()` shim is the only call site, no consumer skips
+anything yet. Phase 2 wires the engine + LoRA wrapper to use the
+skip path. Phase 3 rolls out the split to Mistral, Qwen2/3, OLMoE,
+Qwen3-MoE, Qwen3-Next.
 
 ### `compute_cost(chunk)`
 

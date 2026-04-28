@@ -268,8 +268,30 @@ class Qwen3_5FullLayer:
     def backward(
         self, dx, chunk: ChunkMeta, weights, grads, slot, ctx: LayerContext,
     ) -> torch.Tensor:
+        upstream_dx, intermediates = self.backward_dgrad(
+            dx, chunk, weights, grads, slot, ctx,
+        )
+        self.backward_wgrad(intermediates, weights, grads, slot, ctx)
+        return upstream_dx
+
+    def backward_dgrad(
+        self, dx, chunk: ChunkMeta, weights, grads, slot, ctx: LayerContext,
+        *, skip_target_names: frozenset[str] = frozenset(),
+    ):
+        from flextrain.core.layer import BackwardIntermediates
         cfg = self.cfg
-        dx_ffn_norm_up = self.ffn.bwd(dx, weights, grads, slot)
+        skip_g_inline: frozenset[str] = frozenset(
+            f"g_{n[2:]}" for n in skip_target_names
+            if n in ("w_o", "w_2")
+        )
+        capture_xy: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = (
+            {} if skip_g_inline else None
+        )
+
+        dx_ffn_norm_up = self.ffn.bwd(
+            dx, weights, grads, slot,
+            skip_grads=skip_g_inline, capture_xy=capture_xy,
+        )
         ffn_norm_fwd_output_hint = slot.aux.pop(
             "recompute_ffn_norm_output", None
         )
@@ -283,10 +305,6 @@ class Qwen3_5FullLayer:
         )
         if ffn_norm_fwd_output_hint is not None:
             ffn_norm_fwd_output = ffn_norm_fwd_output_hint
-        self.ffn.bwd_accumulate_w1_w3_grads(
-            ffn_norm_fwd_output, grads, slot,
-        )
-        del ffn_norm_fwd_output
 
         attn_norm_fwd_output_hint = slot.aux.pop(
             "recompute_attn_norm_output", None
@@ -300,6 +318,7 @@ class Qwen3_5FullLayer:
         dx_attn_norm_up = self.attn.bwd(
             dx, chunk, weights, grads, slot, ctx,
             attn_norm_output=attn_norm_fwd_output,
+            skip_grads=skip_g_inline, capture_xy=capture_xy,
         )
         dx, _ = self.attn_norm.bwd(
             dx_attn_norm_up,
@@ -309,11 +328,45 @@ class Qwen3_5FullLayer:
             recompute_output=False,
             recomputed_output_tensor=None,
         )
+        intermediates = BackwardIntermediates(
+            proj_inputs_and_grads={},
+            aux={
+                "ffn_norm_fwd_output": ffn_norm_fwd_output,
+                "attn_norm_fwd_output": attn_norm_fwd_output,
+            },
+        )
+        if capture_xy is not None:
+            for g_name, xy in capture_xy.items():
+                w_name = "w_" + g_name[2:]
+                intermediates.proj_inputs_and_grads[w_name] = xy
+        return dx, intermediates
+
+    def backward_wgrad(
+        self, intermediates, weights, grads, slot, ctx,
+        *, skip_target_names: frozenset[str] = frozenset(),
+    ) -> None:
+        del ctx, weights
+        ffn_norm_fwd_output = intermediates.aux["ffn_norm_fwd_output"]
+        attn_norm_fwd_output = intermediates.aux["attn_norm_fwd_output"]
+        skip_g_names = frozenset(
+            f"g_{n[2:]}" for n in skip_target_names
+            if n in ("w_q", "w_k", "w_v", "w_1", "w_3")
+        )
+        capture_xy: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = (
+            {} if skip_g_names else None
+        )
+        self.ffn.bwd_accumulate_w1_w3_grads(
+            ffn_norm_fwd_output, grads, slot,
+            skip_grads=skip_g_names, capture_xy=capture_xy,
+        )
         self.attn.bwd_accumulate_qkv_grads(
             attn_norm_fwd_output, grads, slot,
+            skip_grads=skip_g_names, capture_xy=capture_xy,
         )
-        del attn_norm_fwd_output
-        return dx
+        if capture_xy is not None:
+            for g_name, xy in capture_xy.items():
+                w_name = "w_" + g_name[2:]
+                intermediates.proj_inputs_and_grads[w_name] = xy
 
     def compute_cost(self, chunk: ChunkMeta) -> ComputeCost:
         max_tier = self.schema.max_tier
@@ -462,8 +515,32 @@ class Qwen3_5LinearLayer:
     def backward(
         self, dx, chunk: ChunkMeta, weights, grads, slot, ctx: LayerContext,
     ) -> torch.Tensor:
+        upstream_dx, intermediates = self.backward_dgrad(
+            dx, chunk, weights, grads, slot, ctx,
+        )
+        self.backward_wgrad(intermediates, weights, grads, slot, ctx)
+        return upstream_dx
+
+    def backward_dgrad(
+        self, dx, chunk: ChunkMeta, weights, grads, slot, ctx: LayerContext,
+        *, skip_target_names: frozenset[str] = frozenset(),
+    ):
+        from flextrain.core.layer import BackwardIntermediates
         cfg = self.cfg
-        dx_ffn_norm_up = self.ffn.bwd(dx, weights, grads, slot)
+        # Inline-Wgrad gates: w_2 (FFN inline), w_lin_out / w_lin_qkvz /
+        # w_lin_ba (linear-attn inline). Note: w_o is N/A (no attention).
+        skip_g_inline: frozenset[str] = frozenset(
+            f"g_{n[2:]}" for n in skip_target_names
+            if n in ("w_2", "w_lin_out", "w_lin_qkvz", "w_lin_ba")
+        )
+        capture_xy: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = (
+            {} if skip_g_inline else None
+        )
+
+        dx_ffn_norm_up = self.ffn.bwd(
+            dx, weights, grads, slot,
+            skip_grads=skip_g_inline, capture_xy=capture_xy,
+        )
         ffn_norm_fwd_output_hint = slot.aux.pop(
             "recompute_ffn_norm_output", None
         )
@@ -477,13 +554,12 @@ class Qwen3_5LinearLayer:
         )
         if ffn_norm_fwd_output_hint is not None:
             ffn_norm_fwd_output = ffn_norm_fwd_output_hint
-        self.ffn.bwd_accumulate_w1_w3_grads(
-            ffn_norm_fwd_output, grads, slot,
-        )
-        del ffn_norm_fwd_output
 
-        # Linear-attn bwd writes weight grads directly + returns dx.
-        dx_lin = self.lin_attn.bwd(dx, weights, grads, slot, ctx)
+        # Linear-attn bwd. Skip-able for w_lin_out / w_lin_qkvz / w_lin_ba.
+        dx_lin = self.lin_attn.bwd(
+            dx, weights, grads, slot, ctx,
+            skip_grads=skip_g_inline, capture_xy=capture_xy,
+        )
         dx, _ = self.attn_norm.bwd(
             dx_lin,
             slot.x_inp,
@@ -492,7 +568,38 @@ class Qwen3_5LinearLayer:
             recompute_output=False,
             recomputed_output_tensor=None,
         )
-        return dx
+
+        intermediates = BackwardIntermediates(
+            proj_inputs_and_grads={},
+            aux={"ffn_norm_fwd_output": ffn_norm_fwd_output},
+        )
+        if capture_xy is not None:
+            for g_name, xy in capture_xy.items():
+                w_name = "w_" + g_name[2:]
+                intermediates.proj_inputs_and_grads[w_name] = xy
+        return dx, intermediates
+
+    def backward_wgrad(
+        self, intermediates, weights, grads, slot, ctx,
+        *, skip_target_names: frozenset[str] = frozenset(),
+    ) -> None:
+        del ctx, weights
+        ffn_norm_fwd_output = intermediates.aux["ffn_norm_fwd_output"]
+        skip_g_names = frozenset(
+            f"g_{n[2:]}" for n in skip_target_names
+            if n in ("w_1", "w_3")
+        )
+        capture_xy: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = (
+            {} if skip_g_names else None
+        )
+        self.ffn.bwd_accumulate_w1_w3_grads(
+            ffn_norm_fwd_output, grads, slot,
+            skip_grads=skip_g_names, capture_xy=capture_xy,
+        )
+        if capture_xy is not None:
+            for g_name, xy in capture_xy.items():
+                w_name = "w_" + g_name[2:]
+                intermediates.proj_inputs_and_grads[w_name] = xy
 
     def compute_cost(self, chunk: ChunkMeta) -> ComputeCost:
         max_tier = self.schema.max_tier

@@ -26,12 +26,14 @@ from flextrain.core.activation_schema import (
     concat_fields,
 )
 from flextrain.core.layer import (
+    BackwardIntermediates,
     ChunkMeta,
     ComputeCost,
     LayerContext,
     MoEChunkConfig,
     ParamSpec,
 )
+from flextrain.core.activation_schema import ActivationSlot
 from flextrain.nn.blocks import (
     GQAAttentionBlock,
     GQAAttentionConfig,
@@ -274,12 +276,65 @@ class OLMoEBlock:
         slot,
         ctx: LayerContext,
     ) -> torch.Tensor:
+        """Delegate to ``backward_dgrad`` + ``backward_wgrad`` -- same
+        FLOPs, same kernels, same order. The split lets LoRA's fast
+        path (rank-r dA/dB on attention deferred Wgrads) skip the
+        per-projection Wgrad addmm. See ``docs/lora_fast_backward.md``.
+        """
+        upstream_dx, intermediates = self.backward_dgrad(
+            dx, chunk, weights, grads, slot, ctx,
+        )
+        self.backward_wgrad(intermediates, weights, grads, slot, ctx)
+        return upstream_dx
+
+    def backward_dgrad(
+        self,
+        dx: torch.Tensor,
+        chunk: ChunkMeta,
+        weights: Mapping[str, torch.Tensor],
+        grads: MutableMapping[str, torch.Tensor],
+        slot: ActivationSlot,
+        ctx: LayerContext,
+        *,
+        skip_target_names: frozenset[str] = frozenset(),
+    ) -> tuple[torch.Tensor, BackwardIntermediates]:
+        """First half of OLMoE backward: dx + recomputed RMSNorm
+        outputs into intermediates payload.
+
+        ``skip_target_names`` honors ``w_o`` (attention output proj
+        inline Wgrad) here; ``w_q/w_k/w_v`` are honored in
+        :meth:`backward_wgrad`. MoE FFN expert projections
+        (``w_up, w_down, w_router``) are always inline and currently
+        go through the slow scratch-`dW` path -- the wrapper handles
+        that internally.
+        """
         cfg = self.cfg
 
-        # --- MoE FFN backward ---
-        # Ensure recompute_ffn_norm_output is available (forward_recompute
-        # may have set it; if x_up was already saved at tier 3,
-        # forward_recompute skipped setting it — recompute here).
+        # Translate w_o (only inline-Wgrad target on this layer) ->
+        # skip_grads for attn.bwd.
+        skip_g_inline: frozenset[str] = frozenset(
+            f"g_{n[2:]}" for n in skip_target_names if n in ("w_o",)
+        )
+        capture_xy: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = (
+            {} if skip_g_inline else None
+        )
+
+        # MoE FFN: gate g_up/g_down/g_router. The wrapper provides a
+        # per-expert callback via intermediates.aux on the way in --
+        # passed positionally below.
+        skip_g_moe: frozenset[str] = frozenset(
+            f"g_{n[2:]}" for n in skip_target_names
+            if n in ("w_up", "w_down", "w_router")
+        )
+        moe_callback = None  # populated by wrapper via slot.aux below
+        if skip_g_moe:
+            moe_callback = slot.aux.pop("__lora_moe_callback__", None)
+            if moe_callback is None:
+                # Wrapper didn't install one -- fall back to slow path
+                # (don't actually skip).
+                skip_g_moe = frozenset()
+
+        # --- MoE FFN backward (monolithic; expert Wgrads always inline) ---
         if "recompute_ffn_norm_output" not in slot.aux:
             slot.aux["recompute_ffn_norm_output"] = self.ffn_norm.fwd_from_rstd(
                 slot.xo.view(-1, cfg.d_model), weights, slot.ffn_norm_rstd,
@@ -288,11 +343,10 @@ class OLMoEBlock:
         ffn_norm_upstream = self.ffn.bwd(
             dx, weights, grads, slot, ctx, chunk,
             layer_id=self.layer_id,
+            skip_grads=skip_g_moe,
+            lora_per_expert_callback=moe_callback,
         )
 
-        # MoE.bwd already handled RMSNorm of ffn_norm in orig, but our
-        # MoESwiGLUFFN returns `ffn_norm_upstream` which is the pre-
-        # rmsnorm grad. We need to run the ffn_norm RMSNorm backward now.
         ffn_norm_fwd_output = slot.aux.pop("recompute_ffn_norm_output")
         dx_xo, _ = self.ffn_norm.bwd(
             ffn_norm_upstream,
@@ -305,10 +359,6 @@ class OLMoEBlock:
         dx = dx_xo
 
         # --- Attention backward ---
-        # With qk_norm=True, attn.bwd needs the pre-norm attn_norm_output
-        # (to recompute pre-QK-norm Q/K for the Q/K RMSNorm backward).
-        # Recompute it from x_inp + saved attn_norm_rstd, and reuse for
-        # bwd_accumulate_qkv_grads.
         attn_norm_fwd_output = slot.aux.pop(
             "recompute_attn_norm_output", None
         )
@@ -320,6 +370,7 @@ class OLMoEBlock:
         dx_attn_norm_up = self.attn.bwd(
             dx, chunk, weights, grads, slot, ctx,
             attn_norm_output=attn_norm_fwd_output,
+            skip_grads=skip_g_inline, capture_xy=capture_xy,
         )
         dx, _ = self.attn_norm.bwd(
             dx_attn_norm_up,
@@ -330,12 +381,53 @@ class OLMoEBlock:
             recomputed_output_tensor=None,
         )
 
+        intermediates = BackwardIntermediates(
+            proj_inputs_and_grads={},
+            aux={
+                "attn_norm_fwd_output": attn_norm_fwd_output,
+            },
+        )
+        if capture_xy is not None:
+            for g_name, xy in capture_xy.items():
+                w_name = "w_" + g_name[2:]
+                intermediates.proj_inputs_and_grads[w_name] = xy
+        return dx, intermediates
+
+    def backward_wgrad(
+        self,
+        intermediates: BackwardIntermediates,
+        weights: Mapping[str, torch.Tensor],
+        grads: MutableMapping[str, torch.Tensor],
+        slot: ActivationSlot,
+        ctx: LayerContext,
+        *,
+        skip_target_names: frozenset[str] = frozenset(),
+    ) -> None:
+        """Second half: deferred attention Wgrads (``g_q, g_k, g_v``).
+        MoE FFN Wgrads are inline in ``ffn.bwd`` and not skip-able yet."""
+        del ctx, weights
+
+        attn_norm_fwd_output = intermediates.aux["attn_norm_fwd_output"]
+
+        # Translate w_* skip names -> g_* skip names. Only attention
+        # deferred Wgrads are gateable in this Phase.
+        skip_g_names: frozenset[str] = frozenset(
+            f"g_{n[2:]}" for n in skip_target_names
+            if n in ("w_q", "w_k", "w_v")
+        )
+        capture_xy: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = (
+            {} if skip_g_names else None
+        )
+
         self.attn.bwd_accumulate_qkv_grads(
             attn_norm_fwd_output, grads, slot,
+            skip_grads=skip_g_names, capture_xy=capture_xy,
         )
-        del attn_norm_fwd_output
 
-        return dx
+        if capture_xy is not None:
+            for g_name, xy in capture_xy.items():
+                w_name = "w_" + g_name[2:]
+                intermediates.proj_inputs_and_grads[w_name] = xy
 
     def compute_cost(self, chunk: ChunkMeta) -> ComputeCost:
         max_tier = self.schema.max_tier

@@ -7,6 +7,7 @@ from .activation_schema import (
     ActivationSlot,
 )
 from .layer import (
+    BackwardIntermediates,
     ChunkMeta,
     ComputeCost,
     InputLayer,
@@ -29,6 +30,7 @@ __all__ = [
     "ActivationField",
     "ActivationSchema",
     "ActivationSlot",
+    "BackwardIntermediates",
     "ChunkMeta",
     "ComputeCost",
     "DPTables",

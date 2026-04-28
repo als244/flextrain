@@ -651,6 +651,9 @@ class GatedDeltaNetBlock:
         grads: MutableMapping[str, torch.Tensor],
         slot,
         ctx: LayerContext,
+        *,
+        skip_grads: frozenset[str] = frozenset(),
+        capture_xy: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
     ) -> torch.Tensor:
         """Backward through the Gated DeltaNet block.
 
@@ -720,12 +723,16 @@ class GatedDeltaNetBlock:
             core_out, z, W_norm, cfg.rms_norm_eps,
         )                                                    # (T, n_v_heads, head_v_dim)
         o_normed_2d = o_normed.reshape(T, cfg.value_dim)
-        # dW_out = o_normed^T @ dy
-        g_w_out = grads.get("g_lin_out")
-        if g_w_out is not None:
-            g_w_out.add_(
-                (o_normed_2d.T.float() @ dy.float()).to(g_w_out.dtype)
-            )
+        # dW_out = o_normed^T @ dy (skip-able: LoRA fast path).
+        if "g_lin_out" in skip_grads:
+            if capture_xy is not None:
+                capture_xy["g_lin_out"] = (o_normed_2d, dy)
+        else:
+            g_w_out = grads.get("g_lin_out")
+            if g_w_out is not None:
+                g_w_out.add_(
+                    (o_normed_2d.T.float() @ dy.float()).to(g_w_out.dtype)
+                )
         # do_normed = dy @ W_out^T
         do_normed_2d = dy.float() @ W_out.float().T          # (T, value_dim)
         do_normed = do_normed_2d.to(dtype).reshape(
@@ -885,15 +892,24 @@ class GatedDeltaNetBlock:
         d_ba_2d = d_ba.reshape(T, cfg.proj_ba_dim)
 
         # 10. Linear bwd for x @ W_qkvz and x @ W_ba.
-        x_2d = x.reshape(T, cfg.d_model).float()
-        if grads.get("g_lin_qkvz") is not None:
+        # Wgrad addmms are skip-able (LoRA fast path); the dx accumulations
+        # below always run (they're dgrad).
+        x_2d_f = x.reshape(T, cfg.d_model).float()
+        x_2d_dt = x.reshape(T, cfg.d_model)  # native dtype copy for capture
+        if "g_lin_qkvz" in skip_grads:
+            if capture_xy is not None:
+                capture_xy["g_lin_qkvz"] = (x_2d_dt, d_qkvz_2d)
+        elif grads.get("g_lin_qkvz") is not None:
             grads["g_lin_qkvz"].add_(
-                (x_2d.T @ d_qkvz_2d.float())
+                (x_2d_f.T @ d_qkvz_2d.float())
                 .to(grads["g_lin_qkvz"].dtype)
             )
-        if grads.get("g_lin_ba") is not None:
+        if "g_lin_ba" in skip_grads:
+            if capture_xy is not None:
+                capture_xy["g_lin_ba"] = (x_2d_dt, d_ba_2d)
+        elif grads.get("g_lin_ba") is not None:
             grads["g_lin_ba"].add_(
-                (x_2d.T @ d_ba_2d.float())
+                (x_2d_f.T @ d_ba_2d.float())
                 .to(grads["g_lin_ba"].dtype)
             )
         dx_via_qkvz = (d_qkvz_2d.float() @ W_qkvz.float().T).to(dtype)

@@ -356,6 +356,8 @@ class MoESwiGLUSharedExpertFFN:
         chunk: ChunkMeta,
         *,
         layer_id: int,
+        skip_grads: frozenset[str] = frozenset(),
+        lora_per_expert_callback: object | None = None,
     ) -> torch.Tensor:
         """Backward.
 
@@ -416,8 +418,17 @@ class MoESwiGLUSharedExpertFFN:
             d_sh_gate.float() * sig_gate.float() * (1.0 - sig_gate.float())
         ).to(d_sh_gate.dtype)                                                # (T, S)
 
-        # w_shared_expert_gate grad: x.T @ d_sh_gate_pre  (d_model, S)
-        if grads.get("g_shared_expert_gate") is not None:
+        # w_shared_expert_gate grad: x.T @ d_sh_gate_pre  (d_model, S).
+        # The shared-expert gate is router-like (not LoRA-targeted by
+        # default; user can target it explicitly). When skipped, hand
+        # back (X, dY) -- but note this is a 2-D projection, so the
+        # callback fires with eid=-1.
+        if "g_shared_expert_gate" in skip_grads:
+            if lora_per_expert_callback is not None:
+                lora_per_expert_callback(
+                    "g_shared_expert_gate", -1, x_2d, d_sh_gate_pre,
+                )
+        elif grads.get("g_shared_expert_gate") is not None:
             grads["g_shared_expert_gate"].add_(
                 (x_2d.float().T @ d_sh_gate_pre.float()).to(grads["g_shared_expert_gate"].dtype)
             )
@@ -430,7 +441,17 @@ class MoESwiGLUSharedExpertFFN:
         # sh_each[t,s,d] = sum_f sh_act[t,s,f] * w_down[s,f,d]
         # d/d(w_down[s,f,d]) = sum_t sh_act[t,s,f] * d_sh_each[t,s,d]
         # d/d(sh_act[t,s,f]) = sum_d w_down[s,f,d] * d_sh_each[t,s,d]
-        if grads.get("g_shared_down") is not None:
+        if "g_shared_down" in skip_grads:
+            if lora_per_expert_callback is not None:
+                # Per-shared-expert: call callback with eid=s, X=sh_act[t,s,:],
+                # dY=d_sh_each[t,s,:]. Stored A: (S, F, r), B: (S, r, d).
+                S = sh_act.shape[1]
+                for eid in range(S):
+                    lora_per_expert_callback(
+                        "g_shared_down", eid,
+                        sh_act[:, eid, :], d_sh_each[:, eid, :],
+                    )
+        elif grads.get("g_shared_down") is not None:
             g_w_shared_down = torch.einsum(
                 "tsf,tsd->sfd", sh_act.float(), d_sh_each.float()
             ).to(grads["g_shared_down"].dtype)
@@ -457,7 +478,17 @@ class MoESwiGLUSharedExpertFFN:
         # sh_pre[t,s,f] = sum_d x[t,d] * w_up[s,d,f]
         # d/d(w_up[s,d,f]) = sum_t x[t,d] * d_sh_pre[t,s,f]
         # d/d(x[t,d])      = sum_{s,f} w_up[s,d,f] * d_sh_pre[t,s,f]
-        if grads.get("g_shared_up") is not None:
+        if "g_shared_up" in skip_grads:
+            if lora_per_expert_callback is not None:
+                # Per-shared-expert: X=x_2d (same for all S), dY=d_x_shared_pre[:, s, :].
+                # Stored A: (S, d, r), B: (S, r, F).
+                S = d_x_shared_pre.shape[1]
+                for eid in range(S):
+                    lora_per_expert_callback(
+                        "g_shared_up", eid,
+                        x_2d, d_x_shared_pre[:, eid, :],
+                    )
+        elif grads.get("g_shared_up") is not None:
             g_w_shared_up = torch.einsum(
                 "td,tsf->sdf", x_2d.float(), d_x_shared_pre.float()
             ).to(grads["g_shared_up"].dtype)
@@ -470,9 +501,14 @@ class MoESwiGLUSharedExpertFFN:
         # ------------------------------------------------------------------
         # Routed path bwd — delegate. The inner block accumulates
         # g_router/g_up/g_down into ``grads`` and returns dx_via_routed.
+        # ``skip_grads`` and ``lora_per_expert_callback`` plumb through:
+        # the routed path's g_router/g_up/g_down get the same fast-path
+        # treatment as a non-shared MoE.
         # ------------------------------------------------------------------
         dx_via_routed = self._routed_ffn.bwd(
             dy_resid, weights, grads, slot, ctx, chunk, layer_id=layer_id,
+            skip_grads=skip_grads,
+            lora_per_expert_callback=lora_per_expert_callback,
         )
 
         # Combine all three dx contributions.

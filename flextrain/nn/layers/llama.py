@@ -31,6 +31,7 @@ from flextrain.core.activation_schema import (
     concat_fields,
 )
 from flextrain.core.layer import (
+    BackwardIntermediates,
     ChunkMeta,
     ComputeCost,
     LayerContext,
@@ -279,11 +280,59 @@ class LlamaBlock:
         slot: ActivationSlot,
         ctx: LayerContext,
     ) -> torch.Tensor:
-        """Mirror ``orig/dense_layer.py:183-330``."""
+        """Mirror ``orig/dense_layer.py:183-330``.
+
+        Implemented as a delegating shim over :meth:`backward_dgrad` +
+        :meth:`backward_wgrad` -- same FLOPs, same kernels, same order.
+        The split is what enables LoRA's fast-path (skip the per-
+        projection Wgrad matmul on frozen base weights). See
+        ``docs/lora_fast_backward.md``.
+        """
+        upstream_dx, intermediates = self.backward_dgrad(
+            dx, chunk, weights, grads, slot, ctx,
+        )
+        self.backward_wgrad(intermediates, weights, grads, slot, ctx)
+        return upstream_dx
+
+    def backward_dgrad(
+        self,
+        dx: torch.Tensor,
+        chunk: ChunkMeta,
+        weights: Mapping[str, torch.Tensor],
+        grads: MutableMapping[str, torch.Tensor],
+        slot: ActivationSlot,
+        ctx: LayerContext,
+        *,
+        skip_target_names: frozenset[str] = frozenset(),
+    ) -> tuple[torch.Tensor, BackwardIntermediates]:
+        """First half of backward: produce ``upstream_dx`` and stash the
+        recomputed RMSNorm outputs into the intermediates payload.
+
+        ``skip_target_names`` is honored for ALL 7 LoRA-targetable
+        projections. Inline cases (``g_o`` in ``attn.bwd``, ``g_2`` in
+        ``ffn.bwd``) honor it here in dgrad; the deferred cases
+        (``g_q, g_k, g_v, g_1, g_3``) honor it in :meth:`backward_wgrad`.
+        Captured ``(X, dY)`` for skipped projections is written to
+        ``intermediates.proj_inputs_and_grads`` keyed by the ``w_*``
+        target name.
+        """
         cfg = self.cfg
 
-        # --- FFN backward ---
-        dx_ffn_norm_up = self.ffn.bwd(dx, weights, grads, slot)
+        # Translate w_* skip target names -> g_* skip names for the
+        # inline-Wgrad addmms here (g_o, g_2 only).
+        skip_g_inline: frozenset[str] = frozenset(
+            f"g_{n[2:]}" for n in skip_target_names
+            if n in ("w_o", "w_2")
+        )
+        capture_xy: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = (
+            {} if skip_g_inline else None
+        )
+
+        # --- FFN backward (dgrad path; accumulates g_2 unless skipped) ---
+        dx_ffn_norm_up = self.ffn.bwd(
+            dx, weights, grads, slot,
+            skip_grads=skip_g_inline, capture_xy=capture_xy,
+        )
 
         ffn_norm_fwd_output_hint = slot.aux.pop(
             "recompute_ffn_norm_output", None
@@ -301,14 +350,11 @@ class LlamaBlock:
         if ffn_norm_fwd_output_hint is not None:
             ffn_norm_fwd_output = ffn_norm_fwd_output_hint
 
-        self.ffn.bwd_accumulate_w1_w3_grads(
-            ffn_norm_fwd_output, grads, slot
-        )
-        del ffn_norm_fwd_output
-
-        # --- Attention backward ---
+        # --- Attention backward (dgrad path; accumulates g_o unless skipped) ---
         dx_attn_norm_up = self.attn.bwd(
-            dx, chunk, weights, grads, slot, ctx, attn_norm_output=None  # type: ignore[arg-type]
+            dx, chunk, weights, grads, slot, ctx,
+            attn_norm_output=None,  # type: ignore[arg-type]
+            skip_grads=skip_g_inline, capture_xy=capture_xy,
         )
 
         attn_norm_fwd_output_hint = slot.aux.pop(
@@ -327,12 +373,88 @@ class LlamaBlock:
         if attn_norm_fwd_output_hint is not None:
             attn_norm_fwd_output = attn_norm_fwd_output_hint
 
-        self.attn.bwd_accumulate_qkv_grads(
-            attn_norm_fwd_output, grads, slot
+        intermediates = BackwardIntermediates(
+            proj_inputs_and_grads={},
+            aux={
+                "ffn_norm_fwd_output": ffn_norm_fwd_output,
+                "attn_norm_fwd_output": attn_norm_fwd_output,
+            },
         )
-        del attn_norm_fwd_output
+        # Inline-skipped (X, dY) go into intermediates so the wrapper
+        # picks them up alongside the deferred ones.
+        if capture_xy is not None:
+            for g_name, xy in capture_xy.items():
+                w_name = "w_" + g_name[2:]
+                intermediates.proj_inputs_and_grads[w_name] = xy
+        return dx, intermediates
 
-        return dx
+    def backward_wgrad(
+        self,
+        intermediates: BackwardIntermediates,
+        weights: Mapping[str, torch.Tensor],
+        grads: MutableMapping[str, torch.Tensor],
+        slot: ActivationSlot,
+        ctx: LayerContext,
+        *,
+        skip_target_names: frozenset[str] = frozenset(),
+    ) -> None:
+        """Second half of backward: consume the recomputed RMSNorm
+        outputs from ``intermediates.aux`` and run the deferred
+        Wgrad matmuls (``g_1, g_3, g_q, g_k, g_v``).
+
+        ``skip_target_names`` is a set of base parameter names (e.g.
+        ``"w_q"``) whose Wgrad ``addmm`` should be skipped. For each
+        skipped projection we instead populate
+        ``intermediates.proj_inputs_and_grads[name] = (X, dY)`` so a
+        LoRA wrapper can compute ``dA, dB`` via rank-r matmuls
+        directly without ever materializing ``dW``. Default empty set
+        means "compute every Wgrad" -- bit-identical to today's
+        behavior.
+
+        Note: only the deferred Wgrads (``g_1, g_3, g_q, g_k, g_v``)
+        are skip-able in this Phase-2 version. The inline ``g_o`` and
+        ``g_2`` addmms (computed inside ``attn.bwd`` / ``ffn.bwd``
+        during ``backward_dgrad``) are not skip-able yet -- LoRA
+        targeting ``w_o`` or ``w_2`` falls back to the slow path
+        (materialize-then-decompose ``dW``). Skipping those would
+        require modifying the block-level ``bwd`` itself; deferred to
+        a follow-up.
+        """
+        del ctx  # not consumed by the deferred Wgrad addmms
+        del weights  # unused here -- LoRA wrapper reads A/B itself
+
+        ffn_norm_fwd_output = intermediates.aux["ffn_norm_fwd_output"]
+        attn_norm_fwd_output = intermediates.aux["attn_norm_fwd_output"]
+
+        # Translate w_* skip target names to g_* grad names. Only the
+        # deferred Wgrads are gateable in Phase 2.
+        skip_g_names: frozenset[str] = frozenset(
+            f"g_{n[2:]}" for n in skip_target_names
+            if n in ("w_q", "w_k", "w_v", "w_1", "w_3")
+        )
+        capture_xy: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = (
+            {} if skip_g_names else None
+        )
+
+        # FFN Wgrads that need ffn_norm_fwd_output as the left operand.
+        self.ffn.bwd_accumulate_w1_w3_grads(
+            ffn_norm_fwd_output, grads, slot,
+            skip_grads=skip_g_names, capture_xy=capture_xy,
+        )
+
+        # Attention Wgrads that need attn_norm_fwd_output as the left operand.
+        self.attn.bwd_accumulate_qkv_grads(
+            attn_norm_fwd_output, grads, slot,
+            skip_grads=skip_g_names, capture_xy=capture_xy,
+        )
+
+        # Hand captured (X, dY) pairs back to the wrapper via
+        # intermediates.proj_inputs_and_grads, keyed by the w_* name
+        # the wrapper expects.
+        if capture_xy is not None:
+            for g_name, xy in capture_xy.items():
+                w_name = "w_" + g_name[2:]
+                intermediates.proj_inputs_and_grads[w_name] = xy
 
     def compute_cost(self, chunk: ChunkMeta) -> ComputeCost:
         max_tier = self.schema.max_tier

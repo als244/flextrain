@@ -538,10 +538,17 @@ class GQAAttentionBlock:
         slot,
         ctx: LayerContext,
         attn_norm_output: torch.Tensor,
+        *,
+        skip_grads: frozenset[str] = frozenset(),
+        capture_xy: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
     ) -> torch.Tensor:
         """Attention backward. Accumulates ``g_o / g_q / g_k / g_v`` into
         ``grads`` and returns ``dx_attn_norm_up`` (gradient w.r.t. the input
         of attn-norm, so callers can pass it to RMSNorm backward).
+
+        ``skip_grads`` can include ``"g_o"`` to gate the inline output-
+        projection Wgrad addmm (LoRA fast path). ``g_q/g_k/g_v`` skip is
+        handled in :meth:`bwd_accumulate_qkv_grads`.
 
         Does NOT accumulate into the residual stream -- the caller holds
         ``dx_resid`` and merges the attn-norm downstream gradient itself,
@@ -556,10 +563,17 @@ class GQAAttentionBlock:
         attn_result = slot.attn_result.view(num_tokens, -1)
 
         # 1. g_o += attn_result^T @ dx_resid
-        torch.addmm(
-            grads["g_o"], attn_result.T, dx_resid,
-            alpha=1.0, beta=1.0, out=grads["g_o"],
-        )
+        if "g_o" in skip_grads:
+            if capture_xy is not None:
+                # Clone dx_resid because the caller will overwrite it
+                # downstream with attn-norm-upstream gradient and we want
+                # the LoRA wrapper to see the value at this point.
+                capture_xy["g_o"] = (attn_result, dx_resid.clone())
+        else:
+            torch.addmm(
+                grads["g_o"], attn_result.T, dx_resid,
+                alpha=1.0, beta=1.0, out=grads["g_o"],
+            )
 
         # 2. dx_up_attn = dx_resid @ w_o^T
         dx_up_attn = torch.matmul(dx_resid, weights["w_o"].T)
@@ -686,25 +700,41 @@ class GQAAttentionBlock:
         attn_norm_output: torch.Tensor,
         grads: MutableMapping[str, torch.Tensor],
         slot,
+        *,
+        skip_grads: frozenset[str] = frozenset(),
+        capture_xy: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
     ) -> None:
         """Second half of backward: once the caller has recomputed
         ``attn_norm_output`` via RMSNorm bwd, we use it as the left operand
         for the w_q / w_k / w_v weight-grad matmuls.
 
+        ``skip_grads`` -- names from {``g_q``, ``g_k``, ``g_v``} whose
+        addmm should be skipped (LoRA fast-path: the wrapper computes
+        rank-r ``dA, dB`` from ``(X, dY)`` directly and never needs the
+        full ``dW``). Default empty -- behavior identical to before.
+
+        ``capture_xy`` -- if provided, the ``(X, dY)`` pair for each
+        skipped projection is written into this dict by name. The
+        wrapper consumes them via the rank-r matmul. Caller is
+        responsible for cloning if it needs them past this call;
+        we hand back the same tensors the addmm would have used.
+
         Mirrors ``orig/dense_layer.py:318-320``.
         """
-        torch.addmm(
-            grads["g_v"], attn_norm_output.T, slot.aux["bwd_local_dv"],
-            alpha=1.0, beta=1.0, out=grads["g_v"],
-        )
-        torch.addmm(
-            grads["g_k"], attn_norm_output.T, slot.aux["bwd_local_dk"],
-            alpha=1.0, beta=1.0, out=grads["g_k"],
-        )
-        torch.addmm(
-            grads["g_q"], attn_norm_output.T, slot.aux["bwd_dq"],
-            alpha=1.0, beta=1.0, out=grads["g_q"],
-        )
+        for name, dy_key in (
+            ("g_v", "bwd_local_dv"),
+            ("g_k", "bwd_local_dk"),
+            ("g_q", "bwd_dq"),
+        ):
+            dy = slot.aux[dy_key]
+            if name in skip_grads:
+                if capture_xy is not None:
+                    capture_xy[name] = (attn_norm_output, dy)
+            else:
+                torch.addmm(
+                    grads[name], attn_norm_output.T, dy,
+                    alpha=1.0, beta=1.0, out=grads[name],
+                )
         del slot.aux["bwd_dq"]
         del slot.aux["bwd_local_dk"]
         del slot.aux["bwd_local_dv"]

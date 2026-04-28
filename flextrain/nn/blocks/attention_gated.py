@@ -474,6 +474,9 @@ class GQAAttentionGatedBlock:
         slot,
         ctx: LayerContext,
         attn_norm_output: torch.Tensor,
+        *,
+        skip_grads: frozenset[str] = frozenset(),
+        capture_xy: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
     ) -> torch.Tensor:
         cfg = self.cfg
         n_heads, n_kv, head_dim = cfg.n_heads, cfg.n_kv_heads, cfg.head_dim
@@ -490,10 +493,16 @@ class GQAAttentionGatedBlock:
         gated_2d = attn_result_2d * sig_gate
 
         # 1. g_o += gated^T @ dx_resid
-        torch.addmm(
-            grads["g_o"], gated_2d.T, dx_resid,
-            alpha=1.0, beta=1.0, out=grads["g_o"],
-        )
+        if "g_o" in skip_grads:
+            if capture_xy is not None:
+                # Clone gated_2d (built from saved tensors -- safe but
+                # minimal cost) and dx_resid (caller will overwrite).
+                capture_xy["g_o"] = (gated_2d.clone(), dx_resid.clone())
+        else:
+            torch.addmm(
+                grads["g_o"], gated_2d.T, dx_resid,
+                alpha=1.0, beta=1.0, out=grads["g_o"],
+            )
 
         # 2. d(gated) = dx_resid @ w_o^T   (T, attn_dim)
         d_gated = torch.matmul(dx_resid, weights["w_o"].T)
@@ -631,22 +640,31 @@ class GQAAttentionGatedBlock:
         attn_norm_output: torch.Tensor,
         grads: MutableMapping[str, torch.Tensor],
         slot,
+        *,
+        skip_grads: frozenset[str] = frozenset(),
+        capture_xy: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
     ) -> None:
         """Second half of bwd: weight-grad matmuls against the
         recomputed ``attn_norm_output``. ``g_q`` accumulates the FULL
-        ``(d_model, attn_dim*2)`` weight-grad (Q + gate halves)."""
-        torch.addmm(
-            grads["g_v"], attn_norm_output.T, slot.aux["bwd_local_dv"],
-            alpha=1.0, beta=1.0, out=grads["g_v"],
-        )
-        torch.addmm(
-            grads["g_k"], attn_norm_output.T, slot.aux["bwd_local_dk"],
-            alpha=1.0, beta=1.0, out=grads["g_k"],
-        )
-        torch.addmm(
-            grads["g_q"], attn_norm_output.T, slot.aux["bwd_dqg"],
-            alpha=1.0, beta=1.0, out=grads["g_q"],
-        )
+        ``(d_model, attn_dim*2)`` weight-grad (Q + gate halves).
+
+        ``skip_grads`` / ``capture_xy``: see
+        :class:`flextrain.nn.blocks.attention.GQAAttentionBlock` --
+        same LoRA fast-path contract."""
+        for name, dy_key in (
+            ("g_v", "bwd_local_dv"),
+            ("g_k", "bwd_local_dk"),
+            ("g_q", "bwd_dqg"),
+        ):
+            dy = slot.aux[dy_key]
+            if name in skip_grads:
+                if capture_xy is not None:
+                    capture_xy[name] = (attn_norm_output, dy)
+            else:
+                torch.addmm(
+                    grads[name], attn_norm_output.T, dy,
+                    alpha=1.0, beta=1.0, out=grads[name],
+                )
         del slot.aux["bwd_dqg"]
         del slot.aux["bwd_local_dk"]
         del slot.aux["bwd_local_dv"]

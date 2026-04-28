@@ -441,6 +441,8 @@ class MoESwiGLUFFN:
         chunk: ChunkMeta,
         *,
         layer_id: int,
+        skip_grads: frozenset[str] = frozenset(),
+        lora_per_expert_callback: object | None = None,
     ) -> torch.Tensor:
         """MoE backward. Accumulates ``g_router / g_up / g_down`` and
         returns ``dx_ffn_norm_up``.
@@ -449,6 +451,16 @@ class MoESwiGLUFFN:
         ``total_tokens_per_step`` needed by the aux-loss kernel is
         read from ``ctx.total_tokens_per_step``. Mirrors
         ``orig/moe_layer.backward_moe``.
+
+        ``skip_grads`` may include ``g_up``, ``g_down``, ``g_router``
+        to gate the corresponding per-expert (or full-router) ``addmm``.
+        Skipped projections do not allocate / write into ``grads[name]``;
+        the caller (LoRA wrapper) supplies a
+        ``lora_per_expert_callback(name, eid, X, dY)`` that fires inside
+        the per-expert loop with the same ``(X, dY)`` the addmm would
+        have used. The callback typically does rank-r matmuls into the
+        wrapper's ``g_a/g_b`` accumulators, never materializing the
+        per-expert ``dW``. ``g_router`` is callback-fired with eid=-1.
         """
         cfg = self.cfg
         num_tokens = dy_resid.shape[0]
@@ -550,27 +562,41 @@ class MoESwiGLUFFN:
             )
 
             # c) g_down[e] += fwd_act.T @ exp_upstream
-            g_down_e = grads["g_down"][eid, :, :]
-            dispatcher.matmul(
-                stream_ptr,
-                A=fwd_act.T, B=exp_upstream,
-                C=g_down_e, D=g_down_e,
-                beta=1.0, alpha=1.0,
-            )
+            if "g_down" in skip_grads:
+                if lora_per_expert_callback is not None:
+                    # Hand back X=fwd_act, dY=exp_upstream for this expert.
+                    # No clones: the wrapper's callback consumes them
+                    # immediately into rank-r accumulators (still inside
+                    # this loop iteration; no lifetime issues).
+                    lora_per_expert_callback("g_down", eid, fwd_act, exp_upstream)
+            else:
+                g_down_e = grads["g_down"][eid, :, :]
+                dispatcher.matmul(
+                    stream_ptr,
+                    A=fwd_act.T, B=exp_upstream,
+                    C=g_down_e, D=g_down_e,
+                    beta=1.0, alpha=1.0,
+                )
 
             # d) dx_pre = dx_up_up @ w_up.T (overwrites exp_upstream to
             # carry the pre-scatter gradient for the gather step below).
+            # MUST run for both fast and slow LoRA paths (it's part of
+            # dgrad, not Wgrad).
             dispatcher.matmul(stream_ptr, A=dx_up_up, B=w_up.T, D=exp_upstream)
 
             # e) g_up[e] += scattered_x[start:end].T @ dx_up_up
             exp_inp = scattered_x[start:end, :]
-            g_up_e = grads["g_up"][eid, :, :]
-            dispatcher.matmul(
-                stream_ptr,
-                A=exp_inp.T, B=dx_up_up,
-                C=g_up_e, D=g_up_e,
-                beta=1.0, alpha=1.0,
-            )
+            if "g_up" in skip_grads:
+                if lora_per_expert_callback is not None:
+                    lora_per_expert_callback("g_up", eid, exp_inp, dx_up_up)
+            else:
+                g_up_e = grads["g_up"][eid, :, :]
+                dispatcher.matmul(
+                    stream_ptr,
+                    A=exp_inp.T, B=dx_up_up,
+                    C=g_up_e, D=g_up_e,
+                    beta=1.0, alpha=1.0,
+                )
 
         del scattered_x
 
@@ -612,20 +638,28 @@ class MoESwiGLUFFN:
             )
 
         # 7) Router weight gradient + downstream FFN-norm-upstream accumulation.
-        # ffn_norm_upstream += dlogits @ w_router.T
+        # ffn_norm_upstream += dlogits @ w_router.T (always runs -- dgrad).
         dispatcher.matmul(
             stream_ptr,
             A=dlogits, B=weights["w_router"].T,
             C=ffn_norm_upstream, D=ffn_norm_upstream,
             beta=1.0, alpha=1.0,
         )
-        # g_router += ffn_norm_output.T @ dlogits
-        dispatcher.matmul(
-            stream_ptr,
-            A=ffn_norm_output.T, B=dlogits,
-            C=grads["g_router"], D=grads["g_router"],
-            beta=1.0, alpha=1.0,
-        )
+        # g_router += ffn_norm_output.T @ dlogits (Wgrad -- skip-able).
+        if "g_router" in skip_grads:
+            if lora_per_expert_callback is not None:
+                # eid=-1 marks "non-per-expert"; the LoRA wrapper does
+                # a 2-D rank-r matmul rather than a per-expert 3-D one.
+                lora_per_expert_callback(
+                    "g_router", -1, ffn_norm_output, dlogits,
+                )
+        else:
+            dispatcher.matmul(
+                stream_ptr,
+                A=ffn_norm_output.T, B=dlogits,
+                C=grads["g_router"], D=grads["g_router"],
+                beta=1.0, alpha=1.0,
+            )
 
         return ffn_norm_upstream
 

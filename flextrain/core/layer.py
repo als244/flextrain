@@ -442,6 +442,62 @@ class MoEChunkConfig:
 
 
 @dataclass
+class BackwardIntermediates:
+    """Per-projection ``(X, dY)`` pairs and any layer-internal cache the
+    weight-grad pass needs to consume. Produced by
+    :meth:`Layer.backward_dgrad`, consumed by :meth:`Layer.backward_wgrad`
+    (or by a LoRA wrapper's fast accumulate path).
+
+    Why a typed payload
+    -------------------
+    Splitting ``backward()`` into ``backward_dgrad()`` (returns ``dx``)
+    and ``backward_wgrad()`` (accumulates ``grads[g_*]``) lets layers
+    that wrap a frozen base — LoRA in particular — call dgrad alone and
+    skip the expensive ``X^T @ dY`` Wgrad matmul on every projection.
+    LoRA accumulates its own ``dA, dB`` directly from ``(X, dY)`` via
+    rank-r matmuls, never materializing ``dW`` for the frozen base.
+
+    Contract
+    --------
+    * ``proj_inputs_and_grads[name]`` = ``(X, dY)`` for projection
+      ``name`` (a key in the layer's ``ParamSpec`` / ``weights`` /
+      ``grads`` dicts -- e.g. ``"w_q"``, ``"w_o"``, ``"w_1"``,
+      ``"w_up"``). The Wgrad matmul a layer would have run is
+      ``grads[f"g_{name[2:]}"].addmm_(X.T, dY)``; LoRA replaces this
+      with rank-r matmuls on the same ``(X, dY)``.
+    * For MoE projections the ``(X, dY)`` tensors are 3-D
+      ``(num_experts, T_e, dim)`` -- the same shape contract LoRA
+      already handles via ``bmm`` (see ``lora_wrapper.py``).
+    * ``aux`` carries layer-internal state -- e.g. a recomputed
+      RMSNorm output that ``backward_wgrad`` needs as the left operand
+      of a Wgrad matmul. Opaque to LoRA.
+
+    Lifetime
+    --------
+    Short-lived: the engine calls dgrad immediately followed by wgrad
+    on the compute stream, so an intermediates instance lives only for
+    one (layer, chunk) backward iteration. No cross-layer accumulation,
+    no extra long-lived GPU residency vs. today's monolithic backward.
+    """
+
+    proj_inputs_and_grads: dict[str, tuple[torch.Tensor, torch.Tensor]] = (
+        field(default_factory=dict)
+    )
+    aux: dict[str, Any] = field(default_factory=dict)
+
+    def __getitem__(
+        self, name: str
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.proj_inputs_and_grads[name]
+
+    def __contains__(self, name: str) -> bool:
+        return name in self.proj_inputs_and_grads
+
+    def names(self) -> tuple[str, ...]:
+        return tuple(self.proj_inputs_and_grads.keys())
+
+
+@dataclass
 class LayerContext:
     """Engine-provided per-call resources. Replaces the ad-hoc ``fwd_context``
     / ``bwd_context`` dicts that ``orig/`` passed around.
@@ -543,7 +599,99 @@ class Layer(Protocol):
     ) -> torch.Tensor:
         """One chunk backward. Accumulates param gradients into ``grads``
         in-place. Returns ``dx`` for the preceding layer (same shape as
-        ``x``)."""
+        ``x``).
+
+        Layers MAY also implement the optional split pair below
+        (:meth:`backward_dgrad` + :meth:`backward_wgrad`). When both are
+        implemented, the canonical pattern is for ``backward()`` to be
+        a delegating shim: ``upstream_dx, inter = backward_dgrad(...);
+        backward_wgrad(inter, ...); return upstream_dx``. This keeps
+        zero-behavior-change for all current callers (engine, parity
+        benches, tests) while enabling the LoRA fast-path consumer in
+        :mod:`flextrain.engine.active_model` to call dgrad alone and
+        skip the per-projection Wgrad matmuls for frozen base weights.
+        See ``docs/lora_fast_backward.md`` for the contract.
+        """
+        ...
+
+    # ------------------------------------------------------------------
+    # Optional: split backward into dgrad / wgrad. Phase 1 of the LoRA
+    # fast-backward refactor (docs/lora_fast_backward.md). Layers that
+    # implement these two methods AND have ``backward()`` delegate to
+    # them gain the ability to skip Wgrad on a per-projection basis
+    # (LoRA does this for every wrapped projection). Layers that don't
+    # implement them keep using the monolithic ``backward()`` -- the
+    # engine falls back automatically in that case.
+    # ------------------------------------------------------------------
+
+    def backward_dgrad(
+        self,
+        dx: torch.Tensor,
+        chunk: ChunkMeta,
+        weights: Mapping[str, torch.Tensor],
+        grads: MutableMapping[str, torch.Tensor],
+        slot: ActivationSlot,
+        ctx: LayerContext,
+        *,
+        skip_target_names: frozenset[str] = frozenset(),
+    ) -> tuple[torch.Tensor, BackwardIntermediates]:
+        """Compute dL/dx (the upstream gradient) and return everything
+        :meth:`backward_wgrad` will need to accumulate dL/dW.
+
+        Returns ``(upstream_dx, intermediates)``.
+
+        ``intermediates`` is a :class:`BackwardIntermediates` carrying
+        per-projection ``(X, dY)`` pairs (``proj_inputs_and_grads``) so
+        a LoRA wrapper can compute ``dA, dB`` directly via rank-r
+        matmuls without materializing the full ``dW = X^T @ dY`` for
+        the frozen base, plus opaque layer-internal state in ``aux``
+        (e.g. recomputed RMSNorm outputs).
+
+        Side effects on ``grads``
+        -------------------------
+        Some Wgrads are accumulated INLINE during dgrad in today's
+        block implementations -- e.g. ``g_o`` (attention output proj)
+        and ``g_2`` (FFN down-proj) in Llama, plus 1-D parameter grads
+        like RMSNorm gain (``g_attn_norm`` etc.) and attention biases
+        (``g_b_q`` etc.). These are still accumulated here.
+
+        For a 2-D matmul projection whose name appears in
+        ``skip_target_names``, the inline ``addmm`` is skipped and the
+        ``(X, dY)`` pair is stashed into
+        ``intermediates.proj_inputs_and_grads[name]`` so the LoRA
+        wrapper can pick it up. 1-D parameter grads (norms, biases)
+        are never LoRA targets and always accumulate normally.
+
+        ``skip_target_names`` defaults to ``frozenset()`` -- full FT
+        callers don't pass anything and behavior is identical to
+        today's monolithic backward.
+        """
+        ...
+
+    def backward_wgrad(
+        self,
+        intermediates: BackwardIntermediates,
+        weights: Mapping[str, torch.Tensor],
+        grads: MutableMapping[str, torch.Tensor],
+        slot: ActivationSlot,
+        ctx: LayerContext,
+        *,
+        skip_target_names: frozenset[str] = frozenset(),
+    ) -> None:
+        """Accumulate the deferred dL/dW into ``grads`` -- the Wgrads
+        that need a recomputed RMSNorm output as their left operand
+        and so couldn't run inline during ``backward_dgrad``.
+
+        ``skip_target_names`` works the same way as in
+        :meth:`backward_dgrad`: a 2-D projection whose name is in the
+        set has its ``addmm`` skipped and its ``(X, dY)`` stashed in
+        ``intermediates.proj_inputs_and_grads[name]`` so a LoRA
+        wrapper can compute ``dA, dB`` from the same ``(X, dY)``.
+
+        ``slot`` is passed through so the layer can reach activations
+        the block-level callees still read from ``slot.aux`` (e.g.
+        Llama's ``slot.aux["bwd_dq"]``).
+        """
         ...
 
     def compute_cost(self, chunk: ChunkMeta) -> ComputeCost:
