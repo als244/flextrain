@@ -491,10 +491,34 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--lora-rank", type=int, default=16, help="LoRA rank when --mode lora. Default: 16.")
     p.add_argument("--lora-alpha", type=float, default=16.0, help="LoRA alpha when --mode lora. Default: 16.0.")
     p.add_argument("--device-id", type=int, default=0, help="CUDA device id. Default: 0.")
-    p.add_argument("--max-gpu-mem-gib", type=float, default=None, help="GPU memory budget in GiB. Default: 24.")
-    p.add_argument("--max-host-mem-gib", type=float, default=None, help="Host memory budget in GiB. Default: 110.")
+    p.add_argument(
+        "--max-gpu-mem-gib", type=float, default=None,
+        help=(
+            "GPU memory budget in GiB. Default: auto-discovered via "
+            "torch.cuda.mem_get_info (with nvidia-smi / ROCm fallbacks)."
+        ),
+    )
+    p.add_argument(
+        "--max-host-mem-gib", type=float, default=None,
+        help=(
+            "Host memory budget in GiB. Default: auto-discovered, "
+            "respecting Slurm allocation / cgroup v1+v2 limits / psutil "
+            "available."
+        ),
+    )
     p.add_argument("--leeway-gpu-mem-gib", type=float, default=2.0, help="Reserved GPU slack in GiB. Default: 2.0.")
     p.add_argument("--leeway-host-mem-gib", type=float, default=10.0, help="Reserved host-memory slack in GiB. Default: 10.0.")
+    p.add_argument(
+        "--force-save-level",
+        type=int,
+        default=None,
+        choices=[0, 1, 2, 3],
+        help=(
+            "Debug: force every host-resident (layer, chunk) pair to this "
+            "save tier instead of letting the DP solver choose. Tier is "
+            "clamped to each layer's max. The on-device tail keeps -1."
+        ),
+    )
     p.add_argument("--save", action="store_true", help="Export final.safetensors at the end of the run.")
     return p
 
@@ -551,13 +575,31 @@ def main(argv: list[str] | None = None) -> int:
         )
         lora_targets = None
 
-    max_gpu_mem_bytes = (
-        int(args.max_gpu_mem_gib * (1 << 30))
-        if args.max_gpu_mem_gib is not None else int(24 * (1 << 30))
+    # Auto-discover memory budgets when the user doesn't override them.
+    # Falls back to a conservative 24 / 110 GiB if discovery fails (no
+    # CUDA, no psutil, etc.) so train.py still launches in dev sandboxes.
+    from flextrain.core._memory import (
+        get_available_gpu_memory,
+        get_available_host_memory,
     )
-    max_host_mem_bytes = (
-        int(args.max_host_mem_gib * (1 << 30))
-        if args.max_host_mem_gib is not None else int(110 * (1 << 30))
+    if args.max_gpu_mem_gib is not None:
+        max_gpu_mem_bytes = int(args.max_gpu_mem_gib * (1 << 30))
+        gpu_src = "user"
+    else:
+        discovered = get_available_gpu_memory(args.device_id)
+        max_gpu_mem_bytes = discovered if discovered > 0 else int(24 * (1 << 30))
+        gpu_src = "auto" if discovered > 0 else "fallback"
+    if args.max_host_mem_gib is not None:
+        max_host_mem_bytes = int(args.max_host_mem_gib * (1 << 30))
+        host_src = "user"
+    else:
+        discovered = get_available_host_memory()
+        max_host_mem_bytes = discovered if discovered > 0 else int(110 * (1 << 30))
+        host_src = "auto" if discovered > 0 else "fallback"
+    print(
+        f"Memory budgets: gpu={max_gpu_mem_bytes / (1 << 30):.1f}GiB ({gpu_src}), "
+        f"host={max_host_mem_bytes / (1 << 30):.1f}GiB ({host_src})",
+        flush=True,
     )
     print(
         f"Train config: model={local_model_dir} mode={args.mode} "
@@ -566,16 +608,30 @@ def main(argv: list[str] | None = None) -> int:
         flush=True,
     )
     device_str = f"cuda:{args.device_id}"
-    print("Probing hardware (one matmul + one PCIe transfer)...", flush=True)
+    print(
+        "Probing hardware (sustained matmul + memory bandwidth + PCIe; "
+        "~5s)...",
+        flush=True,
+    )
     from flextrain.core.hw_probe import probe_hardware
     probe = probe_hardware(device=device_str)
+    throttle_drop = (
+        probe.achieved_tflops_first_half - probe.achieved_tflops_second_half
+    )
+    throttle_pct = (
+        100.0 * throttle_drop / probe.achieved_tflops_first_half
+        if probe.achieved_tflops_first_half > 0 else 0.0
+    )
     print(
-        f"[HW Probe] peak_tflops={probe.hw_cost.peak_tflops:.1f}, "
+        f"[HW Probe] sustained_tflops={probe.hw_cost.peak_tflops:.1f} "
+        f"(first half {probe.achieved_tflops_first_half:.1f} -> "
+        f"second half {probe.achieved_tflops_second_half:.1f}, "
+        f"throttle drop {throttle_pct:.1f}%), "
         f"pcie_bw_gbps={probe.hw_cost.pcie_bw_gbps:.1f}, "
         f"mem_bw_gbps={probe.mem_bw_gbps:.1f} "
-        f"(matmul {probe.matmul_n}^2 bf16 = {probe.matmul_per_call_ms:.2f}ms; "
-        f"PCIe {probe.transfer_bytes/(1<<20):.0f}MiB = "
-        f"{probe.transfer_per_call_ms:.2f}ms)",
+        f"[matmul {probe.matmul_n}^2 ran {probe.matmul_total_seconds:.1f}s; "
+        f"PCIe {probe.transfer_bytes/(1<<20):.0f}MiB per call "
+        f"{probe.transfer_per_call_ms:.2f}ms]",
         flush=True,
     )
     print(
@@ -598,6 +654,7 @@ def main(argv: list[str] | None = None) -> int:
         lora_alpha=args.lora_alpha,
         hw_cost=probe.hw_cost,
         mem_bw_gbps=probe.mem_bw_gbps,
+        force_saved_act_level=args.force_save_level,
         strict=False,
         verbose=True,
     )

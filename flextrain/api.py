@@ -206,6 +206,7 @@ def from_pretrained(
     hw_cost: HardwareCost | None = None,
     mem_bw_gbps: float | None = None,
     fixed_seq_len: bool = False,
+    force_saved_act_level: int | None = None,
     head_chunk_size: int = 512,
     load_weights: bool = True,
     strict: bool = False,
@@ -247,6 +248,13 @@ def from_pretrained(
         plans that skip recompute regardless of the actual
         compute/PCIe ratio. Real training runs should always pass
         a measured ``hw_cost``.
+    force_saved_act_level
+        Debug knob. If set, every (layer, chunk) pair that would have
+        gone to a host slot is forced to this tier (clamped to each
+        layer's ``schema.max_tier``). The on-device tail set by the
+        engine still uses ``-1``. Useful for ablations / parity tests
+        where you want a known save policy regardless of the DP
+        solver's choice.
     load_weights
         If False, skip the ``am.load_hf`` call (random init).
     strict
@@ -358,6 +366,7 @@ def from_pretrained(
         working_set=working_set,
         hw_cost=hw_cost,
         dims=dims, device=device,
+        force_saved_act_level=force_saved_act_level,
     )
 
     # 6. Load + permute weights.

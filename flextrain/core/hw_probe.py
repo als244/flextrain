@@ -1,23 +1,31 @@
 """Light-weight hardware probe for DP-solver inputs.
 
-The DP solver in :mod:`flextrain.core.save_level` needs two scalars:
+The DP solver in :mod:`flextrain.core.save_level` needs:
 
-* effective device throughput in TFLOPS (used by ``HardwareCost.flops_to_ms``);
-* unidirectional concurrent host<->device PCIe bandwidth in GB/s
-  (used by ``HardwareCost.bytes_to_ms``).
+* sustained device throughput in TFLOPS (for ``HardwareCost.flops_to_ms``);
+* unidirectional concurrent host<->device PCIe bandwidth in GB/s (for
+  ``HardwareCost.bytes_to_ms``);
+* device memory bandwidth in GB/s (for the working-set solver's
+  arithmetic-intensity bound).
 
-Orig's ``hardware_env.get_hardware_env`` (orig/awsm_transformer/hardware_env.py)
-runs a per-component matmul sweep + multi-direction transfer benches at
-~100 reps each, plus two extra reference benches. That is fine when working
-set sizing actually consumes the per-component breakdown, but for the DP
-solver's use case (two scalars, ~10% accuracy is plenty -- the binary
-"does level 3 fit?" decision is robust to that) it is overkill and burns
-seconds of GPU time at startup.
+Why "sustained" and not "peak"
+------------------------------
+Consumer cards (3090, 4090) and even datacenter cards under modest
+cooling start at boost clocks and drop to base clocks within a few
+seconds of sustained matmul load. A 10-rep, ~50ms probe sees the boost
+window only -- it reports peak-burst TFLOPS, not what training will
+actually sustain. The DP solver then thinks the per-task arrival window
+is small (compute is "fast") and saves everything at the highest tier
+because transfers seem to fit; on real training the throughput drops
+and saves spill and stall.
 
-This module provides :func:`probe_hardware` -- one bf16 square matmul
-plus one concurrent host<->device transfer, ~10 reps each, that returns a
-:class:`flextrain.core.save_level.HardwareCost`. Total wall time on a
-modern datacenter GPU is well under a second.
+The fix is wall-time bounded probing: run matmuls for at least a few
+seconds, then return the **second-half average** so the steady-state
+dominates the answer (the first half captures the boost-to-base
+transition; throwing it out gives a cleaner sustained number).
+
+Defaults run for ~3-4 seconds total; pass ``matmul_target_seconds`` to
+trade speed for precision.
 """
 
 from __future__ import annotations
@@ -33,34 +41,62 @@ from .save_level import HardwareCost
 @dataclass(frozen=True)
 class HardwareProbeResult:
     """Outputs of :func:`probe_hardware`. Wraps :class:`HardwareCost`
-    plus a few extra fields useful for logging."""
+    plus extra fields useful for logging.
+
+    Attributes
+    ----------
+    matmul_total_seconds, mem_bw_total_seconds
+        Wall time the corresponding probe actually ran for. Useful for
+        verifying you sized ``*_target_seconds`` long enough for
+        thermal/clock throttling to settle.
+    achieved_tflops_first_half, achieved_tflops_second_half
+        Throughput in each half of the matmul probe. A noticeable drop
+        from first to second half is the signature of thermal/clock
+        throttling kicking in -- the second-half number is the one fed
+        into ``hw_cost``.
+    """
 
     hw_cost: HardwareCost
     matmul_n: int
     matmul_per_call_ms: float
+    matmul_total_seconds: float
+    achieved_tflops_first_half: float
+    achieved_tflops_second_half: float
     transfer_bytes: int
     transfer_per_call_ms: float
-    # GPU memory bandwidth in GB/s, measured via a memory-bound
-    # ``(1 x n) @ (n x n)`` matmul (orig's basic_peak_mem_bandwidth probe).
-    # Used by the working-set solver's arithmetic-intensity bound for
-    # picking minimum chunk size.
     mem_bw_gbps: float
+    mem_bw_total_seconds: float
 
 
-def _bench_matmul(
+def _calibrate_reps(
+    one_call_seconds: float, target_seconds: float, *, min_reps: int
+) -> int:
+    """How many reps to schedule so total runtime ~= ``target_seconds``."""
+    if one_call_seconds <= 0:
+        return min_reps
+    return max(min_reps, int(target_seconds / one_call_seconds) + 1)
+
+
+def _bench_matmul_sustained(
     n: int,
     *,
     dtype: torch.dtype,
     device: torch.device,
+    target_seconds: float,
     n_warmup: int,
-    n_reps: int,
-) -> tuple[float, float]:
-    """Run ``A @ B`` (n x n square) ``n_reps`` times and return
-    ``(per_call_seconds, achieved_tflops)``.
+    min_reps: int,
+) -> tuple[float, float, float, float, float]:
+    """Run an n x n bf16 matmul long enough for steady-state to settle.
 
-    Uses ``torch.matmul`` directly so we don't depend on the custom CUTLASS
-    dispatcher in ``orig.awsm_transformer.matmul_dispatchers`` -- this keeps
-    the probe module self-contained inside ``flextrain``.
+    Returns ``(per_call_seconds, achieved_tflops_overall,
+    achieved_tflops_first_half, achieved_tflops_second_half,
+    total_seconds)``. Use ``second_half`` as the DP-solver input -- it
+    excludes the boost-clock window at the top of the run.
+
+    Implementation: warmup, then time one matmul to estimate per-call
+    cost, then schedule ``ceil(target_seconds / per_call)`` reps. Reps
+    are split into two equal halves; we time them separately so the
+    caller can detect throttling (first-half >> second-half).
     """
     A = torch.randn(n, n, dtype=dtype, device=device)
     B = torch.randn(n, n, dtype=dtype, device=device)
@@ -69,52 +105,94 @@ def _bench_matmul(
         _ = torch.matmul(A, B)
     torch.cuda.synchronize(device)
 
-    start = time.perf_counter_ns()
-    for _ in range(n_reps):
+    # Calibrate per-call time with a single sync'd matmul.
+    cal_start = time.perf_counter_ns()
+    _ = torch.matmul(A, B)
+    torch.cuda.synchronize(device)
+    one_call = (time.perf_counter_ns() - cal_start) / 1e9
+    n_reps = _calibrate_reps(one_call, target_seconds, min_reps=min_reps)
+    # Make n_reps even so the halves are the same size.
+    if n_reps % 2:
+        n_reps += 1
+
+    # First half.
+    half = n_reps // 2
+    start_h1 = time.perf_counter_ns()
+    for _ in range(half):
         _ = torch.matmul(A, B)
     torch.cuda.synchronize(device)
-    total = (time.perf_counter_ns() - start) / 1e9
+    end_h1 = time.perf_counter_ns()
 
-    per_call = total / n_reps
-    flops = 2.0 * n * n * n
-    tflops = (flops / per_call) / 1e12
+    # Second half.
+    for _ in range(half):
+        _ = torch.matmul(A, B)
+    torch.cuda.synchronize(device)
+    end_h2 = time.perf_counter_ns()
+
+    total = (end_h2 - start_h1) / 1e9
+    h1 = (end_h1 - start_h1) / 1e9
+    h2 = (end_h2 - end_h1) / 1e9
+
+    flops_per_call = 2.0 * n * n * n
+    tflops_overall = (flops_per_call * n_reps / total) / 1e12
+    tflops_h1 = (flops_per_call * half / h1) / 1e12 if h1 > 0 else 0.0
+    tflops_h2 = (flops_per_call * half / h2) / 1e12 if h2 > 0 else 0.0
+    per_call_overall = total / n_reps
+
     del A, B
-    return per_call, tflops
+    return per_call_overall, tflops_overall, tflops_h1, tflops_h2, total
 
 
-def _bench_mem_bandwidth(
+def _bench_mem_bandwidth_sustained(
     n: int,
     *,
     dtype: torch.dtype,
     device: torch.device,
+    target_seconds: float,
     n_warmup: int,
-    n_reps: int,
-) -> float:
-    """Estimate device memory bandwidth via a memory-bound matmul shape:
-    ``(1, n) @ (n, n)`` reads ~``n*n*itemsize`` weight bytes per call but
-    only does ``2 * n * n`` flops, so it's bandwidth-limited rather than
-    compute-limited (orig's ``get_basic_peak_mem_bandwidth_gb_per_sec``).
-
-    Returns achieved GB/s.
+    min_reps: int,
+) -> tuple[float, float]:
+    """Memory-bandwidth probe (``(1, n) @ (n, n)`` matmul). Returns
+    ``(gbps_second_half, total_seconds)``. Same time-bounded /
+    second-half-average strategy as :func:`_bench_matmul_sustained` --
+    memory bandwidth on a clocked-down GPU is also lower than peak.
     """
     A = torch.randn(1, n, dtype=dtype, device=device)
     B = torch.randn(n, n, dtype=dtype, device=device)
+
     for _ in range(n_warmup):
         _ = torch.matmul(A, B)
     torch.cuda.synchronize(device)
 
-    start = time.perf_counter_ns()
-    for _ in range(n_reps):
+    cal_start = time.perf_counter_ns()
+    _ = torch.matmul(A, B)
+    torch.cuda.synchronize(device)
+    one_call = (time.perf_counter_ns() - cal_start) / 1e9
+    n_reps = _calibrate_reps(one_call, target_seconds, min_reps=min_reps)
+    if n_reps % 2:
+        n_reps += 1
+
+    half = n_reps // 2
+    # Skip the first half (warmup-after-warmup); time only the second.
+    for _ in range(half):
         _ = torch.matmul(A, B)
     torch.cuda.synchronize(device)
-    total = (time.perf_counter_ns() - start) / 1e9
-    per_call = total / n_reps
 
-    # Bytes touched per call: A (n) + B (n*n) + output (n).
+    start_h2 = time.perf_counter_ns()
+    for _ in range(half):
+        _ = torch.matmul(A, B)
+    torch.cuda.synchronize(device)
+    end_h2 = time.perf_counter_ns()
+
+    h2 = (end_h2 - start_h2) / 1e9
+    per_call = h2 / half
     bytes_touched = dtype.itemsize * (n * n + 2 * n)
     gbps = (bytes_touched / per_call) / 1e9
+
+    # Total runtime including the discarded first half.
+    # (Approximated as 2x the timed half; close enough for a log line.)
     del A, B
-    return gbps
+    return gbps, h2 * 2
 
 
 def _bench_pcie_concurrent(
@@ -124,14 +202,10 @@ def _bench_pcie_concurrent(
     n_warmup: int,
     n_reps: int,
 ) -> tuple[float, float]:
-    """Time concurrent host->device + device->host transfers of ``nbytes``
-    on two streams, returning ``(per_iter_seconds, gbps)``.
-
-    Why concurrent: the engine overlaps inbound (params/acts fetch) and
-    outbound (gradient/act offload) traffic, so the relevant bandwidth for
-    DP scheduling is what each side gets while the other is also active.
-    Matches what orig measures as
-    ``overall_unidirectional_concurrent_bandwidth_gb_per_sec``.
+    """Concurrent host<->device PCIe transfer. PCIe bandwidth doesn't
+    thermal-throttle the way matmul does (the link controller stays at
+    the negotiated PCIe gen rate), so this stays at a small rep count.
+    Returns ``(per_iter_seconds, gbps)``.
     """
     h_in = torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
     d_in = torch.empty(nbytes, dtype=torch.uint8, device=device)
@@ -158,9 +232,6 @@ def _bench_pcie_concurrent(
     total = (time.perf_counter_ns() - start) / 1e9
 
     per_iter = total / n_reps
-    # Each iteration moves ``nbytes`` in each direction. We report the
-    # unidirectional bandwidth -- ``nbytes / per_iter`` -- to mirror orig's
-    # convention (orig:42, ``num_bytes / avg_duration_sec``).
     gbps = (nbytes / per_iter) / 1e9
     del h_in, d_in, d_out, h_out
     return per_iter, gbps
@@ -173,32 +244,50 @@ def probe_hardware(
     matmul_n: int = 4096,
     mem_bw_n: int = 8192,
     transfer_mib: int = 256,
-    n_matmul_warmup: int = 3,
-    n_matmul_reps: int = 10,
-    n_mem_bw_warmup: int = 3,
-    n_mem_bw_reps: int = 20,
+    matmul_target_seconds: float = 3.0,
+    mem_bw_target_seconds: float = 2.0,
+    n_matmul_warmup: int = 5,
+    n_mem_bw_warmup: int = 5,
+    min_matmul_reps: int = 50,
+    min_mem_bw_reps: int = 50,
     n_transfer_warmup: int = 2,
     n_transfer_reps: int = 5,
 ) -> HardwareProbeResult:
-    """One-shot hardware probe sized to be fast (<1s on H100/A100) yet
-    accurate enough for DP-solver inputs.
+    """Probe sustained (post-throttle) compute + memory + PCIe bandwidth.
 
-    Defaults are tuned so the matmul probe is well above the
-    arithmetic-intensity roofline (4096^3 fp16 matmul ≈ 137 GFLOPs,
-    plenty above kernel-launch overhead) and the transfer probe is
-    large enough that PCIe steady-state dominates over per-call latency.
-    Override the ``n_*_reps`` knobs for higher precision.
+    Total wall time is roughly ``matmul_target_seconds + mem_bw_target_seconds``
+    plus a small PCIe component (defaults: ~5s). Tuned so consumer GPUs
+    have time to drop from boost clocks to sustained clocks before the
+    measurement window closes -- if you only ran for ~50ms you'd see
+    boost-clock TFLOPS, which is misleading for sizing the DP solver.
+
+    Set ``matmul_target_seconds`` higher if you suspect the GPU takes
+    longer than 3s to thermally settle (multi-GPU rigs with shared
+    cooling, datacenter cards under heavy ambient load). Each second of
+    target time is roughly one second of GPU activity.
+
+    Returns a :class:`HardwareProbeResult` whose ``hw_cost`` field
+    contains the second-half (sustained) numbers; the per-half
+    breakdown is also exposed so you can detect throttling for logging.
     """
     device = torch.device(device)
 
-    matmul_per_call, achieved_tflops = _bench_matmul(
+    (
+        matmul_per_call,
+        _achieved_tflops_overall,
+        tflops_h1,
+        tflops_h2,
+        matmul_total,
+    ) = _bench_matmul_sustained(
         matmul_n, dtype=dtype, device=device,
-        n_warmup=n_matmul_warmup, n_reps=n_matmul_reps,
+        target_seconds=matmul_target_seconds,
+        n_warmup=n_matmul_warmup, min_reps=min_matmul_reps,
     )
 
-    mem_bw_gbps = _bench_mem_bandwidth(
+    mem_bw_gbps, mem_bw_total = _bench_mem_bandwidth_sustained(
         mem_bw_n, dtype=dtype, device=device,
-        n_warmup=n_mem_bw_warmup, n_reps=n_mem_bw_reps,
+        target_seconds=mem_bw_target_seconds,
+        n_warmup=n_mem_bw_warmup, min_reps=min_mem_bw_reps,
     )
 
     transfer_bytes = transfer_mib * (1 << 20)
@@ -210,14 +299,18 @@ def probe_hardware(
     torch.cuda.empty_cache()
 
     hw_cost = HardwareCost(
-        peak_tflops=achieved_tflops,
+        peak_tflops=tflops_h2,  # sustained second-half average
         pcie_bw_gbps=gbps,
     )
     return HardwareProbeResult(
         hw_cost=hw_cost,
         matmul_n=matmul_n,
         matmul_per_call_ms=matmul_per_call * 1e3,
+        matmul_total_seconds=matmul_total,
+        achieved_tflops_first_half=tflops_h1,
+        achieved_tflops_second_half=tflops_h2,
         transfer_bytes=transfer_bytes,
         transfer_per_call_ms=transfer_per_call * 1e3,
         mem_bw_gbps=mem_bw_gbps,
+        mem_bw_total_seconds=mem_bw_total,
     )
