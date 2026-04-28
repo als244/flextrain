@@ -939,13 +939,21 @@ def _pick_chunk_size(
         # always nonzero and small. With many full rounds preceding it
         # (524288/5040 ~= 104) the per-step overhead is negligible.
         #
-        # Tail < 5% of a full round IS small enough to ignore (one
-        # straggler round on top of 100+ full rounds); tails between 5%
-        # and 40% of compute-limit get the original gate.
+        # Clause (b) compares the tail to the *step*, not to one round:
+        # the cost we care about is "tail wastes a meaningful fraction
+        # of a step's compute", not "tail < 5% of one round" (the latter
+        # would still reject the 5040/524288 case, since every divisor
+        # of 5040 produces ``temp_round_tokens=5040`` and the same fixed
+        # remainder, and the remainder is always >5% of 5040). The
+        # divisor-list pathology kicks in exactly when
+        # ``target_tokens_per_round`` doesn't divide
+        # ``max_global_batch_tokens`` cleanly: e.g. tgt=25200 vs
+        # batch=131072 (=2^17) gives ``131072 % 25200 = 5072`` for every
+        # divisor of 25200, so a per-round threshold rejects all of them.
         if (
             final_round_tokens > 0
             and final_round_tokens < 0.4 * compute_lim_tokens_per_round
-            and final_round_tokens > 0.05 * temp_round_tokens
+            and final_round_tokens > 0.05 * max_global_batch_tokens
         ):
             continue
 
