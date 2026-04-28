@@ -995,9 +995,11 @@ def _pick_chunk_size(
     weights+grads being on-device at any time).
     """
     backbone = baseline.backbone
-    best_option: dict | None = None
 
-    for chunk_size in chunk_size_options:
+    def _search(tail_filter_enabled: bool) -> dict | None:
+      best_option: dict | None = None
+
+      for chunk_size in chunk_size_options:
         cur_gpu = remaining_gpu_mem_bytes
         if max_chunk_size is not None and chunk_size > max_chunk_size:
             continue
@@ -1030,8 +1032,16 @@ def _pick_chunk_size(
         # ``max_global_batch_tokens`` cleanly: e.g. tgt=25200 vs
         # batch=131072 (=2^17) gives ``131072 % 25200 = 5072`` for every
         # divisor of 25200, so a per-round threshold rejects all of them.
+        #
+        # On hardware where ``compute_lim_tokens_per_round`` is so large
+        # that *every* candidate's ``final_round_tokens`` clears clause
+        # (b) but fails clause (a), this filter rejects every option and
+        # ``_pick_chunk_size`` returns None. The outer wrapper retries
+        # with ``tail_filter_enabled=False`` to recover — the user gets
+        # a tail-inefficient round rather than a hard failure.
         if (
-            final_round_tokens > 0
+            tail_filter_enabled
+            and final_round_tokens > 0
             and final_round_tokens < 0.4 * compute_lim_tokens_per_round
             and final_round_tokens > 0.05 * max_global_batch_tokens
         ):
@@ -1187,4 +1197,22 @@ def _pick_chunk_size(
         if best_option["n_gpu_opt_layers"] == 1 and option["n_gpu_opt_layers"] > 1:
             best_option = option
 
-    return best_option
+      return best_option
+
+    # First pass: tail filter on (orig behavior).
+    chosen = _search(tail_filter_enabled=True)
+    if chosen is not None:
+        return chosen
+    # Fallback: every option's tail tripped clause-(a) of the filter
+    # against an enormous compute_lim. Retry with the filter disabled
+    # so we accept a tail-inefficient round rather than fail outright.
+    # ``chunk_size_options`` is already filtered by the AI-bound floor
+    # upstream, so the fallback still respects ``init_target_min_chunk``.
+    if verbose:
+        print(
+            "[Working Set Log] All chunk options rejected by tail-round "
+            "filter; retrying with tail filter disabled (will accept "
+            "smallest chunk above the arithmetic-intensity floor).",
+            flush=True,
+        )
+    return _search(tail_filter_enabled=False)
