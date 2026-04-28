@@ -71,7 +71,7 @@ def _autograd_reference_loss(cfg, x, weights):
         g.unsqueeze(0), beta.unsqueeze(0),
         scale=cfg.head_k_dim ** -0.5, initial_state=None,
         output_final_state=False, cu_seqlens=None,
-        use_qk_l2norm_in_kernel=False,
+        use_qk_l2norm_in_kernel=True,
     )
     o = o.squeeze(0)
     o_f = o.float()

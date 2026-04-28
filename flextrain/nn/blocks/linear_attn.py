@@ -803,27 +803,52 @@ class GatedDeltaNetBlock:
         if g_w_norm is not None:
             g_w_norm.add_(dw_norm.to(g_w_norm.dtype))
 
-        # 3. FLA bwd. Pass the POST-cumsum g (= g_post saved from fwd)
-        # so FLA's internal state matches what it computed during fwd.
-        # FLA's bwd applies a reverse-cumsum at the end so the returned
-        # ``dg`` is in raw pre-cumsum g_input space — i.e. ∂L/∂(g_input).
-        q_b = q_h.unsqueeze(0)
-        k_b = k_h.unsqueeze(0)
-        v_b = v_h.unsqueeze(0)
+        # 3. FLA bwd. Fwd l2-normalized q/k before feeding to the FLA
+        # kernel; bwd has to consume the SAME (post-l2-norm) q_n / k_n
+        # as the kernel saw and return gradients in that space, which we
+        # then back-prop through l2norm_bwd to get ∂L/∂q_h / ∂L/∂k_h.
+        # Recompute q_n / k_n from saved un-normalized q_h / k_h plus
+        # saved rstds (cheap: one elementwise mul per element).
+        q_rstd = slot.lin_q_rstd
+        k_rstd = slot.lin_k_rstd
+        q_n = (q_h.float() * q_rstd.float().unsqueeze(-1)).to(dtype).contiguous()
+        k_n = (k_h.float() * k_rstd.float().unsqueeze(-1)).to(dtype).contiguous()
+        # Pass the POST-cumsum g (= g_post saved from fwd) so FLA's
+        # internal state matches what it computed during fwd. FLA's bwd
+        # applies a reverse-cumsum at the end so the returned ``dg`` is
+        # in raw pre-cumsum g_input space — i.e. ∂L/∂(g_input).
+        # Force ``.contiguous()`` on every kernel input -- FLA's kernels
+        # use raw pointer arithmetic and silently produce wrong results
+        # on non-contiguous strides (same issue as the fwd path).
+        q_b = q_n.unsqueeze(0).contiguous()
+        k_b = k_n.unsqueeze(0).contiguous()
+        v_b = v_h.unsqueeze(0).contiguous()
         beta = b.float().sigmoid().to(dtype)
-        beta_b = beta.unsqueeze(0)
-        do_b = do.unsqueeze(0)
+        beta_b = beta.unsqueeze(0).contiguous()
+        do_b = do.unsqueeze(0).contiguous()
         scale = cfg.head_k_dim ** -0.5
-        dq_h, dk_h, dv_h, dbeta, dg, _, _, _ = chunk_gated_delta_rule_bwd(
+        dq_n, dk_n, dv_h, dbeta, dg, _, _, _ = chunk_gated_delta_rule_bwd(
             q=q_b, k=k_b, v=v_b, g=g_post, beta=beta_b, A=A_int,
             scale=scale, initial_state=None, do=do_b, dht=None,
             cu_seqlens=None,
         )
-        dq_h = dq_h.squeeze(0)                               # (T, n_v_heads, head_k_dim)
-        dk_h = dk_h.squeeze(0)
+        dq_n = dq_n.squeeze(0)                               # (T, n_v_heads, head_k_dim)
+        dk_n = dk_n.squeeze(0)
         dv_h = dv_h.squeeze(0)
         dbeta = dbeta.squeeze(0)                             # (T, n_v_heads)
         dg = dg.squeeze(0)                                   # (T, n_v_heads)
+        # 3b. Back-propagate through the l2 norm: dq_h = l2norm_bwd(q_n,
+        # q_rstd, dq_n). l2norm_bwd takes the *normalized* tensor (y),
+        # the saved rstd, and the upstream gradient (dy), and returns
+        # the gradient in input-space.
+        dq_h = l2norm_bwd(
+            q_n.contiguous(), q_rstd.contiguous(), dq_n.contiguous(),
+            eps=1e-6,
+        )
+        dk_h = l2norm_bwd(
+            k_n.contiguous(), k_rstd.contiguous(), dk_n.contiguous(),
+            eps=1e-6,
+        )
 
         # 4. Gate bwd.
         # beta = sigmoid(b). dbeta -> db_via_beta.
