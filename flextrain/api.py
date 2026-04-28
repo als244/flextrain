@@ -168,7 +168,7 @@ def _build_head(dims: Mapping, hp: Mapping, *, compute, master, grad, norm_grad)
         d_model=int(dims["d_model"]),
         vocab_size=int(dims["vocab_size"]),
         rms_norm_eps=float(hp.get("rms_norm_eps", 1e-5)),
-        head_chunk_size=int(hp.get("head_chunk_size", 512)),
+        head_chunk_size=int(hp.get("head_chunk_size", 1024)),
         compute_dtype=compute, master_dtype=master, grad_dtype=grad,
         norm_grad_dtype=norm_grad,
     ))
@@ -207,7 +207,7 @@ def from_pretrained(
     mem_bw_gbps: float | None = None,
     fixed_seq_len: bool = False,
     force_saved_act_level: int | None = None,
-    head_chunk_size: int = 512,
+    head_chunk_size: int = 1024,
     load_weights: bool = True,
     strict: bool = False,
     verbose: bool = False,

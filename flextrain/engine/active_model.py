@@ -302,7 +302,11 @@ class ActiveModel:
         total_loss = 0.0
         total_tokens = 0
 
+        torch.cuda.nvtx.range_push("Fwd+Bwd")
         for round_idx, round_seqs in enumerate(rounds):
+            torch.cuda.nvtx.range_push(f"Round {round_idx + 1}")
+
+            torch.cuda.nvtx.range_push("Prepare Training Chunks")
             prepared = prepare_training_chunks(
                 round_seqs,
                 max_chunk_size=self.working_set.max_chunk_size,
@@ -311,41 +315,58 @@ class ActiveModel:
             )
             # Allocate per-chunk MoE scratch (no-op if no MoE layers).
             self._allocate_moe_chunk_scratch(prepared)
-
             # Clear per-round event state so stale events from prior
             # rounds don't confuse the waits.
             self.events.clear_per_round()
+            torch.cuda.nvtx.range_pop()
 
-
+            torch.cuda.nvtx.range_push("Determine Saved Levels")
             plan = self._plan_save_levels(prepared)
             if verbose:
                 self._log_round(round_idx, len(rounds), prepared, plan)
+            torch.cuda.nvtx.range_pop()
 
             # Sync at top of round so last round's tail DMAs are done
             # before we start overwriting state. Matches orig:1203.
             self.streams.compute.synchronize()
 
+            torch.cuda.nvtx.range_push("Setup Round")
             self._setup_round(prepared, plan)
+            torch.cuda.nvtx.range_pop()
+
+            torch.cuda.nvtx.range_push("Forward")
             self._forward_pass(prepared, plan)
+            torch.cuda.nvtx.range_pop()
+
+            torch.cuda.nvtx.range_push("Head")
             round_loss, round_tokens = self._head_pass(
                 prepared,
                 loss_scale=loss_scale_factor,
                 loss_fn=loss_fn,
             )
+            torch.cuda.nvtx.range_pop()
+
+            torch.cuda.nvtx.range_push("Backward")
             self._backward_pass(
                 prepared, plan, total_tokens_per_step=total_tokens_per_step
             )
+            torch.cuda.nvtx.range_pop()
+
+            torch.cuda.nvtx.range_push("Embed Backward")
             self._embed_backward(prepared)
+            torch.cuda.nvtx.range_pop()
 
             total_loss += round_loss
             total_tokens += round_tokens
             self._zero_grad = False  # grads accumulated
+            torch.cuda.nvtx.range_pop()  # Round N
 
         # Make sure any trailing grad-offload DMAs are done before
         # returning; the caller will read per-sequence loss or call
         # step().
         self.streams.compute.synchronize()
         self.streams.outbound.synchronize()
+        torch.cuda.nvtx.range_pop()  # Fwd+Bwd
 
         return StepStats(
             total_tokens=total_tokens,
@@ -997,6 +1018,7 @@ class ActiveModel:
 
         for layer_ind, layer in enumerate(self.backbone):
             lid = layer.layer_id
+            torch.cuda.nvtx.range_push(f"Layer {lid}")
             # Wait on the layer's params being resident in this GPU slot.
             self.events.weight_inbound.wait_on(lid, self.streams.compute)
 
@@ -1018,10 +1040,12 @@ class ActiveModel:
                 )
 
                 # Forward on the compute stream.
+                torch.cuda.nvtx.range_push(f"Forward: Chunk {chunk.id}")
                 with torch.cuda.stream(self.streams.compute):
                     x = self.buffers.transitions[chunk.id]
                     y = layer.forward(x, chunk.meta, weights, computed_slot, ctx)
                     self.buffers.transitions[chunk.id] = y
+                torch.cuda.nvtx.range_pop()
 
                 lvl = plan.level_for(lid, chunk.id)
                 if lvl.is_on_device:
@@ -1116,6 +1140,7 @@ class ActiveModel:
             # will stay in place for backward's first iteration).
             if layer_ind < num_layers - 1:
                 cur_weight_slot = (cur_weight_slot + 1) % N_P
+            torch.cuda.nvtx.range_pop()  # Layer N
 
         # Save the final values for use by backward.
         self._final_weight_slot = cur_weight_slot
@@ -1213,6 +1238,7 @@ class ActiveModel:
         for k_ind in range(num_layers - 1, -1, -1):
             layer = self.backbone[k_ind]
             lid = layer.layer_id
+            torch.cuda.nvtx.range_push(f"Layer {lid}")
 
             # Wait on params + grads for this layer.
             self.events.weight_inbound.wait_on(lid, self.streams.compute)
@@ -1249,14 +1275,22 @@ class ActiveModel:
                     # Forward recompute (fills higher-tier fields that
                     # weren't saved) + backward.
                     with torch.cuda.stream(self.streams.compute):
+                        torch.cuda.nvtx.range_push(
+                            f"Recompute: Chunk {chunk.id}"
+                        )
                         layer.forward_recompute(
                             dev_slot, chunk.meta, weights, ctx
+                        )
+                        torch.cuda.nvtx.range_pop()
+                        torch.cuda.nvtx.range_push(
+                            f"Backward: Chunk {chunk.id}"
                         )
                         dx = self.buffers.transitions[chunk.id]
                         upstream_dx = layer.backward(
                             dx, chunk.meta, weights, grads, dev_slot, ctx
                         )
                         self.buffers.transitions[chunk.id] = upstream_dx
+                        torch.cuda.nvtx.range_pop()
 
                     # Refresh fwd_context K/V for the PRIOR seq group (if
                     # any). The refresh runs on a dedicated stream so it
@@ -1350,6 +1384,7 @@ class ActiveModel:
                 self.events.grad_weight_inbound.mark_consumed(lid)
 
             cur_grad_slot = (cur_grad_slot - 1) % N_G
+            torch.cuda.nvtx.range_pop()  # Layer N
 
     # ==================================================================
     # Internal: embed backward.
