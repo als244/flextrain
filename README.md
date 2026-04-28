@@ -72,6 +72,24 @@ python train.py --model models/Llama-3.1-8B --mode full \
   --lr 5e-5 --lr-warmup-pct 0.03 --lr-final-pct 0.01
 ```
 
+### Profiling with nsys
+
+Wrap a window of steady-state steps for `nsys profile`:
+
+```bash
+nsys profile --capture-range=cudaProfilerApi --capture-range-end=stop \
+  python train.py --model models/Llama-3.1-8B --mode full \
+                  --seq-len 1024 --global-batch-tokens 524288 \
+                  --steps 10 --profile-start-step 5 --profile-stop-step 7
+```
+
+`--profile-start-step` calls `cudaProfilerStart()` right before that
+step begins; `--profile-stop-step` calls `cudaProfilerStop()` after it
+ends (default = start + 2). nsys' capture range opens/closes on those
+markers, so warmup and final-step teardown stay out of the report.
+Each captured step is wrapped in an NVTX range so the timeline groups
+by step.
+
 ## Air-gapped compute nodes
 
 If your training nodes have no internet, pre-stage the model + dataset

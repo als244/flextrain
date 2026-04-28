@@ -170,6 +170,17 @@ def _run_training_loop(am, source, *, model_cfg, args, output_dir: str, save_arc
     max_lr = am.optimizer.hp.lr
     final_lr = max_lr * args.lr_final_pct
 
+    # Profiler boundaries: nsys' --capture-range=cudaProfilerApi waits
+    # for cudaProfilerStart and stops on cudaProfilerStop, so we wrap a
+    # caller-chosen window of steps. Default window = 3 steps.
+    profile_start_step = args.profile_start_step
+    profile_stop_step = (
+        args.profile_stop_step
+        if args.profile_stop_step is not None
+        else (profile_start_step + 2 if profile_start_step is not None else None)
+    )
+    profiler_running = False
+
     train_start = time.time()
     smoothed_loss = None
     smooth_decay = 0.95
@@ -189,6 +200,16 @@ def _run_training_loop(am, source, *, model_cfg, args, output_dir: str, save_arc
         if not seqs:
             print(f"[step {step}] data source exhausted")
             break
+
+        if profile_start_step is not None and step == profile_start_step:
+            torch.cuda.synchronize()
+            torch.cuda.profiler.start()
+            profiler_running = True
+            print(f"[profile] cudaProfilerStart at step {step}", flush=True)
+
+        if profiler_running:
+            torch.cuda.nvtx.range_push(f"step {step}")
+
         step_tokens = sum(len(s) for s in seqs)
         step_start = time.time()
         stats = am.fwd_bwd(
@@ -199,6 +220,13 @@ def _run_training_loop(am, source, *, model_cfg, args, output_dir: str, save_arc
         am.step()
         torch.cuda.synchronize()
         step_time = time.time() - step_start
+
+        if profiler_running:
+            torch.cuda.nvtx.range_pop()
+        if profile_stop_step is not None and step == profile_stop_step and profiler_running:
+            torch.cuda.profiler.stop()
+            profiler_running = False
+            print(f"[profile] cudaProfilerStop after step {step}", flush=True)
 
         step_flops = sum(
             _get_model_flops_per_token(
@@ -234,6 +262,13 @@ def _run_training_loop(am, source, *, model_cfg, args, output_dir: str, save_arc
             f"elapsed={(time.time()-train_start):.1f}s",
             flush=True,
         )
+
+    # Close the profiler if the loop exited (data exhausted, KeyboardInterrupt
+    # on next iter, etc.) before reaching the stop step.
+    if profiler_running:
+        torch.cuda.profiler.stop()
+        profiler_running = False
+        print("[profile] cudaProfilerStop at training end", flush=True)
 
     total_time = time.time() - train_start
     overall_tok_per_s = total_tokens_processed / total_time if total_time > 0 else 0
@@ -357,6 +392,28 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--leeway-gpu-mem-gib", type=float, default=2.0, help="Reserved GPU slack in GiB. Default: 2.0.")
     p.add_argument("--leeway-host-mem-gib", type=float, default=10.0, help="Reserved host-memory slack in GiB. Default: 10.0.")
+    p.add_argument(
+        "--profile-start-step",
+        type=int,
+        default=None,
+        help=(
+            "Call cudaProfilerStart() right before this 1-indexed step "
+            "begins. Pair with `nsys profile --capture-range=cudaProfilerApi "
+            "--capture-range-end=stop` to skip warmup and capture only the "
+            "steps you care about. Each step is also wrapped in an NVTX "
+            "range so the timeline groups cleanly."
+        ),
+    )
+    p.add_argument(
+        "--profile-stop-step",
+        type=int,
+        default=None,
+        help=(
+            "1-indexed step after which to call cudaProfilerStop(). "
+            "Default: --profile-start-step + 2 (i.e. capture 3 steps). "
+            "Ignored if --profile-start-step isn't set."
+        ),
+    )
     p.add_argument(
         "--force-save-level",
         type=int,
