@@ -120,6 +120,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help="HF dataset split. Default: train.",
     )
     d.add_argument(
+        "--config", default=None,
+        help=(
+            "HF dataset config name (for datasets that ship multiple, "
+            "e.g. openai/gsm8k has 'main' and 'socratic')."
+        ),
+    )
+    d.add_argument(
         "--force", action="store_true",
         help="Re-download even if the target already exists.",
     )
@@ -144,6 +151,7 @@ def main(argv: list[str] | None = None) -> int:
             args.spec,
             args.target,
             split=args.split,
+            config=args.config,
             force=args.force,
         )
         print(out)
