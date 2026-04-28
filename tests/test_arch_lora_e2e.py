@@ -99,8 +99,9 @@ ARCHES: dict[str, ArchSpec] = {
     ),
     "qwen3-8b": ArchSpec(
         name="qwen3-8b", hf_dir="Qwen3-8B",
-        seq_len=2048, global_batch_tokens=16384, steps=30,
-        gpu_gib=70.0, host_gib=180.0,
+        seq_len=2048, global_batch_tokens=8192, steps=5,
+        gpu_gib=22.0, host_gib=110.0,
+        notes="Qwen3 dense, 36 layers, QK-norm. Fits 24 GiB GPU.",
     ),
     "qwen3.5-2b": ArchSpec(
         name="qwen3.5-2b", hf_dir="Qwen3.5-2B",
