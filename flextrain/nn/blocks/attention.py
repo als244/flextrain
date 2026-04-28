@@ -68,10 +68,16 @@ class GQAAttentionConfig:
     alternating, GPT-OSS subset).
 
     ``qk_norm`` (default False) toggles Qwen3-style per-head RMSNorm on Q
-    and K between projection and RoPE. When True, the layer must attach
-    ``q_norm`` / ``k_norm`` :class:`RMSNormBlock` instances via
-    :meth:`GQAAttentionBlock.set_qk_norm`, and the weights dict passed to
-    ``fwd``/``bwd`` must include ``w_q_norm`` / ``w_k_norm``.
+    and K between projection and RoPE. When True, the block instantiates
+    its own per-head ``q_norm`` / ``k_norm`` :class:`RMSNormBlock` instances
+    internally, contributing their fields/params/compute_cost into this
+    block's. The weights dict passed to ``fwd``/``bwd`` must therefore
+    include ``w_q_norm`` / ``w_k_norm``.
+
+    ``qk_norm_master_dtype`` / ``qk_norm_grad_dtype`` control the QK-norm
+    weight master and grad dtypes (default fp32 — RMSNorm weight vectors
+    are tiny, so we keep them fp32 to avoid losing tiny SGD updates and
+    to match the kernel's atomic-fp32 wgrad accumulator).
     """
 
     d_model: int
@@ -96,6 +102,13 @@ class GQAAttentionConfig:
     grad_dtype: torch.dtype | None = None
     qk_norm: bool = False
     rms_norm_eps: float = 1e-6  # Used only when qk_norm=True
+    qk_norm_master_dtype: torch.dtype = torch.float32
+    qk_norm_grad_dtype: torch.dtype = torch.float32
+    # Default Qwen3-style PER-HEAD RMSNorm on Q/K (weight vector sized
+    # head_dim, broadcast across heads, rstd shape (T, heads)). OLMoE
+    # uses FULL-ROW RMSNorm (per_head=False; weight sized attn_dim/kv_dim,
+    # rstd shape (T, 1)). Set to False for OLMoE-style.
+    qk_norm_per_head: bool = True
     # Qwen2 family adds biases on Q/K/V projections (o_proj has no bias).
     # When True, w_q/w_k/w_v ParamSpec adds matching b_q/b_k/b_v tensors
     # with shape (attn_dim,) / (kv_dim,) / (kv_dim,).
@@ -172,24 +185,40 @@ class GQAAttentionBlock:
     def __init__(self, cfg: GQAAttentionConfig) -> None:
         self.cfg = cfg
         self._rope_inv_freq_cache: torch.Tensor | None = None
-        # QK-norm hooks (Qwen3). Attached by the enclosing layer when
-        # cfg.qk_norm=True. RMSNormBlock instances with per_head=True.
-        self.q_norm = None
-        self.k_norm = None
-
-    def set_qk_norm(self, q_norm, k_norm) -> None:
-        """Attach per-head Q/K RMSNorm blocks (Qwen3).
-
-        Called by the enclosing layer. The blocks must name their rstd
-        fields such that ``slot.<rstd_name>`` resolves — i.e., the layer's
-        activation schema must also include them.
-        """
-        if not self.cfg.qk_norm:
-            raise ValueError(
-                "GQAAttentionConfig.qk_norm must be True to attach QK-norm"
+        # Qwen3-style per-head QK-norm. Owned internally so the modeling
+        # layer doesn't need to wire up parallel RMSNormBlocks. Fields,
+        # params, and compute_cost roll up via this block's methods.
+        if cfg.qk_norm:
+            from .norm import RMSNormBlock
+            if cfg.qk_norm_per_head:
+                # Qwen3-style: weight (head_dim,), rstd (T, heads).
+                q_weight_dim, k_weight_dim = "head_dim", "head_dim"
+            else:
+                # OLMoE-style: weight (attn_dim,) / (kv_dim,), rstd (T, 1).
+                q_weight_dim, k_weight_dim = "attn_dim", "kv_dim"
+            self.q_norm = RMSNormBlock(
+                prefix="q_norm",
+                eps=cfg.rms_norm_eps,
+                per_head=cfg.qk_norm_per_head,
+                heads_dim_name="n_heads",
+                weight_dim_name=q_weight_dim,
+                param_compute_dtype=cfg.compute_dtype,
+                param_master_dtype=cfg.qk_norm_master_dtype,
+                param_grad_dtype=cfg.qk_norm_grad_dtype,
             )
-        self.q_norm = q_norm
-        self.k_norm = k_norm
+            self.k_norm = RMSNormBlock(
+                prefix="k_norm",
+                eps=cfg.rms_norm_eps,
+                per_head=cfg.qk_norm_per_head,
+                heads_dim_name="n_kv_heads",
+                weight_dim_name=k_weight_dim,
+                param_compute_dtype=cfg.compute_dtype,
+                param_master_dtype=cfg.qk_norm_master_dtype,
+                param_grad_dtype=cfg.qk_norm_grad_dtype,
+            )
+        else:
+            self.q_norm = None
+            self.k_norm = None
 
     # ------------------------------------------------------------------
     # Declarations consumed by the layer / engine.
@@ -206,10 +235,13 @@ class GQAAttentionBlock:
         * ``softmax_lse``  tier 1 (token_axis=1, shape ``(n_heads, T)``)
         * ``xq``           tier 2
         * ``xo``           tier 2
+
+        When ``cfg.qk_norm=True``, the per-head q_norm/k_norm rstd fields
+        are appended as well (tier 0 each).
         """
         cfg = self.cfg
         bf = cfg.compute_dtype
-        return (
+        out = (
             ActivationField(
                 "xk",
                 lambda n, d: (n, cfg.n_kv_heads, cfg.head_dim),
@@ -248,6 +280,9 @@ class GQAAttentionBlock:
                 tier=2,
             ),
         )
+        if cfg.qk_norm:
+            out = out + self.q_norm.fields() + self.k_norm.fields()
+        return out
 
     def param_spec(self) -> ParamSpec:
         """``w_q``, ``w_k``, ``w_v``, ``w_o`` as ``(in, out)`` matrices
@@ -313,7 +348,14 @@ class GQAAttentionBlock:
                     grad_dtype=cfg.grad_dtype,
                 ),
             ])
-        return ParamSpec(tensors=tuple(tensors))
+        spec = ParamSpec(tensors=tuple(tensors))
+        if cfg.qk_norm:
+            spec = ParamSpec.merge([
+                spec,
+                self.q_norm.param_spec(),
+                self.k_norm.param_spec(),
+            ])
+        return spec
 
     # ------------------------------------------------------------------
     # Compute. Called by the enclosing layer's forward / backward.

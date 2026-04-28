@@ -147,30 +147,9 @@ def _assemble_qwen3_block(
         param_grad_dtype=cfg.norm_grad_dtype,
     )
 
-    # Per-head QK-norms: RMSNormBlock in per_head mode. Same kernel, just a
-    # different ``head_dim`` arg and weight-vector dim.
-    self.q_norm = RMSNormBlock(
-        prefix="q_norm",
-        eps=cfg.rms_norm_eps,
-        per_head=True,
-        heads_dim_name="n_heads",
-        weight_dim_name="head_dim",
-        param_compute_dtype=cfg.compute_dtype,
-        param_master_dtype=cfg.norm_master_dtype,
-        param_grad_dtype=cfg.norm_grad_dtype,
-    )
-    self.k_norm = RMSNormBlock(
-        prefix="k_norm",
-        eps=cfg.rms_norm_eps,
-        per_head=True,
-        heads_dim_name="n_kv_heads",
-        weight_dim_name="head_dim",
-        param_compute_dtype=cfg.compute_dtype,
-        param_master_dtype=cfg.norm_master_dtype,
-        param_grad_dtype=cfg.norm_grad_dtype,
-    )
-
-    # Attention + FFN.
+    # Attention + FFN. Per-head QK-norms are owned by the attention
+    # block when attn_cfg.qk_norm=True; their fields/params/compute_cost
+    # roll up via attn.fields() / attn.param_spec().
     self.attn = attn_block(attn_cfg)
     self.ffn = SwiGLUFFN(
         SwiGLUConfig(
@@ -196,8 +175,6 @@ def _assemble_qwen3_block(
                 self.attn_norm.fields(),
                 (x_inp_field,),
                 self.attn.fields(),
-                self.q_norm.fields(),
-                self.k_norm.fields(),
                 self.ffn_norm.fields(),
                 self.ffn.fields(),
             ]
@@ -207,8 +184,6 @@ def _assemble_qwen3_block(
     self.param_spec = ParamSpec.merge(
         [
             self.attn_norm.param_spec(),
-            self.q_norm.param_spec(),
-            self.k_norm.param_spec(),
             self.attn.param_spec(),
             self.ffn_norm.param_spec(),
             self.ffn.param_spec(),
@@ -224,10 +199,11 @@ def _assemble_qwen3_block(
 class Qwen3DenseBlock:
     """Qwen3-dense full-context layer (layers ``< max_window_layers``).
 
-    Forward / backward are the same as :class:`LlamaBlock` except we
-    interpose per-head ``q_norm`` / ``k_norm`` (RMSNorm) between the Q/K
-    projections and RoPE. The QK-norm hook is wired directly into
-    :class:`GQAAttentionBlock` via ``cfg.qk_norm=True`` + ``set_qk_norm``.
+    Forward / backward are the same as :class:`LlamaBlock` except the
+    attention block applies per-head ``q_norm`` / ``k_norm`` (RMSNorm)
+    between the Q/K projections and RoPE. Toggled via
+    ``cfg.qk_norm=True`` on :class:`GQAAttentionConfig`; the attention
+    block owns those RMSNormBlocks internally.
     """
 
     def __init__(self, layer_id: int, cfg: Qwen3DenseBlockConfig) -> None:
@@ -248,9 +224,10 @@ class Qwen3DenseBlock:
                 grad_dtype=cfg.grad_dtype,
                 qk_norm=True,
                 rms_norm_eps=cfg.rms_norm_eps,
+                qk_norm_master_dtype=cfg.norm_master_dtype,
+                qk_norm_grad_dtype=cfg.norm_grad_dtype,
             ),
         )
-        self.attn.set_qk_norm(self.q_norm, self.k_norm)
 
     # ------------------------------------------------------------------
     # Layer Protocol (mirrors LlamaBlock, with QK-norm hook in attn)
@@ -464,8 +441,6 @@ class Qwen3DenseBlock:
             [
                 self.attn_norm.compute_cost(chunk.total_q, self._dims, max_tier),
                 self.attn.compute_cost(chunk, max_tier=max_tier),
-                self.q_norm.compute_cost(chunk.total_q, self._dims, max_tier),
-                self.k_norm.compute_cost(chunk.total_q, self._dims, max_tier),
                 self.ffn_norm.compute_cost(chunk.total_q, self._dims, max_tier),
                 self.ffn.compute_cost(chunk, max_tier=max_tier),
             ],
@@ -505,6 +480,7 @@ class Qwen3DenseSWABlock(Qwen3DenseBlock):
                 grad_dtype=cfg.grad_dtype,
                 qk_norm=True,
                 rms_norm_eps=cfg.rms_norm_eps,
+                qk_norm_master_dtype=cfg.norm_master_dtype,
+                qk_norm_grad_dtype=cfg.norm_grad_dtype,
             ),
         )
-        self.attn.set_qk_norm(self.q_norm, self.k_norm)

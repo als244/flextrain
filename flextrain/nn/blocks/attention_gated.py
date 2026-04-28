@@ -93,18 +93,37 @@ class GQAAttentionGatedBlock:
         # The output gate is implicit from the block class.
         self.cfg = cfg
         self._rope_inv_freq_cache: torch.Tensor | None = None
-        # QK-norm hooks (Qwen3 / Qwen3-Next per-head). Attached by the
-        # enclosing layer when cfg.qk_norm=True.
-        self.q_norm = None
-        self.k_norm = None
-
-    def set_qk_norm(self, q_norm, k_norm) -> None:
-        if not self.cfg.qk_norm:
-            raise ValueError(
-                "GQAAttentionGatedBlock: cfg.qk_norm must be True to attach QK-norm"
+        # Qwen3-style per-head QK-norm. Owned internally so the modeling
+        # layer doesn't need to wire up parallel RMSNormBlocks.
+        if cfg.qk_norm:
+            from .norm import RMSNormBlock
+            if cfg.qk_norm_per_head:
+                q_weight_dim, k_weight_dim = "head_dim", "head_dim"
+            else:
+                q_weight_dim, k_weight_dim = "attn_dim", "kv_dim"
+            self.q_norm = RMSNormBlock(
+                prefix="q_norm",
+                eps=cfg.rms_norm_eps,
+                per_head=cfg.qk_norm_per_head,
+                heads_dim_name="n_heads",
+                weight_dim_name=q_weight_dim,
+                param_compute_dtype=cfg.compute_dtype,
+                param_master_dtype=cfg.qk_norm_master_dtype,
+                param_grad_dtype=cfg.qk_norm_grad_dtype,
             )
-        self.q_norm = q_norm
-        self.k_norm = k_norm
+            self.k_norm = RMSNormBlock(
+                prefix="k_norm",
+                eps=cfg.rms_norm_eps,
+                per_head=cfg.qk_norm_per_head,
+                heads_dim_name="n_kv_heads",
+                weight_dim_name=k_weight_dim,
+                param_compute_dtype=cfg.compute_dtype,
+                param_master_dtype=cfg.qk_norm_master_dtype,
+                param_grad_dtype=cfg.qk_norm_grad_dtype,
+            )
+        else:
+            self.q_norm = None
+            self.k_norm = None
 
     # ------------------------------------------------------------------
     # Declarations
@@ -113,7 +132,7 @@ class GQAAttentionGatedBlock:
     def fields(self) -> tuple[ActivationField, ...]:
         cfg = self.cfg
         bf = cfg.compute_dtype
-        return (
+        out = (
             ActivationField(
                 "xk",
                 lambda n, d: (n, cfg.n_kv_heads, cfg.head_dim),
@@ -150,6 +169,9 @@ class GQAAttentionGatedBlock:
                 bf, tier=2,
             ),
         )
+        if cfg.qk_norm:
+            out = out + self.q_norm.fields() + self.k_norm.fields()
+        return out
 
     def param_spec(self) -> ParamSpec:
         """``w_q`` has DOUBLED out-dim (Q + gate concat). Other tensors
@@ -209,7 +231,14 @@ class GQAAttentionGatedBlock:
                     grad_dtype=cfg.grad_dtype,
                 ),
             ])
-        return ParamSpec(tensors=tuple(tensors))
+        spec = ParamSpec(tensors=tuple(tensors))
+        if cfg.qk_norm:
+            spec = ParamSpec.merge([
+                spec,
+                self.q_norm.param_spec(),
+                self.k_norm.param_spec(),
+            ])
+        return spec
 
     # ------------------------------------------------------------------
     # Helpers

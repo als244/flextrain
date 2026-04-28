@@ -133,7 +133,7 @@ def main():
     )
     from flextrain.core.layer import LayerContext, ChunkMeta
     from flextrain.nn.blocks import (
-        GQAAttentionConfig, GQAAttentionGatedBlock, RMSNormBlock,
+        GQAAttentionConfig, GQAAttentionGatedBlock,
     )
 
     d_model = 128
@@ -181,16 +181,10 @@ def main():
 
     # ----- FT block (clone weights, run via block.fwd / block.bwd) -----
     weights_ft = {k: weights_ref[k].detach().clone() for k in weights_ref}
-    # Build a slot for the block's activation fields + qk-norm rstds.
-    qn = RMSNormBlock(prefix="q_norm", eps=eps, per_head=True, heads_dim_name="n_heads", weight_dim_name="head_dim",
-                     param_compute_dtype=DTYPE, param_master_dtype=DTYPE, param_grad_dtype=DTYPE)
-    kn = RMSNormBlock(prefix="k_norm", eps=eps, per_head=True, heads_dim_name="n_kv_heads", weight_dim_name="head_dim",
-                     param_compute_dtype=DTYPE, param_master_dtype=DTYPE, param_grad_dtype=DTYPE)
-    block.set_qk_norm(qn, kn)
-
-    # Schema + slot. Include both block fields and qk-norm rstd fields.
+    # The block owns q_norm/k_norm internally when cfg.qk_norm=True;
+    # block.fields() already includes their rstd fields.
     schema = ActivationSchema(
-        fields=block.fields() + qn.fields() + kn.fields(),
+        fields=block.fields(),
         max_tier=3,
     )
     dims = {

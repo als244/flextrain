@@ -79,6 +79,8 @@ def _build_attn(cfg: Gemma3BlockConfig):
                 is_causal=cfg.is_causal,
                 qk_norm=True,
                 rms_norm_eps=cfg.rms_norm_eps,
+                qk_norm_master_dtype=cfg.norm_master_dtype,
+                qk_norm_grad_dtype=cfg.norm_grad_dtype,
                 window_size_left=cfg.window_size_left,
                 attn_logit_softcap=cfg.attn_logit_softcap,
                 compute_dtype=cfg.compute_dtype,
@@ -95,6 +97,8 @@ def _build_attn(cfg: Gemma3BlockConfig):
             is_causal=cfg.is_causal,
             qk_norm=True,
             rms_norm_eps=cfg.rms_norm_eps,
+            qk_norm_master_dtype=cfg.norm_master_dtype,
+            qk_norm_grad_dtype=cfg.norm_grad_dtype,
             attn_logit_softcap=cfg.attn_logit_softcap,
             compute_dtype=cfg.compute_dtype,
             master_dtype=cfg.master_dtype,
@@ -137,25 +141,9 @@ class Gemma3Block:
             param_master_dtype=cfg.norm_master_dtype,
             param_grad_dtype=cfg.norm_grad_dtype,
         )
-        # Per-head QK-norm.
-        self.q_norm = RMSNormBlock(
-            prefix="q_norm", eps=cfg.rms_norm_eps,
-            per_head=True, heads_dim_name="n_heads",
-            weight_dim_name="head_dim",
-            param_compute_dtype=cfg.compute_dtype,
-            param_master_dtype=cfg.norm_master_dtype,
-            param_grad_dtype=cfg.norm_grad_dtype,
-        )
-        self.k_norm = RMSNormBlock(
-            prefix="k_norm", eps=cfg.rms_norm_eps,
-            per_head=True, heads_dim_name="n_kv_heads",
-            weight_dim_name="head_dim",
-            param_compute_dtype=cfg.compute_dtype,
-            param_master_dtype=cfg.norm_master_dtype,
-            param_grad_dtype=cfg.norm_grad_dtype,
-        )
+        # Per-head QK-norm is owned by the attention block when
+        # cfg.qk_norm=True (rolled up via attn.fields() / param_spec()).
         self.attn = _build_attn(cfg)
-        self.attn.set_qk_norm(self.q_norm, self.k_norm)
         self.ffn = SwiGLUFFN(
             SwiGLUConfig(
                 d_model=cfg.d_model, expert_dim=cfg.expert_dim,
@@ -179,8 +167,6 @@ class Gemma3Block:
                     self.pre_attn_norm.fields(),
                     (x_inp,),
                     self.attn.fields(),
-                    self.q_norm.fields(),
-                    self.k_norm.fields(),
                     self.post_attn_norm.fields(),
                     (x_mid,),
                     self.pre_ffn_norm.fields(),
@@ -193,8 +179,6 @@ class Gemma3Block:
         self.param_spec = ParamSpec.merge(
             [
                 self.pre_attn_norm.param_spec(),
-                self.q_norm.param_spec(),
-                self.k_norm.param_spec(),
                 self.attn.param_spec(),
                 self.post_attn_norm.param_spec(),
                 self.pre_ffn_norm.param_spec(),
@@ -252,8 +236,6 @@ class Gemma3Block:
         return ComputeCost.sum(
             [
                 self.pre_attn_norm.compute_cost(chunk.total_q, self._dims, max_tier),
-                self.q_norm.compute_cost(chunk.total_q, self._dims, max_tier),
-                self.k_norm.compute_cost(chunk.total_q, self._dims, max_tier),
                 self.attn.compute_cost(chunk, max_tier=max_tier),
                 self.post_attn_norm.compute_cost(chunk.total_q, self._dims, max_tier),
                 self.pre_ffn_norm.compute_cost(chunk.total_q, self._dims, max_tier),

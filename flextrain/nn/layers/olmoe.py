@@ -107,6 +107,11 @@ class OLMoEBlock:
             param_master_dtype=cfg.norm_master_dtype,
             param_grad_dtype=cfg.norm_grad_dtype,
         )
+        # OLMoE Q/K RMSNorm is FULL-ROW (across attn_dim / kv_dim, not
+        # per-head like Qwen3). Weight vectors are sized (attn_dim,) and
+        # (kv_dim,); shape is independent of head partition. The attention
+        # block owns the q_norm/k_norm RMSNormBlocks internally when
+        # qk_norm=True; qk_norm_per_head=False selects the OLMoE layout.
         self.attn = GQAAttentionBlock(
             GQAAttentionConfig(
                 d_model=cfg.d_model,
@@ -117,33 +122,14 @@ class OLMoEBlock:
                 is_causal=cfg.is_causal,
                 qk_norm=True,
                 rms_norm_eps=cfg.rms_norm_eps,
+                qk_norm_master_dtype=cfg.norm_master_dtype,
+                qk_norm_grad_dtype=cfg.norm_grad_dtype,
+                qk_norm_per_head=False,
                 compute_dtype=cfg.compute_dtype,
                 master_dtype=cfg.master_dtype,
                 grad_dtype=cfg.grad_dtype,
             )
         )
-        # OLMoE Q/K RMSNorm is FULL-ROW (across attn_dim / kv_dim, not
-        # per-head like Qwen3). Weight vectors are sized (attn_dim,) and
-        # (kv_dim,); shape is independent of head partition.
-        self.q_norm = RMSNormBlock(
-            prefix="q_norm",
-            eps=cfg.rms_norm_eps,
-            per_head=False,
-            weight_dim_name="attn_dim",
-            param_compute_dtype=cfg.compute_dtype,
-            param_master_dtype=cfg.norm_master_dtype,
-            param_grad_dtype=cfg.norm_grad_dtype,
-        )
-        self.k_norm = RMSNormBlock(
-            prefix="k_norm",
-            eps=cfg.rms_norm_eps,
-            per_head=False,
-            weight_dim_name="kv_dim",
-            param_compute_dtype=cfg.compute_dtype,
-            param_master_dtype=cfg.norm_master_dtype,
-            param_grad_dtype=cfg.norm_grad_dtype,
-        )
-        self.attn.set_qk_norm(self.q_norm, self.k_norm)
         self.ffn_norm = RMSNormBlock(
             prefix="ffn_norm",
             eps=cfg.rms_norm_eps,
@@ -182,8 +168,6 @@ class OLMoEBlock:
                     self.attn_norm.fields(),
                     (x_inp_field,),
                     self.attn.fields(),
-                    self.q_norm.fields(),
-                    self.k_norm.fields(),
                     self.ffn_norm.fields(),
                     self.ffn.fields(),
                 ]
@@ -193,8 +177,6 @@ class OLMoEBlock:
         self.param_spec = ParamSpec.merge(
             [
                 self.attn_norm.param_spec(),
-                self.q_norm.param_spec(),
-                self.k_norm.param_spec(),
                 self.attn.param_spec(),
                 self.ffn_norm.param_spec(),
                 self.ffn.param_spec(),
