@@ -204,6 +204,8 @@ def from_pretrained(
     lora_init_seed: int = 20260424,
     lora_a_std: float = 0.02,
     hw_cost: HardwareCost | None = None,
+    mem_bw_gbps: float | None = None,
+    fixed_seq_len: bool = False,
     head_chunk_size: int = 512,
     load_weights: bool = True,
     strict: bool = False,
@@ -236,8 +238,15 @@ def from_pretrained(
         adapter dtype is fp32 for master/grad/opt-state (matches HF
         PEFT).
     hw_cost
-        Optional :class:`HardwareCost`. Defaults to a conservative
-        60 TFLOPS / 20 GB/s estimate.
+        :class:`HardwareCost` for the DP-solver. Pass the result of
+        :func:`flextrain.core.hw_probe.probe_hardware` for measured
+        numbers, or construct one directly with known TFLOPS / PCIe
+        values. ``None`` falls back to a conservative 60 TFLOPS /
+        20 GB/s placeholder — fine for offline tests, but on real
+        hardware this inflates compute-times ~10x and produces
+        plans that skip recompute regardless of the actual
+        compute/PCIe ratio. Real training runs should always pass
+        a measured ``hw_cost``.
     load_weights
         If False, skip the ``am.load_hf`` call (random init).
     strict
@@ -307,6 +316,13 @@ def from_pretrained(
         "opt_choice": type(optimizer).__name__,
         "opt_dtype": opt_dtype_name or "float32",
     }
+    # If the caller provided a measured ``hw_cost``, hand its scalars to
+    # the working-set solver so it doesn't run a redundant probe. If they
+    # also pass ``mem_bw_gbps`` (from ``probe_hardware().mem_bw_gbps``),
+    # we propagate that for the AI-bound chunk-size pick. Otherwise the
+    # solver runs its own internal probe.
+    ws_peak_tflops = hw_cost.peak_tflops if hw_cost is not None else None
+    ws_pcie_bw_gbps = hw_cost.pcie_bw_gbps if hw_cost is not None else None
     working_set = determine_working_set_config(
         model_dims=dims,
         max_seq_len=max_seq_len,
@@ -317,14 +333,30 @@ def from_pretrained(
         max_host_mem_bytes=max_host_mem_bytes,
         leeway_gpu_mem_bytes=leeway_gpu_mem_bytes,
         leeway_host_mem_bytes=leeway_host_mem_bytes,
+        peak_tflops=ws_peak_tflops,
+        pcie_bw_gbps=ws_pcie_bw_gbps,
+        mem_bw_gbps=mem_bw_gbps,
+        fixed_seq_len=fixed_seq_len,
         verbose=verbose,
     )
 
-    # 5. Build engine.
+    # 5. Build engine. ``hw_cost`` must come from the caller — either
+    # a measured :func:`flextrain.core.hw_probe.probe_hardware` result
+    # (the recommended path) or hand-set values for tests / unusual
+    # hardware. We deliberately do NOT probe here: hardware benchmarking
+    # is orthogonal to model construction and benefits from being
+    # callable independently (cached across runs, swappable for tests,
+    # etc.). The placeholder fallback only fires when the caller passes
+    # nothing AND no GPU probe ran — which is fine for offline tests
+    # but produces poor DP plans on real hardware (compute_times come
+    # out ~10x slower than reality, letting level-3 "fit" everywhere
+    # and producing the no-recompute symptom).
+    if hw_cost is None:
+        hw_cost = HardwareCost(peak_tflops=60.0, pcie_bw_gbps=20.0)
     am = ActiveModel(
         embed=embed, backbone=backbone, head=head, optimizer=optimizer,
         working_set=working_set,
-        hw_cost=hw_cost or HardwareCost(peak_tflops=60.0, pcie_bw_gbps=20.0),
+        hw_cost=hw_cost,
         dims=dims, device=device,
     )
 

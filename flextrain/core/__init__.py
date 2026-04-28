@@ -18,10 +18,12 @@ from .layer import (
 )
 from .save_level import (
     DPTables,
+    HardwareCost,
     SaveLevel,
     SaveLevelPlan,
     build_dp_tables,
 )
+from .hw_probe import HardwareProbeResult, probe_hardware
 
 __all__ = [
     "ActivationField",
@@ -30,6 +32,8 @@ __all__ = [
     "ChunkMeta",
     "ComputeCost",
     "DPTables",
+    "HardwareCost",
+    "HardwareProbeResult",
     "InputLayer",
     "Layer",
     "LayerContext",
@@ -39,4 +43,5 @@ __all__ = [
     "SaveLevelPlan",
     "TensorSpec",
     "build_dp_tables",
+    "probe_hardware",
 ]

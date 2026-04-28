@@ -565,6 +565,19 @@ def main(argv: list[str] | None = None) -> int:
         f"batch_tokens={args.global_batch_tokens}",
         flush=True,
     )
+    device_str = f"cuda:{args.device_id}"
+    print("Probing hardware (one matmul + one PCIe transfer)...", flush=True)
+    from flextrain.core.hw_probe import probe_hardware
+    probe = probe_hardware(device=device_str)
+    print(
+        f"[HW Probe] peak_tflops={probe.hw_cost.peak_tflops:.1f}, "
+        f"pcie_bw_gbps={probe.hw_cost.pcie_bw_gbps:.1f}, "
+        f"mem_bw_gbps={probe.mem_bw_gbps:.1f} "
+        f"(matmul {probe.matmul_n}^2 bf16 = {probe.matmul_per_call_ms:.2f}ms; "
+        f"PCIe {probe.transfer_bytes/(1<<20):.0f}MiB = "
+        f"{probe.transfer_per_call_ms:.2f}ms)",
+        flush=True,
+    )
     print(
         f"Preparing model from {local_model_dir}. "
         "This includes the working-set solve, engine construction, and HF weight load.",
@@ -577,12 +590,14 @@ def main(argv: list[str] | None = None) -> int:
         max_global_batch_tokens=args.global_batch_tokens,
         max_gpu_mem_bytes=max_gpu_mem_bytes,
         max_host_mem_bytes=max_host_mem_bytes,
-        device=f"cuda:{args.device_id}",
+        device=device_str,
         leeway_gpu_mem_bytes=int(args.leeway_gpu_mem_gib * (1 << 30)),
         leeway_host_mem_bytes=int(args.leeway_host_mem_gib * (1 << 30)),
         lora_targets=lora_targets,
         lora_rank=args.lora_rank,
         lora_alpha=args.lora_alpha,
+        hw_cost=probe.hw_cost,
+        mem_bw_gbps=probe.mem_bw_gbps,
         strict=False,
         verbose=True,
     )
