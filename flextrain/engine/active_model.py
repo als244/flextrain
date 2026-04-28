@@ -162,6 +162,7 @@ class ActiveModel:
     force_saved_act_level: int | None = None
     host_backend: HostMemoryBackend | None = None
     device: str | torch.device = "cuda:0"
+    verbose_init: bool = False
 
     # Post-init fields.
     buffers: BufferManager = field(init=False)
@@ -189,6 +190,7 @@ class ActiveModel:
             opt_spec=self.optimizer.state_spec,
             device=device,
             host_backend=self.host_backend,
+            verbose=self.verbose_init,
         )
 
         # MoE layers (future) can pass with_secondary=True; dense defaults.

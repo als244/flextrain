@@ -391,6 +391,7 @@ class BufferManager:
         head_dim: int | None = None,
         kv_dtype: torch.dtype = torch.bfloat16,
         host_backend: HostMemoryBackend | None = None,
+        verbose: bool = False,
     ) -> None:
         self.device = torch.device(device)
         self.working_set = working_set
@@ -410,13 +411,19 @@ class BufferManager:
         if head_dim is None:
             head_dim = int(self.dims["head_dim"])
 
+        if verbose:
+            print(
+                f"[BufferManager] Pinning host master/grad/opt for "
+                f"{len(self.layer_param_specs)} backbone layers...",
+                flush=True,
+            )
         # ---- Allocate host master params / grads / opt for every layer ----
         # All host-side allocation goes through self.host_backend so we
         # can swap in remote-memory backends later.
         self.host_params = []
         self.host_grads = []
         self.host_opt = []
-        for ps in self.layer_param_specs:
+        for layer_idx, ps in enumerate(self.layer_param_specs):
             params = _alloc_dict_on_host(
                 ps, self.dims, role="master", backend=self.host_backend
             )
@@ -431,6 +438,15 @@ class BufferManager:
             self.host_params.append(params)
             self.host_grads.append(grads)
             self.host_opt.append(opt_b)
+            if verbose and (
+                (layer_idx + 1) % 8 == 0
+                or layer_idx + 1 == len(self.layer_param_specs)
+            ):
+                print(
+                    f"[BufferManager]   layer {layer_idx + 1}/"
+                    f"{len(self.layer_param_specs)} pinned",
+                    flush=True,
+                )
 
         # embed
         self.host_embed_params = {}
@@ -568,9 +584,18 @@ class BufferManager:
 
         # ---- Host activation buffer (routed through host backend) ----
         if working_set.host_act_buffer_size > 0:
+            if verbose:
+                print(
+                    f"[BufferManager] Pinning host activation buffer "
+                    f"({working_set.host_act_buffer_size / (1 << 30):.2f} GiB)..."
+                    " This is one big cudaHostRegister and can take 10-30s.",
+                    flush=True,
+                )
             self.host_act_buffer = self.host_backend.allocate_tensor(
                 (working_set.host_act_buffer_size,), torch.uint8
             )
+            if verbose:
+                print("[BufferManager] Host activation buffer pinned.", flush=True)
         else:
             self.host_act_buffer = None
 

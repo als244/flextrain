@@ -377,6 +377,7 @@ def from_pretrained(
         hw_cost=hw_cost,
         dims=dims, device=device,
         force_saved_act_level=force_saved_act_level,
+        verbose_init=verbose,
     )
     if verbose:
         print("[from_pretrained] Engine ready.", flush=True)
