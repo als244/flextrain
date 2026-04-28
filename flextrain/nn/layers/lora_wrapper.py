@@ -45,6 +45,98 @@ from flextrain.core.layer import (
 )
 
 
+# ---------------------------------------------------------------------------
+# Rank-r dA/dB grad accumulation.
+#
+# Per LoRA target on the dense fast path we accumulate:
+#     dA = (X.T @ (dY @ B.T)) * scale   -> (in, r)
+#     dB = ((X @ A).T @ dY)   * scale   -> (r, out)
+#     ga += dA.cast;  gb += dB.cast
+#
+# Two paths:
+#
+# 1. Same-dtype "fused" path: when X / dY / A / B / ga / gb all share
+#    a dtype (the production all-bf16 LoRA config), route the two big
+#    GEMMs through cuBLASLt via the matmul_dispatcher with
+#    ``alpha=scale, beta=1, C=ga, D=ga``. cuBLASLt folds the scale +
+#    accumulate into the GEMM epilogue so we skip the un-fused
+#    ``ga.add_(dA.to(...))`` pass. Bit-identical to eager (rel=0.0
+#    in our tests; same cuBLAS kernels, same fp32 internal accum,
+#    different epilogue). ~1.05-1.12x at small T (1024-4096), wash
+#    at large T (>=16384) but never a regression. See
+#    docs/lora_perf_notes.md for measured numbers.
+#
+# 2. Mixed-dtype "eager" path: when accumulators ga/gb don't match
+#    the input dtype (e.g. bf16 inputs + fp32 grads when
+#    lora_adapter_grad_dtype=fp32), the dispatcher's same-dtype
+#    Python wrapper can't express the mixed cast in one call, so we
+#    fall back to the 4-GEMM eager pipeline plus a separate
+#    ga.add_(dA.to(ga.dtype)) cast/add. Correct, just doesn't get the
+#    cuBLASLt epilogue fusion.
+#
+# We tried other approaches (torch.compile, hand-rolled Triton chain
+# fusion, hand-rolled Triton epilogue fusion) -- all measured worse
+# than the cuBLASLt route. See docs/lora_perf_notes.md.
+# ---------------------------------------------------------------------------
+
+
+# Lazy-import the dispatcher: ops/__init__.py has GPU-only side effects
+# (matmul_dispatcher workspace allocation), and we want lora_wrapper
+# itself to remain importable on head nodes (download.py path).
+_dispatcher = None
+
+
+def _get_dispatcher():
+    global _dispatcher
+    if _dispatcher is None:
+        from flextrain.ops import dispatcher as _d
+        _dispatcher = _d
+    return _dispatcher
+
+
+def _lora_dadb(
+    X: torch.Tensor, dY: torch.Tensor,
+    A: torch.Tensor, B: torch.Tensor,
+    ga: torch.Tensor, gb: torch.Tensor,
+    scale: float,
+) -> None:
+    """Compute and accumulate dA/dB into (ga, gb) for one LoRA target.
+
+    Routes to the cuBLASLt fused-epilogue path when all six tensors
+    share dtype; falls back to the 4-GEMM eager pipeline otherwise.
+    """
+    same_dtype = (
+        ga.dtype == X.dtype and gb.dtype == X.dtype
+        and dY.dtype == X.dtype and A.dtype == X.dtype
+        and B.dtype == X.dtype
+    )
+    if same_dtype and X.is_cuda:
+        dispatcher = _get_dispatcher()
+        stream_ptr = torch.cuda.current_stream().cuda_stream
+        # Cheap (T, r) intermediates -- still cuBLAS, just via PyTorch.
+        dY_B = dY @ B.transpose(-1, -2)
+        X_A = X @ A
+        # ga += scale * X.T @ dY_B  (fused alpha*AB + beta*C in one call)
+        dispatcher.matmul(
+            stream_ptr, A=X.transpose(0, 1), B=dY_B,
+            C=ga, D=ga, alpha=float(scale), beta=1.0,
+        )
+        # gb += scale * X_A.T @ dY
+        dispatcher.matmul(
+            stream_ptr, A=X_A.transpose(0, 1), B=dY,
+            C=gb, D=gb, alpha=float(scale), beta=1.0,
+        )
+        return
+
+    # Fallback: 4 cuBLAS GEMMs + 2 separate cast/add.
+    dY_B = dY @ B.transpose(-1, -2)              # (T, r)
+    dA = (X.transpose(-1, -2) @ dY_B) * scale    # (in, r)
+    X_A = X @ A                                   # (T, r)
+    dB = (X_A.transpose(-1, -2) @ dY) * scale    # (r, out)
+    ga.add_(dA.to(ga.dtype))
+    gb.add_(dB.to(gb.dtype))
+
+
 @dataclass(frozen=True)
 class LoRATargetConfig:
     """LoRA on one base parameter.
@@ -111,6 +203,19 @@ def _discover_lora_eligible_names(
     * Shared-expert gates (name contains ``shared_expert_gate``): the
       per-token sigmoid scalar gate is router-like (single-output
       projection) and not normally adapted via LoRA.
+    * Depthwise convolution kernels (name contains ``conv``): 3-D shape
+      ``(channels, 1, K)`` is not a per-expert linear stack and the
+      wrapper's MoE-style adapter math doesn't apply.
+    * Bundled gated-DeltaNet linear-attn projections
+      (``w_lin_qkvz``, ``w_lin_ba``): FT bundles HF's split
+      ``in_proj_qkv``/``in_proj_z``/``in_proj_b``/``in_proj_a`` into one
+      matrix for compute efficiency. A single rank-r adapter on the
+      bundled matrix is mathematically NOT equivalent to four
+      independent rank-r adapters on HF's split projections, so we
+      skip these to preserve HF PEFT parity. Users targeting LoRA on
+      linear-attn layers should adapt ``w_lin_out`` plus the layer's
+      MLP only (the typical practical recipe). To LoRA the bundled
+      projections explicitly, name them in ``lora_targets``.
     """
     out = []
     for t in param_spec.tensors:
@@ -121,6 +226,10 @@ def _discover_lora_eligible_names(
         if "router" in nm:
             continue
         if "shared_expert_gate" in nm:
+            continue
+        if "conv" in nm:
+            continue
+        if nm in ("w_lin_qkvz", "w_lin_ba"):
             continue
         out.append(t.name)
     return tuple(out)
@@ -251,25 +360,28 @@ class LoRAWrapperLayer:
         )
         self._target_set: frozenset[str] = frozenset(target_names)
 
-        # Compose the param spec: mark targets frozen, add A/B.
+        # Compose the param spec: every base tensor is frozen (matches
+        # HF PEFT default: ``requires_grad_(False)`` is applied
+        # everywhere, then only the LoRA A/B adapters get added back as
+        # trainable). For LoRA targets we keep a handle on the original
+        # spec so we can build matching A/B shapes; the spec we install
+        # for the target is also frozen.
         new_base_specs = []
         target_specs: dict[str, TensorSpec] = {}
         for t in base.param_spec.tensors:
             if t.name in self._target_set:
                 target_specs[t.name] = t
-                new_base_specs.append(
-                    TensorSpec(
-                        name=t.name, shape_fn=t.shape_fn,
-                        compute_dtype=t.compute_dtype,
-                        master_dtype=t.master_dtype,
-                        grad_dtype=t.grad_dtype,
-                        opt_state_dtype=t.opt_state_dtype,
-                        optimizer=t.optimizer,
-                        frozen=True,
-                    )
+            new_base_specs.append(
+                TensorSpec(
+                    name=t.name, shape_fn=t.shape_fn,
+                    compute_dtype=t.compute_dtype,
+                    master_dtype=t.master_dtype,
+                    grad_dtype=t.grad_dtype,
+                    opt_state_dtype=t.opt_state_dtype,
+                    optimizer=t.optimizer,
+                    frozen=True,
                 )
-            else:
-                new_base_specs.append(t)
+            )
         ab_specs: list[TensorSpec] = []
         for cfg in self.targets:
             a_spec, b_spec = _make_lora_specs(
@@ -544,6 +656,13 @@ class LoRAWrapperLayer:
         "w_shared_up", "w_shared_down", "w_shared_expert_gate",
     ))
 
+    # torch.compile of the rank-r dA/dB block. Set FLEXTRAIN_LORA_COMPILE=0
+    # to disable (e.g. for diagnostic runs or environments where Inductor
+    # can't lower the kernel). Compiled per-shape; we cache one entry
+    # per (in_dim, out_dim, T, dtype) tuple via dynamic=True so a single
+    # compile covers all chunks once T is recompiled-as-dynamic.
+    _COMPILED_DADB = None
+
     def accumulate_lora_grads(
         self, intermediates: BackwardIntermediates,
         weights: Mapping[str, torch.Tensor],
@@ -590,13 +709,12 @@ class LoRAWrapperLayer:
                 # Dense fast path. (X, dY) shapes:
                 #   X: (T, in), dY: (T, out)
                 #   A: (in, r), B: (r, out)
+                # Delegated to a torch.compile-ed kernel (cast/add fuse
+                # into the matmul epilogue + CUDA Graphs remove launch
+                # overhead). Eager fallback is bit-identical; see the
+                # ``_lora_dadb`` definition at module top.
                 X, dY = intermediates.proj_inputs_and_grads[target]
-                dY_B = (dY @ B.transpose(-1, -2))  # (T, r)
-                dA = (X.transpose(-1, -2) @ dY_B) * cfg.scale  # (in, r)
-                X_A = (X @ A)  # (T, r)
-                dB = (X_A.transpose(-1, -2) @ dY) * cfg.scale  # (r, out)
-                ga.add_(dA.to(ga.dtype))
-                gb.add_(dB.to(gb.dtype))
+                _lora_dadb(X, dY, A, B, ga, gb, cfg.scale)
             elif f"g_{target[2:]}" in scratch_grads:
                 # Slow path: dW was materialized in scratch and now we
                 # decompose. Every supported arch should hit a fast

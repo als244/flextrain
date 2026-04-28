@@ -167,6 +167,10 @@ def _baseline_model_memory(
     training_config: Mapping | None,
     has_embed: bool,
     has_head: bool,
+    lora_active: bool = False,
+    layer_param_specs: Sequence | None = None,
+    embed_param_spec: object = None,
+    head_param_spec: object = None,
 ) -> _BaselineModelMemory:
     """How many bytes one full-state copy of the model needs on host
     (training state for every layer + endpoints) and GPU (one full
@@ -176,6 +180,21 @@ def _baseline_model_memory(
     ``training_config["opt_choice"]``: AdamW = 2x opt-dtype tensors per
     param, Muon = 1x (plus a per-layer adamw fixup for routers + norms
     that Muon can't update -- orig:99-100).
+
+    Spec-driven sizing
+    ------------------
+    When ``layer_param_specs`` / ``embed_param_spec`` / ``head_param_spec``
+    are supplied, we compute the actual byte budget from those specs
+    via ``ParamSpec.byte_size`` (which already excludes frozen tensors
+    from grad / opt-state roles). This is the correct path for hybrid
+    setups (LoRA = some tensors frozen, MLP weights still trainable;
+    Muon = only 2-D weights get a single buffer; etc.). When the specs
+    are not provided we fall back to the model_dims-based generic
+    estimator (used by callers that haven't built layers yet).
+
+    ``lora_active`` only affects the legacy generic estimator path —
+    when specs are supplied, ``frozen=True`` on the spec is the source
+    of truth and ``lora_active`` is ignored.
     """
     required_gpu_bytes = 0
     required_host_bytes = 0
@@ -210,38 +229,87 @@ def _baseline_model_memory(
 
     # ---- Endpoints: embed + head full training state lives on GPU
     if has_embed and grad_dims is not None:
-        emb_master = embedding_size_bytes(master_dims)
-        emb_grad = embedding_size_bytes(grad_dims)
-        # Endpoints always use AdamW (orig:62)
-        emb_opt = 2 * embedding_size_bytes(opt_dims)
+        if embed_param_spec is not None:
+            # Spec-driven: respect frozen / per-tensor dtypes.
+            emb_master = embed_param_spec.byte_size(model_dims, role="master")
+            emb_grad = embed_param_spec.byte_size(model_dims, role="grad")
+            emb_opt = opt_mult * embed_param_spec.byte_size(
+                model_dims, role="opt_state"
+            )
+        else:
+            emb_master = embedding_size_bytes(master_dims)
+            if lora_active:
+                emb_grad = 0
+                emb_opt = 0
+            else:
+                emb_grad = embedding_size_bytes(grad_dims)
+                # Endpoints always use AdamW (orig:62)
+                emb_opt = 2 * embedding_size_bytes(opt_dims)
         required_gpu_bytes += emb_master + emb_grad + emb_opt
         required_host_bytes += emb_master + emb_grad + emb_opt
         embed_bytes = emb_master + emb_grad + emb_opt
 
     if has_head and grad_dims is not None:
-        head_master = head_size_bytes(master_dims)
-        head_grad = head_size_bytes(grad_dims)
-        head_opt = 2 * head_size_bytes(opt_dims)
+        if head_param_spec is not None:
+            head_master = head_param_spec.byte_size(model_dims, role="master")
+            head_grad = head_param_spec.byte_size(model_dims, role="grad")
+            head_opt = opt_mult * head_param_spec.byte_size(
+                model_dims, role="opt_state"
+            )
+        else:
+            head_master = head_size_bytes(master_dims)
+            if lora_active:
+                head_grad = 0
+                head_opt = 0
+            else:
+                head_grad = head_size_bytes(grad_dims)
+                head_opt = 2 * head_size_bytes(opt_dims)
         required_gpu_bytes += head_master + head_grad + head_opt
         required_host_bytes += head_master + head_grad + head_opt
         head_bytes = head_master + head_grad + head_opt
 
     # ---- Backbone: training state in host, +1 layer weights+grads on GPU
     if training_config is not None and num_local_layers > 0:
-        weight_b = backbone_layer_size_bytes(model_dims)
-        master_b = backbone_layer_size_bytes(master_dims)
-        grad_b = backbone_layer_size_bytes(grad_dims)
-        opt_b = opt_mult * backbone_layer_size_bytes(opt_dims)
-
-        # Muon can't update routers and norms; those tensors fall back
-        # to AdamW-style (2x state). Orig:99-100 adds the missing copy.
-        if opt_choice == "Muon":
-            extra_dtype = torch_dtype_from_name(training_config["opt_dtype"])
-            d = model_dims["d_model"]
-            # 2 norms + (router weight matrix per routed expert)
-            opt_b += extra_dtype.itemsize * (
-                2 * d + model_dims["num_routed_experts"] * d
+        if layer_param_specs:
+            # Spec-driven: take the per-layer maximum across (possibly
+            # heterogeneous) layer types. ``ParamSpec.byte_size`` honors
+            # ``TensorSpec.frozen`` for grad/opt roles, which is what
+            # gives us correct LoRA accounting.
+            weight_b = max(
+                ps.byte_size(model_dims, role="compute")
+                for ps in layer_param_specs
             )
+            master_b = max(
+                ps.byte_size(model_dims, role="master")
+                for ps in layer_param_specs
+            )
+            grad_b = max(
+                ps.byte_size(model_dims, role="grad")
+                for ps in layer_param_specs
+            )
+            opt_b = opt_mult * max(
+                ps.byte_size(model_dims, role="opt_state")
+                for ps in layer_param_specs
+            )
+        else:
+            weight_b = backbone_layer_size_bytes(model_dims)
+            master_b = backbone_layer_size_bytes(master_dims)
+            if lora_active:
+                grad_b = 0
+                opt_b = 0
+            else:
+                grad_b = backbone_layer_size_bytes(grad_dims)
+                opt_b = opt_mult * backbone_layer_size_bytes(opt_dims)
+
+                # Muon can't update routers and norms; those tensors fall back
+                # to AdamW-style (2x state). Orig:99-100 adds the missing copy.
+                if opt_choice == "Muon":
+                    extra_dtype = torch_dtype_from_name(training_config["opt_dtype"])
+                    d = model_dims["d_model"]
+                    # 2 norms + (router weight matrix per routed expert)
+                    opt_b += extra_dtype.itemsize * (
+                        2 * d + model_dims["num_routed_experts"] * d
+                    )
 
         backbone = _BackboneSizes(
             weight_bytes=weight_b,
@@ -375,6 +443,10 @@ def determine_working_set_config(
     peak_tflops: float | None = None,
     pcie_bw_gbps: float | None = None,
     mem_bw_gbps: float | None = None,
+    lora_active: bool = False,
+    layer_param_specs: Sequence | None = None,
+    embed_param_spec: object = None,
+    head_param_spec: object = None,
 ) -> WorkingSetConfig:
     """Solve the working set: pick chunk size, tokens-per-round, and
     GPU-resident layer counts. Native v2 implementation -- no ``orig`` import.
@@ -484,6 +556,10 @@ def determine_working_set_config(
         model_dims, num_local_layers,
         training_config=training_config,
         has_embed=has_embed, has_head=has_head,
+        lora_active=lora_active,
+        layer_param_specs=layer_param_specs,
+        embed_param_spec=embed_param_spec,
+        head_param_spec=head_param_spec,
     )
     if max_gpu_mem_bytes < baseline.required_gpu_bytes:
         raise ValueError(

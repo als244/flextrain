@@ -789,9 +789,11 @@ class GatedDeltaNetBlock:
                 g_w_out.add_(
                     (o_normed_2d.T.float() @ dy.float()).to(g_w_out.dtype)
                 )
-        # do_normed = dy @ W_out^T
-        do_normed_2d = dy.float() @ W_out.float().T          # (T, value_dim)
-        do_normed = do_normed_2d.to(dtype).reshape(
+        # do_normed = dy @ W_out^T. Keep matmul in compute_dtype (bf16)
+        # to avoid materializing a fp32 copy of the (potentially frozen)
+        # weight matrix on every backward pass.
+        do_normed_2d = (dy.to(dtype) @ W_out.T)              # (T, value_dim)
+        do_normed = do_normed_2d.reshape(
             T, cfg.num_v_heads, cfg.head_v_dim,
         )
 
@@ -917,16 +919,16 @@ class GatedDeltaNetBlock:
         d_post_padded = F.pad(d_post_conv_btc, (0, K - 1))     # (1, conv_dim, T+K-1)
 
         # dW_conv: depthwise conv1d input-gradient form = conv(conv_in_padded, d_post)
-        # Easiest: use torch.nn.grad helpers.
+        # Easiest: use torch.nn.grad helpers. Skip when frozen.
         conv_in_btc = conv_in.transpose(0, 1).unsqueeze(0)     # (1, conv_dim, T)
-        dW_conv = torch.nn.grad.conv1d_weight(
-            input=conv_in_btc,
-            weight_size=W_conv.shape,
-            grad_output=d_post_padded,
-            stride=1, padding=K - 1, dilation=1,
-            groups=cfg.conv_dim,
-        )
         if grads.get("g_lin_conv") is not None:
+            dW_conv = torch.nn.grad.conv1d_weight(
+                input=conv_in_btc,
+                weight_size=W_conv.shape,
+                grad_output=d_post_padded,
+                stride=1, padding=K - 1, dilation=1,
+                groups=cfg.conv_dim,
+            )
             grads["g_lin_conv"].add_(dW_conv.to(grads["g_lin_conv"].dtype))
 
         # d_conv_in: conv1d transpose with weight.
@@ -975,26 +977,36 @@ class GatedDeltaNetBlock:
         # 10. Linear bwd for x @ W_qkvz and x @ W_ba.
         # Wgrad addmms are skip-able (LoRA fast path); the dx accumulations
         # below always run (they're dgrad).
-        x_2d_f = x.reshape(T, cfg.d_model).float()
         x_2d_dt = x.reshape(T, cfg.d_model)  # native dtype copy for capture
         if "g_lin_qkvz" in skip_grads:
             if capture_xy is not None:
                 capture_xy["g_lin_qkvz"] = (x_2d_dt, d_qkvz_2d)
         elif grads.get("g_lin_qkvz") is not None:
+            # Promote to fp32 only when we need to accumulate into a
+            # fp32 grad buffer (full-FT path with master_dtype=fp32).
+            x_2d_f = x_2d_dt.float()
             grads["g_lin_qkvz"].add_(
                 (x_2d_f.T @ d_qkvz_2d.float())
                 .to(grads["g_lin_qkvz"].dtype)
             )
+            del x_2d_f
         if "g_lin_ba" in skip_grads:
             if capture_xy is not None:
                 capture_xy["g_lin_ba"] = (x_2d_dt, d_ba_2d)
         elif grads.get("g_lin_ba") is not None:
+            x_2d_f = x_2d_dt.float()
             grads["g_lin_ba"].add_(
                 (x_2d_f.T @ d_ba_2d.float())
                 .to(grads["g_lin_ba"].dtype)
             )
-        dx_via_qkvz = (d_qkvz_2d.float() @ W_qkvz.float().T).to(dtype)
-        dx_via_ba = (d_ba_2d.float() @ W_ba.float().T).to(dtype)
+            del x_2d_f
+        # dx via base matmul. Keep in compute_dtype (typically bf16) to
+        # avoid materializing a fp32 copy of the (frozen, big) weight
+        # matrix on every backward pass — under LoRA that costs ~hidden
+        # x proj_qkvz_dim x 4 bytes per layer in flight, which dwarfs
+        # all other transient buffers.
+        dx_via_qkvz = (d_qkvz_2d.to(dtype) @ W_qkvz.T)
+        dx_via_ba = (d_ba_2d.to(dtype) @ W_ba.T)
         dx = (dx_via_qkvz + dx_via_ba).view_as(x)
         return dx
 

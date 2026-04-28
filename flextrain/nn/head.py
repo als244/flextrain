@@ -230,8 +230,11 @@ class LMHead:
 
         w_final_norm = weights["w_final_norm"]
         w_head_proj = weights["w_head_proj"]
-        g_final_norm = grads["g_final_norm"]
-        g_head_proj = grads["g_head_proj"]
+        # Frozen-aware: under LoRA the BufferManager skips grad
+        # allocation for frozen tensors. ``None`` means "skip the
+        # wgrad accumulate" (forward + dx still run normally).
+        g_final_norm = grads.get("g_final_norm")
+        g_head_proj = grads.get("g_head_proj")
 
         # For extras (e.g. KL for RL), collect per-chunk and let the
         # engine / caller concatenate. We don't want to force a schema
@@ -281,14 +284,15 @@ class LMHead:
             # ---- bwd: accumulate w_head_proj grad ----
             #   g_head_proj += head_proj_in.T @ dZ   (loss_scale already
             #   folded into dZ by the loss fn, so alpha=1.0 here)
-            torch.addmm(
-                g_head_proj,
-                head_proj_in.T,
-                dZ,
-                alpha=1.0,
-                beta=1.0,
-                out=g_head_proj,
-            )
+            if g_head_proj is not None:
+                torch.addmm(
+                    g_head_proj,
+                    head_proj_in.T,
+                    dZ,
+                    alpha=1.0,
+                    beta=1.0,
+                    out=g_head_proj,
+                )
 
             # ---- bwd: dX_head_in = dZ @ w_head_proj.T ----
             dX_head_in = torch.empty(
@@ -306,6 +310,8 @@ class LMHead:
             del dZ  # if dZ aliased logits, the buffer is now free
 
             # ---- bwd: RMSNorm bwd (dW accumulated in g_final_norm) ----
+            # ``dW=None`` tells flextrain_rmsnorm_bwd to skip the
+            # wgrad accumulate (frozen final-norm).
             dX_slice, _dW_norm, _ = flextrain_rmsnorm_bwd(
                 dX_head_in,
                 x_slice,

@@ -766,15 +766,28 @@ class BufferManager:
         slot_idx: int,
         *,
         non_blocking: bool = True,
+        skip_frozen: bool = False,
     ) -> None:
         """Copy host master params for ``layer_id`` into GPU ring slot
         ``slot_idx``. Casts master_dtype -> compute_dtype when they
         differ (handled implicitly by ``Tensor.copy_`` dtype promotion).
+
+        ``skip_frozen=True``: don't transfer frozen tensors (use during
+        ``ActiveModel.step`` since frozen tensors aren't updated and
+        their device copies stay valid across steps). Forward/backward
+        passes always need frozen master copies on device, so they
+        should leave ``skip_frozen=False``.
         """
         spec = self.layer_param_specs[layer_id]
         gpu = self.gpu_param_slot(slot_idx, spec)
         host = self.host_params[layer_id]
+        if skip_frozen:
+            frozen_names = {t.name for t in spec.tensors if t.frozen}
+        else:
+            frozen_names = set()
         for name, dev_t in gpu.items():
+            if name in frozen_names:
+                continue
             dev_t.copy_(host[name], non_blocking=non_blocking)
 
     def fetch_layer_grads(
@@ -812,11 +825,17 @@ class BufferManager:
     ) -> None:
         """Mirror of :meth:`fetch_layer_params` — used during
         :meth:`ActiveModel.step` to write updated master params back
-        to the host copy."""
+        to the host copy. Skips frozen tensors (their master never
+        changes, so the device→host write would be a wasted PCIe
+        transfer)."""
         spec = self.layer_param_specs[layer_id]
         gpu = self.gpu_param_slot(slot_idx, spec)
         host = self.host_params[layer_id]
+        # Build a frozen-name set from the spec so we can skip them.
+        frozen_names = {t.name for t in spec.tensors if t.frozen}
         for name, dev_t in gpu.items():
+            if name in frozen_names:
+                continue
             host[name].copy_(dev_t, non_blocking=non_blocking)
 
     # ------------------------------------------------------------------

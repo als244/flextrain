@@ -206,14 +206,23 @@ class ParamSpec:
         or 1 for Muon. Keeping that multiplier out of here lets us stay
         optimizer-agnostic.
         """
+        # Frozen tensors (``TensorSpec.frozen=True``) are excluded from
+        # ``grad`` and ``opt_state`` since the engine doesn't allocate
+        # those buffers for them. They ARE included in ``compute`` and
+        # ``master`` (the forward still reads the frozen weight).
+        def _it():
+            if role in ("grad", "opt_state"):
+                return (t for t in self.tensors if not t.frozen)
+            return iter(self.tensors)
+
         if role == "compute":
-            return sum(t.compute_byte_size(dims) for t in self.tensors)
+            return sum(t.compute_byte_size(dims) for t in _it())
         if role == "master":
-            return sum(t.master_byte_size(dims) for t in self.tensors)
+            return sum(t.master_byte_size(dims) for t in _it())
         if role == "grad":
-            return sum(t.grad_byte_size(dims) for t in self.tensors)
+            return sum(t.grad_byte_size(dims) for t in _it())
         if role == "opt_state":
-            return sum(t.opt_state_byte_size(dims) for t in self.tensors)
+            return sum(t.opt_state_byte_size(dims) for t in _it())
         raise ValueError(
             f"unknown role {role!r}; expected compute|master|grad|opt_state"
         )

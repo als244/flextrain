@@ -454,8 +454,12 @@ class ActiveModel:
         with torch.cuda.stream(self.streams.inbound):
             for i in range(min(N_P, num_layers)):
                 layer_id = self.backbone[i].layer_id
+                # ``skip_frozen=True``: during step we don't read frozen
+                # master copies (the optimizer skips them, and they're
+                # left over from the last fwd_bwd ring-rotation anyway).
+                # Saves a host->device transfer per frozen tensor.
                 self.buffers.fetch_layer_params(
-                    layer_id, i, non_blocking=True
+                    layer_id, i, non_blocking=True, skip_frozen=True,
                 )
                 self.events.weight_inbound.record_on(
                     layer_id, self.streams.inbound
@@ -625,10 +629,17 @@ class ActiveModel:
             return ret
 
         # Mirror updated state back to host (blocking — these are tiny).
+        # Skip frozen tensors (their master / opt-state never changed,
+        # the copy would be a no-op transfer).
         if mirror_host:
+            frozen_names = {t.name for t in param_spec.tensors if t.frozen}
             for name, t in weights.items():
+                if name in frozen_names:
+                    continue
                 host_master[name].copy_(t)
             for name, t in dev_opt.items():
+                # Opt-state names are e.g. "o_m_q" — strip the trailing
+                # weight name to test against frozen_names.
                 host_opt[name].copy_(t)
         torch.cuda.synchronize()
         return 0

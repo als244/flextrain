@@ -57,6 +57,7 @@ from typing import Any, Callable, Iterable, Mapping
 
 import torch
 
+from flextrain.core.layer import ParamSpec
 from flextrain.core.save_level import HardwareCost
 from flextrain.core.working_set import determine_working_set_config
 from flextrain.engine.active_model import ActiveModel
@@ -191,16 +192,18 @@ def from_pretrained(
     leeway_gpu_mem_bytes: int = 2 * (1 << 30),
     leeway_host_mem_bytes: int = 4 * (1 << 30),
     compute_dtype: torch.dtype = torch.bfloat16,
-    master_dtype: torch.dtype | None = None,
-    grad_dtype: torch.dtype | None = None,
+    # Master defaults to compute_dtype (bf16). Override to torch.float32
+    # for higher-precision parameter updates at 2x param memory cost.
+    master_dtype: torch.dtype | None = torch.bfloat16,
+    grad_dtype: torch.dtype | None = torch.bfloat16,
     norm_grad_dtype: torch.dtype = torch.float32,
     lora_targets: object | None = None,
     lora_rank: int = 16,
     lora_alpha: float = 16.0,
-    lora_adapter_compute_dtype: torch.dtype | None = None,
-    lora_adapter_master_dtype: torch.dtype | None = torch.float32,
-    lora_adapter_grad_dtype: torch.dtype | None = torch.float32,
-    lora_adapter_opt_state_dtype: torch.dtype | None = torch.float32,
+    lora_adapter_compute_dtype: torch.dtype | None = torch.bfloat16,
+    lora_adapter_master_dtype: torch.dtype | None = torch.bfloat16,
+    lora_adapter_grad_dtype: torch.dtype | None = torch.bfloat16,
+    lora_adapter_opt_state_dtype: torch.dtype | None = torch.bfloat16,
     lora_init_seed: int = 20260424,
     lora_a_std: float = 0.02,
     hw_cost: HardwareCost | None = None,
@@ -304,6 +307,21 @@ def from_pretrained(
         compute=compute_dtype, master=master_dtype, grad=grad_dtype,
         norm_grad=norm_grad_dtype,
     )
+    # LoRA: freeze every embed and head tensor (matches HF PEFT
+    # default — non-LoRA-targeted params get ``requires_grad_(False)``
+    # including the final-norm γ). The BufferManager skips grad/opt
+    # allocation for frozen tensors; downstream code that consumes
+    # head grads must check for absence (``head.forward_backward``
+    # treats a missing ``g_final_norm`` / ``g_head_proj`` as "this
+    # is a frozen LoRA run, skip the wgrad accumulate").
+    if lora_targets is not None:
+        from dataclasses import replace as _replace
+        embed.param_spec = ParamSpec(tensors=tuple(
+            _replace(t, frozen=True) for t in embed.param_spec.tensors
+        ))
+        head.param_spec = ParamSpec(tensors=tuple(
+            _replace(t, frozen=True) for t in head.param_spec.tensors
+        ))
     ctx = BuildContext(
         hf_config=hf_config, dims=dims, hyperparams=hyperparams,
         compute_dtype=compute_dtype, master_dtype=master_dtype,
@@ -348,6 +366,14 @@ def from_pretrained(
         fixed_seq_len=fixed_seq_len,
         verbose=verbose,
         min_chunk_size=min_chunk_size,
+        lora_active=lora_targets is not None,
+        # Hand the actual specs to the solver so it sizes from real
+        # frozen-aware byte counts (LoRA wraps backbone tensors with
+        # ``frozen=True``; embed/head get marked frozen above when
+        # ``lora_targets`` is set).
+        layer_param_specs=[layer.param_spec for layer in backbone],
+        embed_param_spec=embed.param_spec,
+        head_param_spec=head.param_spec,
     )
 
     # 5. Build engine. ``hw_cost`` must come from the caller — either

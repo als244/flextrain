@@ -217,6 +217,10 @@ class RMSNormBlock:
 
         Returns ``(dx, recomputed_output)``.
         """
+        # Frozen-aware: under LoRA the BufferManager skips grad
+        # allocation for frozen tensors, so ``grads`` may not contain
+        # ``self.grad_name``. ``dW=None`` tells flextrain_rmsnorm_bwd to
+        # skip the wgrad accumulate (forward + dx still run normally).
         dx, _, recomputed = flextrain_rmsnorm_bwd(
             dy,
             x,
@@ -224,7 +228,7 @@ class RMSNormBlock:
             rstd=rstd,
             head_dim=self._head_dim_arg(x, weights),
             dX=dx_accumulator,
-            dW=grads[self.grad_name],
+            dW=grads.get(self.grad_name),
             recompute_output=recompute_output,
             recomputed_output_tensor=recomputed_output_tensor,
         )

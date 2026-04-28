@@ -136,9 +136,15 @@ class TokenEmbedLayer:
     ) -> None:
         """Scatter-add ``dx`` into ``grads["g_tok_embeddings"]``.
 
+        Skipped under LoRA (the embed table is frozen, ``grads`` does
+        not contain ``g_tok_embeddings``).
+
         Mirrors ``orig/awsm_transformer/embed.py:20-32``.
         """
-        flextrain_embedding_bwd(dx, token_ids, grads["g_tok_embeddings"], scale=1.0)
+        g = grads.get("g_tok_embeddings")
+        if g is None:
+            return
+        flextrain_embedding_bwd(dx, token_ids, g, scale=1.0)
 
     def compute_cost(self, chunk: ChunkMeta) -> ComputeCost:
         """Gather (forward) + scatter-add (backward) are both bandwidth-
