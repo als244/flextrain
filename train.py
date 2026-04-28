@@ -429,6 +429,28 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "clamped to each layer's max. The on-device tail keeps -1."
         ),
     )
+    p.add_argument(
+        "--min-chunk-size",
+        type=int,
+        default=None,
+        help=(
+            "Lower bound (in tokens) on the chunk size the working-set "
+            "solver may pick. Overrides the arithmetic-intensity floor "
+            "the solver computes from sustained TFLOPS / mem-bw. Useful "
+            "for short-input forwards / debugging."
+        ),
+    )
+    p.add_argument(
+        "--max-chunk-size",
+        type=int,
+        default=None,
+        help=(
+            "Upper bound (in tokens) on the chunk size the working-set "
+            "solver may pick. Useful when the auto-pick is too large for "
+            "the host activation buffer or workspace, or when you want to "
+            "force a specific tile shape for profiling."
+        ),
+    )
     p.add_argument("--save", action="store_true", help="Export final.safetensors at the end of the run.")
     return p
 
@@ -585,6 +607,8 @@ def main(argv: list[str] | None = None) -> int:
         hw_cost=probe.hw_cost,
         mem_bw_gbps=probe.mem_bw_gbps,
         force_saved_act_level=args.force_save_level,
+        min_chunk_size=args.min_chunk_size,
+        max_chunk_size=args.max_chunk_size,
         strict=False,
         verbose=True,
     )

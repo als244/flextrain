@@ -215,6 +215,7 @@ def from_pretrained(
     strict: bool = False,
     verbose: bool = False,
     min_chunk_size: int | None = None,
+    max_chunk_size: int | None = None,
 ) -> ActiveModel:
     """Build a configured :class:`ActiveModel` for an HF model directory.
 
@@ -366,6 +367,7 @@ def from_pretrained(
         fixed_seq_len=fixed_seq_len,
         verbose=verbose,
         min_chunk_size=min_chunk_size,
+        max_chunk_size=max_chunk_size,
         lora_active=lora_targets is not None,
         # Hand the actual specs to the solver so it sizes from real
         # frozen-aware byte counts (LoRA wraps backbone tensors with
