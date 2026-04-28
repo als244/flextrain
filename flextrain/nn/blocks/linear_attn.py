@@ -64,6 +64,12 @@ try:
         chunk_gated_delta_rule_bwd,
         chunk_gated_delta_rule_fwd,
     )
+    # L2 norm helpers: HF's gated-delta linear-attn applies an L2-norm
+    # to q/k before the recurrence (``use_qk_l2norm_in_kernel=True`` in
+    # the high-level wrapper). The lower-level ``_fwd``/``_bwd`` calls
+    # don't accept that flag, so we apply it explicitly here. Keeping
+    # ``q_rstd``/``k_rstd`` for the bwd half of l2_norm.
+    from fla.modules.l2norm import l2norm_fwd, l2norm_bwd
 except ImportError as e:  # pragma: no cover
     raise ImportError(
         "Qwen3NextLinearAttention requires `flash-linear-attention`. "
@@ -217,6 +223,23 @@ class GatedDeltaNetBlock:
             ActivationField(
                 "lin_g_post",
                 lambda n, d: (n, cfg.num_v_heads),
+                torch.float32, tier=0,
+            ),
+            # L2-norm reciprocal-stddev per (token, k_head). HF's linear
+            # attention uses ``use_qk_l2norm_in_kernel=True`` which wraps
+            # FLA's recurrence with ``l2norm_fwd``+``l2norm_bwd``; the
+            # lower-level kernel we drive directly doesn't, so we run
+            # l2 norm explicitly. We save only the rstd (small, fp32)
+            # and recompute the normalized q/k in bwd from the saved
+            # un-normalized q_h/k_h.
+            ActivationField(
+                "lin_q_rstd",
+                lambda n, d: (n, cfg.num_k_heads),
+                torch.float32, tier=0,
+            ),
+            ActivationField(
+                "lin_k_rstd",
+                lambda n, d: (n, cfg.num_k_heads),
                 torch.float32, tier=0,
             ),
             # ==================================================
@@ -441,14 +464,36 @@ class GatedDeltaNetBlock:
     ) -> torch.Tensor:
         """Stage 5: FLA chunk-gated-delta-rule. Saves ``lin_core_out``,
         ``lin_A_int``, ``lin_g_post``. Returns ``core_out`` for the
-        gated norm + out projection downstream."""
+        gated norm + out projection downstream.
+
+        L2-normalizes q/k per-(token, k_head) before the recurrence to
+        match HF's ``use_qk_l2norm_in_kernel=True``. ``lin_q_rstd`` /
+        ``lin_k_rstd`` are saved (tier 0) so bwd can apply the
+        complementary ``l2norm_bwd`` to the gradients FLA returns.
+        """
         cfg = self.cfg
         bf = cfg.compute_dtype
         beta = b.float().sigmoid().to(bf)
         scale = cfg.head_k_dim ** -0.5
+
+        # L2 norm on q/k. l2norm_fwd treats the last dim as the
+        # normalization axis; q_h / k_h have shape (T, num_k_heads,
+        # head_k_dim), so per-(t, h) row of length head_k_dim is
+        # normalized as expected. l2norm_fwd internally calls
+        # ``.view(-1, last_dim)`` which requires contiguous input.
+        # FLA's chunk kernel reads with elementwise pointer arithmetic and
+        # silently produces wrong results on non-contiguous inputs.
+        # ``torch.split`` + ``.reshape`` upstream can yield non-contiguous
+        # views, so force contiguity on every kernel input here.
+        q_n, q_rstd = l2norm_fwd(q_h.contiguous())
+        k_n, k_rstd = l2norm_fwd(k_h.contiguous())
+
         g_post, o, A_int, _, _, _ = chunk_gated_delta_rule_fwd(
-            q_h.unsqueeze(0), k_h.unsqueeze(0), v_h.unsqueeze(0),
-            g.unsqueeze(0), beta.unsqueeze(0),
+            q_n.unsqueeze(0).contiguous(),
+            k_n.unsqueeze(0).contiguous(),
+            v_h.unsqueeze(0).contiguous(),
+            g.unsqueeze(0).contiguous(),
+            beta.unsqueeze(0).contiguous(),
             scale=scale, initial_state=None,
             output_final_state=False, cu_seqlens=None,
         )
@@ -456,6 +501,12 @@ class GatedDeltaNetBlock:
         slot.lin_g_post.copy_(g_post.squeeze(0))
         slot.lin_A_int.copy_(A_int.squeeze(0).to(bf))
         slot.lin_core_out.copy_(o.to(bf))
+        # Save rstds (tier 0). Bwd will recompute q_n / k_n from the
+        # saved un-normalized q_h / k_h (in slot.lin_q / slot.lin_k)
+        # and these rstds. q_rstd has shape (T, num_k_heads); make
+        # contiguous for the slot copy.
+        slot.lin_q_rstd.copy_(q_rstd.contiguous())
+        slot.lin_k_rstd.copy_(k_rstd.contiguous())
         return o
 
     def _fwd_norm_out(
