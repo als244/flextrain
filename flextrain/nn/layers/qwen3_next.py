@@ -244,20 +244,25 @@ class Qwen3NextLinearLayer:
         """
         cfg = self.cfg
 
-        # Linear-attn block stages, in order of dependency depth:
-        # Tier 2 ⊃ Tier 3.
-        # ``lin_q`` is tier 2 — present iff the slot's level >= 2.
-        # ``lin_qkvz`` is tier 3 — present iff level >= 3.
-        # post-conv is never saved (transient scratch since Stage D2);
-        # if Q/K/V (tier 2) are missing we re-run from x_inp.
-        if not slot.has("lin_q"):
+        # Linear-attn block stages.
+        # ``lin_qkvz`` is tier 3 — present iff slot's level >= 3.
+        # ``lin_q`` is tier 2 — present iff level >= 2.
+        # post-conv is never saved (transient scratch since Stage D2).
+        #
+        # bwd reads slot.lin_qkvz directly (for z extraction and the
+        # conv_in slice), so we MUST repopulate it if level < 3 even
+        # when level==2 has Q/K/V already. Likewise lin_q if missing.
+        need_proj = not slot.has("lin_qkvz")
+        need_qkv = not slot.has("lin_q")
+        if need_proj or need_qkv:
             attn_norm_output = self.attn_norm.fwd_from_rstd(
                 slot.x_inp, weights, slot.attn_norm_rstd,
             )
             post_conv = self.lin_attn.fwd_recompute_post_conv(
                 attn_norm_output, weights, slot, ctx,
             )
-            self.lin_attn._fwd_qkv_heads(post_conv, slot)
+            if need_qkv:
+                self.lin_attn._fwd_qkv_heads(post_conv, slot)
 
         if not slot.has("lin_core_out") or not slot.has("lin_A_int"):
             # Re-run FLA fwd from saved q/k/v/g/b.
