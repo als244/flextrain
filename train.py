@@ -394,8 +394,25 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "available."
         ),
     )
-    p.add_argument("--leeway-gpu-mem-gib", type=float, default=2.0, help="Reserved GPU slack in GiB. Default: 2.0.")
-    p.add_argument("--leeway-host-mem-gib", type=float, default=10.0, help="Reserved host-memory slack in GiB. Default: 10.0.")
+    p.add_argument(
+        "--leeway-gpu-mem-gib",
+        type=float,
+        default=5.0,
+        help=(
+            "Reserved GPU slack in GiB. Default: 5.0. The working_set "
+            "subtracts this from the discovered budget before sizing "
+            "the activation ring; the leeway absorbs aten/FLA kernel "
+            "internal scratch (conv1d_backward, FLA's chunk_delta_h "
+            "internal state tensors, etc.) that the static estimate "
+            "doesn't fully model."
+        ),
+    )
+    p.add_argument(
+        "--leeway-host-mem-gib",
+        type=float,
+        default=10.0,
+        help="Reserved host-memory slack in GiB. Default: 10.0.",
+    )
     p.add_argument(
         "--profile-start-step",
         type=int,
