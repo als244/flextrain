@@ -589,6 +589,16 @@ class JsonSFTTokenSource:
         min_token_count: int | None,
         max_token_count: int | None,
     ) -> list[Sequence]:
+        # Default semantics: when caller gives only max_token_count,
+        # treat min as max — pack until full or the producer is
+        # exhausted. This matches the old synchronous behavior; the
+        # alternative (return as soon as ≥1 sequence is buffered) is
+        # a footgun because the first call returns an undersized batch
+        # while the producer is still tokenizing the rest.
+        if min_token_count is None and max_token_count is not None:
+            effective_min = max_token_count
+        else:
+            effective_min = min_token_count
         out: list[Sequence] = []
         total = 0
         while True:
@@ -601,20 +611,13 @@ class JsonSFTTokenSource:
                         and out
                         and total + len(head) > max_token_count
                     ):
-                        # Next would overflow; leave it for the next call.
-                        # If we're below min_token_count, this exits the
-                        # outer loop too — caller asked for at least min,
-                        # we can't satisfy without overshooting max.
-                        if (
-                            min_token_count is not None
-                            and total < min_token_count
-                        ):
-                            # This is the rare "min and max are both set,
-                            # and the next sequence won't fit". Return
-                            # what we have; caller should size the cap
-                            # consistently with the source's max_seq_len.
-                            self._room.notify()
-                            return out
+                        # Next would overflow; leave it for the next
+                        # call. (We've already met effective_min
+                        # implicitly: out is non-empty, and the
+                        # block-pop loop only continues while the
+                        # next sequence still fits — so
+                        # ``total + len(head) > max_token_count``
+                        # implies ``total`` is close to max.)
                         self._room.notify()
                         return out
                     self._queue.popleft()
@@ -631,17 +634,11 @@ class JsonSFTTokenSource:
                 if self._exhausted:
                     self._room.notify()
                     return out
-                # If we already have something AND min_token_count is
-                # satisfied (or wasn't requested), return early — don't
-                # block waiting for more when caller didn't ask for a
-                # minimum. If we have NOTHING yet, block until the
-                # producer puts at least one sequence in (otherwise
-                # the consumer would spin returning empty lists while
-                # the producer is busy tokenizing).
-                if out and (
-                    min_token_count is None
-                    or total >= min_token_count
-                ):
+                # Have we satisfied effective_min? If yes, return.
+                # If no, block waiting for the producer to enqueue
+                # more (the typical case on cold start: producer is
+                # mid-tokenize, consumer must wait for it to fill).
+                if effective_min is None or total >= effective_min:
                     self._room.notify()
                     return out
             # Wait for the producer to enqueue more.
