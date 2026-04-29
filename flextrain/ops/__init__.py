@@ -23,6 +23,7 @@ from ._kernels.cross_entropy import (
     flextrain_softmax_cross_entropy_loss,
 )
 from ._kernels.embed import flextrain_embedding_bwd
+from ._kernels.gate_prep import flextrain_gate_prep_fwd
 from ._kernels.gated_rmsnorm import (
     flextrain_gated_rmsnorm_bwd,
     flextrain_gated_rmsnorm_fwd,
@@ -76,6 +77,7 @@ __all__ = [
     "flextrain_copy_expert_counts",
     "flextrain_cross_entropy_loss",
     "flextrain_embedding_bwd",
+    "flextrain_gate_prep_fwd",
     "flextrain_gated_rmsnorm_bwd",
     "flextrain_gated_rmsnorm_fwd",
     "flextrain_fused_topk_softmax",

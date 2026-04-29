@@ -476,25 +476,39 @@ class GatedDeltaNetBlock:
         slot.lin_v.copy_(v_h.to(bf))
         return q_h, k_h, v_h
 
-    def _fwd_gate(
-        self, a: torch.Tensor, weights: Mapping[str, torch.Tensor], slot,
-    ) -> torch.Tensor:
-        """Stage 4: g = -exp(A_log) * softplus(a + dt_bias). Saves ``lin_g``.
+    def _fwd_gate_and_beta(
+        self,
+        a: torch.Tensor,                       # (T, n_v_heads) bf16
+        b: torch.Tensor,                       # (T, n_v_heads) bf16
+        weights: Mapping[str, torch.Tensor],
+        slot,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Stage 4: produce ``g`` (fp32) and ``beta`` (bf16) for FLA.
 
-        Returns the raw pre-cumsum ``g`` (fp32)."""
-        a_f32 = a.float()
-        A_log = weights["w_lin_A_log"].float()
-        dt_bias = weights["w_lin_dt_bias"].float()
-        g = -A_log.exp() * F.softplus(a_f32 + dt_bias)
-        slot.lin_g.copy_(g.detach().clone())
-        return g
+        Math:
+            g[t, h]    = -exp(A_log[h]) * softplus(a[t, h] + dt_bias[h])
+            beta[t, h] = sigmoid(b[t, h])
+
+        Single fused Triton kernel replaces ~9 elementwise launches in
+        the python pipeline. Saves ``lin_g`` to the slot.
+        """
+        from flextrain.ops import flextrain_gate_prep_fwd
+        g, beta = flextrain_gate_prep_fwd(
+            a, b, weights["w_lin_A_log"], weights["w_lin_dt_bias"],
+        )
+        slot.lin_g.copy_(g)
+        return g, beta
 
     def _fwd_fla(
-        self, q_h, k_h, v_h, g, b, slot,
+        self, q_h, k_h, v_h, g, beta, slot,
     ) -> torch.Tensor:
         """Stage 5: FLA chunk-gated-delta-rule. Saves ``lin_core_out``,
         ``lin_A_int``, ``lin_g_post``. Returns ``core_out`` for the
         gated norm + out projection downstream.
+
+        ``beta`` is precomputed by ``_fwd_gate_and_beta`` (fused gate-prep
+        kernel) so we avoid the per-call ``b.float().sigmoid().to(bf)``
+        elementwise pipeline.
 
         L2-normalizes q/k per-(token, k_head) before the recurrence to
         match HF's ``use_qk_l2norm_in_kernel=True``. ``lin_q_rstd`` /
@@ -503,7 +517,6 @@ class GatedDeltaNetBlock:
         """
         cfg = self.cfg
         bf = cfg.compute_dtype
-        beta = b.float().sigmoid().to(bf)
         scale = cfg.head_k_dim ** -0.5
 
         # L2 norm on q/k. l2norm_fwd treats the last dim as the
@@ -564,16 +577,14 @@ class GatedDeltaNetBlock:
 
         Composed from the per-stage helpers
         (``_fwd_proj_split`` → ``_fwd_conv`` → ``_fwd_qkv_heads`` →
-        ``_fwd_gate`` → ``_fwd_fla`` → ``_fwd_norm_out``).
+        ``_fwd_gate_and_beta`` → ``_fwd_fla`` → ``_fwd_norm_out``).
         :meth:`fwd_recompute_*` re-runs only the missing stages.
         """
         z, conv_in = self._fwd_proj_split(x, weights, slot)
         post_conv = self._fwd_conv(conv_in, weights, slot)
         q_h, k_h, v_h = self._fwd_qkv_heads(post_conv, slot)
-        a = slot.lin_a
-        b = slot.lin_b
-        g = self._fwd_gate(a, weights, slot)
-        core_out = self._fwd_fla(q_h, k_h, v_h, g, b, slot)
+        g, beta = self._fwd_gate_and_beta(slot.lin_a, slot.lin_b, weights, slot)
+        core_out = self._fwd_fla(q_h, k_h, v_h, g, beta, slot)
         return self._fwd_norm_out(core_out, z, weights)
 
     def _gated_rmsnorm_fwd(
@@ -647,10 +658,19 @@ class GatedDeltaNetBlock:
         """Tier-2 recompute (FLA half): re-run FLA fwd from saved
         Q/K/V/g/b to repopulate ``lin_core_out`` / ``lin_A_int`` /
         ``lin_g_post``. ``lin_g`` (raw) and ``lin_a`` / ``lin_b``
-        must already be present (tier-0 — always saved)."""
+        must already be present (tier-0 — always saved).
+
+        Beta is recomputed from saved ``lin_b`` via the fused gate-
+        prep kernel (which also recomputes g; we discard the recomputed
+        g since slot.lin_g is already valid)."""
+        from flextrain.ops import flextrain_gate_prep_fwd
+        _g, beta = flextrain_gate_prep_fwd(
+            slot.lin_a, slot.lin_b,
+            weights["w_lin_A_log"], weights["w_lin_dt_bias"],
+        )
         return self._fwd_fla(
             slot.lin_q, slot.lin_k, slot.lin_v,
-            slot.lin_g, slot.lin_b, slot,
+            slot.lin_g, beta, slot,
         )
 
     def _gated_rmsnorm_bwd(
