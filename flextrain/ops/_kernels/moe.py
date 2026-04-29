@@ -700,13 +700,39 @@ def flextrain_moe_sort(
     
     block_accum = torch.empty_like(block_counts)
     total_counts = torch.empty(num_experts, dtype=torch.int32, device=topk_ids.device)
-    
-    MAX_BLOCK_B = 8192  # Fixed upper bound — no recompilation on seq len change
-    if num_blocks > MAX_BLOCK_B:
-        raise ValueError(
-            f"num_blocks={num_blocks} exceeds MAX_BLOCK_B={MAX_BLOCK_B}. "
-            f"Increase MAX_BLOCK_B or increase block_size."
-        )
+
+    # ``BLOCK_B`` is a Triton ``constexpr`` so each distinct value
+    # triggers a kernel recompile. Pick from a small set of power-of-2
+    # buckets so the worst case is one recompile per bucket (5 total
+    # over the workload range) and we never hard-fail on workloads
+    # larger than a previously-fixed cap.
+    #
+    # ``N_TOKENS = T * K`` (the flattened (token, top-k-slot) pairs);
+    # ``num_blocks = ceil(N_TOKENS / block_size)``. Bucket coverage
+    # at the default ``block_size=256``:
+    #   MAX_BLOCK_B    | covers num_blocks up to | covers T*K up to
+    #   ---------------|-------------------------|------------------
+    #     1024         |                    1024 |  ~262K
+    #     4096         |                    4096 |  ~1.05M
+    #     8192         |                    8192 |  ~2.10M
+    #    16384         |                   16384 |  ~4.19M
+    #    65536         |                   65536 |  ~16.78M
+    # For the typical chunk sizes (T=4K..256K, K=4..8), num_blocks
+    # lives in the lowest 1-2 buckets. Above 65K blocks (16M (T,K)
+    # pairs) we bump to the next power-of-2 rather than failing — a
+    # one-time recompile is much cheaper than a hard error.
+    if num_blocks <= 1024:
+        MAX_BLOCK_B = 1024
+    elif num_blocks <= 4096:
+        MAX_BLOCK_B = 4096
+    elif num_blocks <= 8192:
+        MAX_BLOCK_B = 8192
+    elif num_blocks <= 16384:
+        MAX_BLOCK_B = 16384
+    elif num_blocks <= 65536:
+        MAX_BLOCK_B = 65536
+    else:
+        MAX_BLOCK_B = triton.next_power_of_2(num_blocks)
 
     num_warps = max(1, min(4, MAX_BLOCK_B // 32))
     

@@ -287,9 +287,28 @@ def _baseline_model_memory(
                 ps.byte_size(model_dims, role="grad")
                 for ps in layer_param_specs
             )
+            # Optimizer state size: the AdamW / Muon optimizer's actual
+            # state_dtype overrides each TensorSpec's
+            # ``opt_state_dtype`` at runtime (the engine's BufferManager
+            # uses ``opt_spec.tensors[*].dtype.itemsize`` per parameter,
+            # not the per-spec opt_state_dtype). Compute it here to
+            # match — otherwise the picker undersizes opt_layers fit
+            # when the optimizer is fp32 but per-tensor specs are bf16
+            # (LoRA's typical config: state_dtype=fp32 but per-LoRA-A/B
+            # opt_state_dtype defaults to bf16).
+            opt_state_dtype = torch_dtype_from_name(
+                training_config["opt_dtype"]
+            )
+            opt_state_itemsize = opt_state_dtype.itemsize
+
+            def _opt_b_for_spec(ps) -> int:
+                return sum(
+                    t.numel(model_dims) * opt_state_itemsize
+                    for t in ps.tensors
+                    if not t.frozen
+                )
             opt_b = opt_mult * max(
-                ps.byte_size(model_dims, role="opt_state")
-                for ps in layer_param_specs
+                _opt_b_for_spec(ps) for ps in layer_param_specs
             )
         else:
             weight_b = backbone_layer_size_bytes(model_dims)
