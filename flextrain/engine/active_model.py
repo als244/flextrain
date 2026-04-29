@@ -172,6 +172,11 @@ class ActiveModel:
     step_count: int = 0
     _zero_grad: bool = True  # True at round 0 of each step; False after first round.
     _is_first_plan: bool = True  # mirrors orig's ``is_first`` (orig:533).
+    # Source HF dir + arch — set by ``load_hf`` so ``flextrain.export``
+    # can copy tokenizer / config / generation_config alongside the
+    # exported safetensors.
+    _hf_source_path: str | None = None
+    _hf_arch: Any | None = None
 
     def __post_init__(self) -> None:
         device = torch.device(self.device)
@@ -722,6 +727,11 @@ class ActiveModel:
             strict=strict,
             device="cpu",
         )
+
+        # Remember where weights came from so flextrain.export can copy
+        # tokenizer / config / generation_config alongside the safetensors.
+        self._hf_source_path = hf_path
+        self._hf_arch = arch
 
         # Refresh resident GPU slots from the fresh host values.
         self._refresh_gpu_residents()

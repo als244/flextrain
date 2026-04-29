@@ -191,6 +191,7 @@ download.py  pre-stage models/datasets for air-gapped nodes
 | [implementing.md](docs/implementing.md) | adding a new block / layer / model |
 | [dtypes.md](docs/dtypes.md) | compute / master / grad / opt-state dtypes |
 | [optimizers.md](docs/optimizers.md) | AdamW / Muon / HybridMuonAdamW |
+| [export.md](docs/export.md) | export to vLLM / sGLang / HF (full, LoRA adapter, merged) |
 
 ## Tests
 
