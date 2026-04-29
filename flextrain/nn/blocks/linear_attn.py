@@ -718,8 +718,10 @@ class GatedDeltaNetBlock:
                 weight=w,
                 out_2d=slot.lin_post_conv_pre_silu,
             )
-        post_conv = F.silu(slot.lin_post_conv_pre_silu)
-        return post_conv.contiguous()
+        # F.silu over a contiguous slot tensor returns a fresh contiguous
+        # output; the trailing .contiguous() that used to be here was a
+        # no-op pass-through.
+        return F.silu(slot.lin_post_conv_pre_silu)
 
     def _fwd_qkv_heads(self, post_conv: torch.Tensor, slot) -> tuple[
         torch.Tensor, torch.Tensor, torch.Tensor,
@@ -761,20 +763,15 @@ class GatedDeltaNetBlock:
         k_h = k_p.reshape(T, cfg.num_k_heads, cfg.head_k_dim)
         v_h = v_p.reshape(T, cfg.num_v_heads, cfg.head_v_dim)
         # L2 norm per-(token, k_head) row, written directly into slot
-        # tensors (no torch.empty_like + .copy_ round-trip). Flatten the
-        # leading two axes for the FLA kernel; slot.lin_q is bf16
-        # contiguous (T, H, hk) so its .view(T*H, hk) is a free view.
-        TH = T * cfg.num_k_heads
-        _fla_l2norm_fwd_into(
-            x=q_h.contiguous().view(TH, cfg.head_k_dim),
-            y_out=slot.lin_q.view(TH, cfg.head_k_dim),
-            rstd_out=slot.lin_q_rstd.view(TH),
-        )
-        _fla_l2norm_fwd_into(
-            x=k_h.contiguous().view(TH, cfg.head_k_dim),
-            y_out=slot.lin_k.view(TH, cfg.head_k_dim),
-            rstd_out=slot.lin_k_rstd.view(TH),
-        )
+        # tensors. Our flextrain_l2norm_fwd_into accepts strided 3D
+        # input via runtime token/head strides, so q_h / k_h (which are
+        # strided slices of the conv output: stride(0)=conv_dim,
+        # stride(1)=head_k_dim, stride(2)=1) feed in zero-copy. The
+        # FLA wrapper required contiguous (T*H, D) input and forced a
+        # ~T*key_dim bf16 D2D copy per call before this change.
+        from flextrain.ops import flextrain_l2norm_fwd_into
+        flextrain_l2norm_fwd_into(q_h, slot.lin_q, slot.lin_q_rstd)
+        flextrain_l2norm_fwd_into(k_h, slot.lin_k, slot.lin_k_rstd)
         # v has no l2norm; it just needs to land in slot.lin_v. v_h is
         # a free view of post_conv (contiguous slice), but slot.lin_v
         # is its own buffer — we still need the copy here. Cheap (one
@@ -1233,17 +1230,16 @@ class GatedDeltaNetBlock:
         dv_h = dv_h.squeeze(0)                               # (T, n_v_heads, head_v_dim)
         dbeta = dbeta.squeeze(0)                             # (T, n_v_heads)
         dg = dg.squeeze(0)                                   # (T, n_v_heads)
-        # 3b. Back-propagate through the l2 norm. l2norm_bwd takes the
-        # *normalized* tensor (y), the saved rstd, and upstream
-        # gradient (dy); returns gradient in pre-l2norm space.
-        dq_h = l2norm_bwd(
-            q_n.contiguous(), q_rstd.contiguous(), dq_n.contiguous(),
-            eps=1e-6,
-        )
-        dk_h = l2norm_bwd(
-            k_n.contiguous(), k_rstd.contiguous(), dk_n.contiguous(),
-            eps=1e-6,
-        )
+        # 3b. Back-propagate through the l2 norm. Our strided-input
+        # bwd kernel takes (T, H, D) views directly so the saved q_n /
+        # k_n / q_rstd / k_rstd (slot tensors, contiguous) and the
+        # dq_n / dk_n FLA outputs (squeezed views, last-axis-contig)
+        # all feed in zero-copy.
+        from flextrain.ops import flextrain_l2norm_bwd_into
+        dq_h = torch.empty_like(q_n)
+        dk_h = torch.empty_like(k_n)
+        flextrain_l2norm_bwd_into(q_n, q_rstd, dq_n.contiguous(), dq_h)
+        flextrain_l2norm_bwd_into(k_n, k_rstd, dk_n.contiguous(), dk_h)
 
         # 4. Gate bwd.
         # beta = sigmoid(b). dbeta -> db_via_beta.

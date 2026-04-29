@@ -28,6 +28,10 @@ from ._kernels.gated_rmsnorm import (
     flextrain_gated_rmsnorm_bwd,
     flextrain_gated_rmsnorm_fwd,
 )
+from ._kernels.l2norm import (
+    flextrain_l2norm_bwd_into,
+    flextrain_l2norm_fwd_into,
+)
 from ._kernels.moe import (
     flextrain_copy_expert_counts,
     flextrain_fused_topk_softmax,
@@ -80,6 +84,8 @@ __all__ = [
     "flextrain_gate_prep_fwd",
     "flextrain_gated_rmsnorm_bwd",
     "flextrain_gated_rmsnorm_fwd",
+    "flextrain_l2norm_bwd_into",
+    "flextrain_l2norm_fwd_into",
     "flextrain_fused_topk_softmax",
     "flextrain_load_balance_bwd",
     "flextrain_moe_gather",
