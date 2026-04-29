@@ -490,6 +490,24 @@ def determine_working_set_config(
                 for s in layer_schemas
             )
         return int(transformer_saved_act_sizes(model_dims, c)[0])
+
+    def _full_act_slot_bytes(c: int) -> int:
+        """Per-slot device bytes at the FULL save level — bytes the GPU
+        activation ring actually reserves per slot. Schema-driven max
+        across layers when available so hybrid linear+full backbones
+        size the slot correctly: BufferManager uses
+        ``max(schema.device_size_bytes(...) for schema in layer_schemas)``
+        (see flextrain/engine/buffers.py:522), and the working_set's
+        chunk-selection arithmetic must agree or the engine raises
+        "gpu_act_buffer_size too small for a single activation slot"
+        immediately after construction.
+        """
+        if layer_schemas is not None and len(layer_schemas) > 0:
+            return max(
+                int(s.device_size_bytes(c, model_dims))
+                for s in layer_schemas
+            )
+        return int(full_act_slot_size_bytes(model_dims, c))
     if num_local_layers is None:
         num_local_layers = model_dims["n_layers"]
 
@@ -706,8 +724,31 @@ def determine_working_set_config(
     if fixed_seq_len:
         target_tokens_per_round = max(max_seq_len, target_tokens_per_round)
 
+    # Aggregate per-token activation cost across all layers.
+    #
+    # ``full_agg_act_bpt`` and ``min_act_bpt`` set the upper / lower
+    # ``target_tokens_per_round`` ceilings (line 731 below picks
+    # ``min_save_tokens_per_round`` as a hard cap). For hybrid
+    # linear+full attention backbones (Qwen3-Next / Qwen3.5* / Qwen3.6*),
+    # the dense-transformer ``min_act_slot_size_bytes`` heuristic
+    # under-counts level-0 bytes by 2-3x because it doesn't model the
+    # linear-attn ``lin_z`` / ``lin_*_rstd`` fields. That sets the
+    # ceiling 2-3x too high → ``_pick_chunk_size`` then rejects every
+    # candidate at the host check inside the loop because total round
+    # bytes ≈ ``target * n_layers * bpt`` is constant in chunk size.
+    #
+    # When schema-driven sizing is available (``layer_schemas``), use
+    # the worst-case ``max(home_size_bytes(1) for s in schemas) *
+    # n_layers`` — same metric the in-loop host check uses, so the
+    # ceiling and the per-option check are consistent.
+    if layer_schemas is not None and len(layer_schemas) > 0:
+        min_bpt_per_layer = max(
+            int(s.home_size_bytes(1, model_dims, 0)) for s in layer_schemas
+        )
+        min_act_bpt = num_local_layers * min_bpt_per_layer
+    else:
+        min_act_bpt = num_local_layers * min_act_slot_size_bytes(model_dims, 1)
     full_agg_act_bpt = num_local_layers * full_act_slot_size_bytes(model_dims, 1)
-    min_act_bpt = num_local_layers * min_act_slot_size_bytes(model_dims, 1)
     full_save_tokens_per_round = remaining_total_mem // full_agg_act_bpt
     min_save_tokens_per_round = remaining_total_mem // min_act_bpt
 
@@ -868,6 +909,7 @@ def determine_working_set_config(
         min_chunk_size=min_chunk_size,
         verbose=verbose,
         min_act_slot_fn=_min_act_slot_bytes,
+        full_act_slot_fn=_full_act_slot_bytes,
     )
 
     if best_option is None:
@@ -888,7 +930,7 @@ def determine_working_set_config(
     total_act_slots = best_option["total_act_slots"]
     gpu_act_slots = best_option["gpu_act_slots"]
 
-    full_act_slot = full_act_slot_size_bytes(model_dims, target_chunk_size)
+    full_act_slot = _full_act_slot_bytes(target_chunk_size)
     gpu_act_buffer_size_bytes = gpu_act_workspace_size_bytes
     endpoint_bytes = baseline.embed_bytes + baseline.head_bytes
 
@@ -1020,6 +1062,7 @@ def _pick_chunk_size(
     min_chunk_size: int | None,
     verbose: bool,
     min_act_slot_fn=None,
+    full_act_slot_fn=None,
 ) -> dict | None:
     """Greedy chunk-size selection. Mirrors orig:476-653.
 
@@ -1094,7 +1137,10 @@ def _pick_chunk_size(
         )
         cur_gpu -= baseline_act
 
-        full_act = full_act_slot_size_bytes(model_dims, chunk_size)
+        if full_act_slot_fn is not None:
+            full_act = int(full_act_slot_fn(chunk_size))
+        else:
+            full_act = full_act_slot_size_bytes(model_dims, chunk_size)
         if cur_gpu < full_act:
             continue
 
@@ -1152,9 +1198,17 @@ def _pick_chunk_size(
                 cur_gpu -= need_bytes
 
         # As many full additional layers (weights+grads+act-slots-per-chunk) as fit.
+        if full_act_slot_fn is not None:
+            multi_chunk_slot_bytes = int(
+                full_act_slot_fn(chunk_size * target_num_chunks)
+            )
+        else:
+            multi_chunk_slot_bytes = full_act_slot_size_bytes(
+                model_dims, chunk_size * target_num_chunks
+            )
         addl_full_layer_bytes = (
             backbone.weight_bytes + backbone.grad_bytes
-            + full_act_slot_size_bytes(model_dims, chunk_size * target_num_chunks)
+            + multi_chunk_slot_bytes
         )
         addl_complete = int(min(
             num_local_layers - 1,
@@ -1164,9 +1218,7 @@ def _pick_chunk_size(
         n_gpu_grad_layers += addl_complete
         complete_layers_bytes = addl_complete * addl_full_layer_bytes
         leftover = cur_gpu - complete_layers_bytes
-        gpu_act_workspace += addl_complete * full_act_slot_size_bytes(
-            model_dims, chunk_size * target_num_chunks
-        )
+        gpu_act_workspace += addl_complete * multi_chunk_slot_bytes
 
         # Final pass: prioritize getting to 2 layers/grads, then dump the
         # rest into act workspace (orig:603-610).
