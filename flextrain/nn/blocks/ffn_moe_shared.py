@@ -57,7 +57,6 @@ from dataclasses import dataclass
 from typing import Mapping, MutableMapping
 
 import torch
-import torch.nn.functional as F
 
 from flextrain.core.activation_schema import ActivationField
 from flextrain.core.layer import (
@@ -207,32 +206,51 @@ class MoESwiGLUSharedExpertFFN:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute shared-expert SwiGLU output (pre-gate, pre-sum).
 
+        Math: ``up || gate = x @ W_shared_up``, ``sh_act = up * silu(gate)``,
+        ``sh_each = sh_act @ W_shared_down``. All matmuls bf16; SwiGLU
+        fused via ``flextrain_swiglu_fwd``. Pack order on the last dim
+        of ``W_shared_up`` is ``[up | gate]`` (loader convention; see
+        ``flextrain/io/arch/qwen3_5_moe.py``).
+
         Returns:
-          * ``x_shared_pre``: (T, S, 2 * F_s) — pre-SwiGLU. Caller saves to slot.
-          * ``sh_each``:      (T, S, d_model)  — per-shared-expert output, pre-gate.
+          * ``x_shared_pre``: (T, S, 2 * F_s) — pre-SwiGLU bf16; saved to slot.
+          * ``sh_each``:      (T, S, d_model) — per-shared-expert output (bf16).
         """
+        from flextrain.ops import flextrain_swiglu_fwd
+
         cfg = self.cfg
         S = cfg.num_shared_experts
         Fs = cfg.shared_expert_dim
-        T = x_2d.shape[0]
 
-        # x @ w_shared_up: (T, d) × (S, d, 2F) → (T, S, 2F)
-        # Use bmm by broadcasting x to (S, T, d) and using matmul, OR
-        # einsum. einsum is most readable; PyTorch dispatches to bmm.
+        if S == 1:
+            # Fast path (Qwen3-Next/3.5/3.6): 2D bf16 matmul instead of bmm.
+            w_up = weights["w_shared_up"][0]                    # (d, 2F)
+            w_down = weights["w_shared_down"][0]                # (F, d)
+            x_shared_pre_2d = x_2d @ w_up                       # (T, 2F) bf16
+            up_half = x_shared_pre_2d[..., :Fs]
+            gate_half = x_shared_pre_2d[..., Fs:]
+            # flextrain_swiglu_fwd(x1, x3) = silu(x1) * x3. Math wants
+            # ``up * silu(gate)``, so pass x1=gate, x3=up.
+            sh_act_2d = flextrain_swiglu_fwd(gate_half, up_half)  # (T, F)
+            sh_each_2d = sh_act_2d @ w_down                       # (T, d)
+            # Re-introduce the leading S=1 dim so callers (and the slot
+            # field shape) see the canonical (T, S, ...) layout.
+            x_shared_pre = x_shared_pre_2d.unsqueeze(1)           # (T, 1, 2F)
+            sh_each = sh_each_2d.unsqueeze(1)                     # (T, 1, d)
+            return x_shared_pre, sh_each
+
+        # Generic S>1 path (DeepSeek-style). bf16 bmm via einsum;
+        # PyTorch dispatches to a tiled bmm which keeps everything in
+        # the compute dtype (no fp32 promotion).
         x_shared_pre = torch.einsum(
-            "td,sdf->tsf", x_2d.float(), weights["w_shared_up"].float()
-        ).to(x_2d.dtype)
-
-        # Split into [up, gate]; SwiGLU.
-        up_half = x_shared_pre[..., :Fs]
-        gate_half = x_shared_pre[..., Fs:]
-        sh_act = up_half * F.silu(gate_half.float()).to(x_2d.dtype)  # (T, S, F_s)
-
-        # sh_act @ w_shared_down: (T, S, F_s) × (S, F_s, d) → (T, S, d)
+            "td,sdf->tsf", x_2d, weights["w_shared_up"]
+        )                                                          # (T, S, 2F) bf16
+        up_half = x_shared_pre[..., :Fs].contiguous()
+        gate_half = x_shared_pre[..., Fs:].contiguous()
+        sh_act = flextrain_swiglu_fwd(gate_half, up_half)          # (T, S, F)
         sh_each = torch.einsum(
-            "tsf,sfd->tsd", sh_act.float(), weights["w_shared_down"].float()
-        ).to(x_2d.dtype)
-
+            "tsf,sfd->tsd", sh_act, weights["w_shared_down"]
+        )                                                          # (T, S, d)
         return x_shared_pre, sh_each
 
     def _shared_gate_fwd(
@@ -388,115 +406,163 @@ class MoESwiGLUSharedExpertFFN:
         # ------------------------------------------------------------------
         # Shared-expert bwd. Reverse of:
         #   sh_pre        = x @ w_shared_up           (T, S, 2F)
-        #   up, gate      = split(sh_pre, dim=-1)
+        #   up, gate      = split(sh_pre, dim=-1)     pack order: [up | gate]
         #   sh_act        = up * silu(gate)            (T, S, F)
-        #   sh_each       = einsum("tsf, sfd -> tsd")  (T, S, d)
+        #   sh_each       = sh_act @ w_shared_down     (T, S, d)
         #   sh_gate_pre   = x @ w_shared_expert_gate   (T, S)
         #   sh_gate       = sigmoid(sh_gate_pre)
         #   shared_out    = sum_s sh_gate[:, s] * sh_each[:, s, :]
+        #
+        # All matmul/SwiGLU bwd ops here run in bf16. The only
+        # surviving fp32 promotion is the sigmoid bwd
+        # ``sig * (1 - sig)`` on the (T, S) gate scalars — it's
+        # ~T*S elements (tiny, S=1 in production) and the math is
+        # genuinely sensitive to round-off on near-saturated gates.
         # ------------------------------------------------------------------
-        sig_gate = torch.sigmoid(slot.x_shared_gate.float()).to(slot.x_shared_gate.dtype)  # (T, S)
-        # Recompute sh_each from saved x_shared_pre + w_shared_down (cheap;
-        # no need to save sh_each separately).
-        x_shared_pre = slot.x_shared_pre                                    # (T, S, 2F)
+        from flextrain.ops import flextrain_swiglu_bwd
+
+        x_shared_pre = slot.x_shared_pre                                    # (T, S, 2F) bf16
         up_half = x_shared_pre[..., :Fs]                                     # (T, S, F)
         gate_half = x_shared_pre[..., Fs:]                                   # (T, S, F)
-        sh_act = up_half * F.silu(gate_half.float()).to(up_half.dtype)       # (T, S, F)
-        sh_each = torch.einsum(
-            "tsf,sfd->tsd", sh_act.float(), weights["w_shared_down"].float()
-        ).to(up_half.dtype)                                                  # (T, S, d)
 
-        # d/d(shared_out) = dy_resid; each shared expert's contribution is
-        # sh_gate[:,s] * sh_each[:,s,:] summed over s.
-        dy_2d = dy_resid                                                     # (T, d)
-        # d/d(sh_each[t, s, :]) = dy_resid[t, :] * sh_gate[t, s]
-        d_sh_each = dy_2d.unsqueeze(1) * sig_gate.unsqueeze(-1)              # (T, S, d)
-        # d/d(sh_gate[t, s]) = sum_d (dy_resid[t,d] * sh_each[t,s,d])
-        d_sh_gate = (dy_2d.unsqueeze(1) * sh_each).sum(dim=-1)               # (T, S)
-        # d/d(sh_gate_pre) = d_sh_gate * sigmoid(g) * (1 - sigmoid(g))
-        d_sh_gate_pre = (
-            d_sh_gate.float() * sig_gate.float() * (1.0 - sig_gate.float())
-        ).to(d_sh_gate.dtype)                                                # (T, S)
+        if S == 1:
+            # Fast path (Qwen3-Next/3.5/3.6).
+            up_2d = up_half.squeeze(1).contiguous()                          # (T, F)
+            gate_2d = gate_half.squeeze(1).contiguous()                      # (T, F)
+            w_down = weights["w_shared_down"][0]                             # (F, d)
+            w_up = weights["w_shared_up"][0]                                 # (d, 2F)
 
-        # w_shared_expert_gate grad: x.T @ d_sh_gate_pre  (d_model, S).
-        # The shared-expert gate is router-like (not LoRA-targeted by
-        # default; user can target it explicitly). When skipped, hand
-        # back (X, dY) -- but note this is a 2-D projection, so the
-        # callback fires with eid=-1.
-        if "g_shared_expert_gate" in skip_grads:
-            if lora_per_expert_callback is not None:
-                lora_per_expert_callback(
-                    "g_shared_expert_gate", -1, x_2d, d_sh_gate_pre,
-                )
-        elif grads.get("g_shared_expert_gate") is not None:
-            grads["g_shared_expert_gate"].add_(
-                (x_2d.float().T @ d_sh_gate_pre.float()).to(grads["g_shared_expert_gate"].dtype)
+            # sigmoid(g) and the sigmoid-derivative term: kept fp32
+            # only on the (T, 1) tensor for accuracy near saturation.
+            x_shared_gate_f = slot.x_shared_gate.float()                     # (T, 1)
+            sig_gate_f = x_shared_gate_f.sigmoid()
+            sig_gate = sig_gate_f.to(slot.x_shared_gate.dtype)
+
+            # Recompute sh_each via bf16 matmul (used for d_sh_gate).
+            # Cost: same shape as a single fwd down matmul.
+            # Avoids saving the (T, d) sh_each tensor.
+            # Path is: sh_act = silu(gate)*up; sh_each = sh_act @ w_down.
+            from flextrain.ops import flextrain_swiglu_fwd
+            sh_act_2d = flextrain_swiglu_fwd(gate_2d, up_2d)                 # (T, F)
+            sh_each_2d = sh_act_2d @ w_down                                  # (T, d) bf16
+
+            dy_2d = dy_resid                                                 # (T, d)
+            # d/d(sh_each) = dy * sig_gate.
+            d_sh_each_2d = dy_2d * sig_gate                                  # (T, d)
+            # d/d(sig_gate) = sum_d dy * sh_each. (T, 1) result.
+            d_sh_gate_2d = (dy_2d * sh_each_2d).sum(dim=-1, keepdim=True)    # (T, 1)
+            # d/d(sh_gate_pre) = d_sh_gate * sig*(1-sig). fp32-safe scalar op.
+            d_sh_gate_pre = (
+                d_sh_gate_2d.float() * sig_gate_f * (1.0 - sig_gate_f)
+            ).to(dy_resid.dtype)                                             # (T, 1)
+
+            # w_shared_expert_gate grad / dx via gate. Shape (d, 1) and
+            # (T, d). bf16 throughout.
+            if "g_shared_expert_gate" in skip_grads:
+                if lora_per_expert_callback is not None:
+                    lora_per_expert_callback(
+                        "g_shared_expert_gate", -1, x_2d, d_sh_gate_pre,
+                    )
+            elif grads.get("g_shared_expert_gate") is not None:
+                grads["g_shared_expert_gate"].addmm_(x_2d.T, d_sh_gate_pre)
+            dx_via_gate = d_sh_gate_pre @ weights["w_shared_expert_gate"].T  # (T, d) bf16
+
+            # Down-proj bwd: sh_each = sh_act @ w_down.
+            # d_sh_act = d_sh_each @ w_down.T;
+            # g_w_down += sh_act.T @ d_sh_each.
+            if "g_shared_down" in skip_grads:
+                if lora_per_expert_callback is not None:
+                    lora_per_expert_callback(
+                        "g_shared_down", 0, sh_act_2d, d_sh_each_2d,
+                    )
+            elif grads.get("g_shared_down") is not None:
+                # Stored shape: (S=1, F, d).
+                grads["g_shared_down"][0].addmm_(sh_act_2d.T, d_sh_each_2d)
+            d_sh_act_2d = d_sh_each_2d @ w_down.T                            # (T, F) bf16
+
+            # SwiGLU bwd: returns d_gate, d_up, and recomputed sh_act
+            # (which we already have, so discard).
+            d_gate_2d, d_up_2d = flextrain_swiglu_bwd(
+                gate_2d, up_2d, d_sh_act_2d,
             )
-        # dx via gate path: d_sh_gate_pre @ w_shared_expert_gate.T  (T, d_model)
-        dx_via_gate = (
-            d_sh_gate_pre.float() @ weights["w_shared_expert_gate"].float().T
-        ).to(dy_resid.dtype)
 
-        # Backprop through the down-proj einsum:
-        # sh_each[t,s,d] = sum_f sh_act[t,s,f] * w_down[s,f,d]
-        # d/d(w_down[s,f,d]) = sum_t sh_act[t,s,f] * d_sh_each[t,s,d]
-        # d/d(sh_act[t,s,f]) = sum_d w_down[s,f,d] * d_sh_each[t,s,d]
-        if "g_shared_down" in skip_grads:
-            if lora_per_expert_callback is not None:
-                # Per-shared-expert: call callback with eid=s, X=sh_act[t,s,:],
-                # dY=d_sh_each[t,s,:]. Stored A: (S, F, r), B: (S, r, d).
-                S = sh_act.shape[1]
-                for eid in range(S):
+            # Up-proj bwd: sh_pre = x @ w_up. Pack order [up | gate].
+            # d_sh_pre = cat([d_up, d_gate], dim=-1) (T, 2F).
+            # g_w_up += x.T @ d_sh_pre; dx += d_sh_pre @ w_up.T.
+            d_x_shared_pre_2d = torch.cat([d_up_2d, d_gate_2d], dim=-1)      # (T, 2F)
+            if "g_shared_up" in skip_grads:
+                if lora_per_expert_callback is not None:
                     lora_per_expert_callback(
-                        "g_shared_down", eid,
-                        sh_act[:, eid, :], d_sh_each[:, eid, :],
+                        "g_shared_up", 0, x_2d, d_x_shared_pre_2d,
                     )
-        elif grads.get("g_shared_down") is not None:
-            g_w_shared_down = torch.einsum(
-                "tsf,tsd->sfd", sh_act.float(), d_sh_each.float()
-            ).to(grads["g_shared_down"].dtype)
-            grads["g_shared_down"].add_(g_w_shared_down)
-        d_sh_act = torch.einsum(
-            "tsd,sfd->tsf",
-            d_sh_each.float(), weights["w_shared_down"].float(),
-        ).to(sh_act.dtype)                                                   # (T, S, F)
+            elif grads.get("g_shared_up") is not None:
+                grads["g_shared_up"][0].addmm_(x_2d.T, d_x_shared_pre_2d)
+            dx_via_shared_mlp = d_x_shared_pre_2d @ w_up.T                   # (T, d) bf16
 
-        # SwiGLU bwd: sh_act = up * silu(gate)
-        # d/d(up)   = d_sh_act * silu(gate)
-        # d/d(gate) = d_sh_act * up * silu'(gate)
-        # silu'(g) = sigmoid(g) * (1 + g * (1 - sigmoid(g)))
-        gate_f = gate_half.float()
-        sig_g = gate_f.sigmoid()
-        silu_gate = (gate_f * sig_g).to(up_half.dtype)
-        dsilu = (sig_g * (1.0 + gate_f * (1.0 - sig_g))).to(up_half.dtype)
-        d_up = d_sh_act * silu_gate
-        d_gate = d_sh_act * up_half * dsilu
-        # Concat into d_x_shared_pre  (T, S, 2F)
-        d_x_shared_pre = torch.cat([d_up, d_gate], dim=-1)
+        else:
+            # Generic S>1 path (DeepSeek-style). bf16 bmm/einsum throughout.
+            x_shared_gate_f = slot.x_shared_gate.float()                     # (T, S)
+            sig_gate_f = x_shared_gate_f.sigmoid()
+            sig_gate = sig_gate_f.to(slot.x_shared_gate.dtype)               # (T, S)
 
-        # Backprop through the up-proj einsum:
-        # sh_pre[t,s,f] = sum_d x[t,d] * w_up[s,d,f]
-        # d/d(w_up[s,d,f]) = sum_t x[t,d] * d_sh_pre[t,s,f]
-        # d/d(x[t,d])      = sum_{s,f} w_up[s,d,f] * d_sh_pre[t,s,f]
-        if "g_shared_up" in skip_grads:
-            if lora_per_expert_callback is not None:
-                # Per-shared-expert: X=x_2d (same for all S), dY=d_x_shared_pre[:, s, :].
-                # Stored A: (S, d, r), B: (S, r, F).
-                S = d_x_shared_pre.shape[1]
-                for eid in range(S):
+            # Recompute sh_act + sh_each in bf16.
+            from flextrain.ops import flextrain_swiglu_fwd
+            up_c = up_half.contiguous()
+            gate_c = gate_half.contiguous()
+            sh_act = flextrain_swiglu_fwd(gate_c, up_c)                      # (T, S, F)
+            sh_each = torch.einsum(
+                "tsf,sfd->tsd", sh_act, weights["w_shared_down"]
+            )                                                                # (T, S, d)
+
+            dy_2d = dy_resid                                                 # (T, d)
+            d_sh_each = dy_2d.unsqueeze(1) * sig_gate.unsqueeze(-1)          # (T, S, d)
+            d_sh_gate = (dy_2d.unsqueeze(1) * sh_each).sum(dim=-1)           # (T, S)
+            d_sh_gate_pre = (
+                d_sh_gate.float() * sig_gate_f * (1.0 - sig_gate_f)
+            ).to(dy_resid.dtype)                                             # (T, S)
+
+            if "g_shared_expert_gate" in skip_grads:
+                if lora_per_expert_callback is not None:
                     lora_per_expert_callback(
-                        "g_shared_up", eid,
-                        x_2d, d_x_shared_pre[:, eid, :],
+                        "g_shared_expert_gate", -1, x_2d, d_sh_gate_pre,
                     )
-        elif grads.get("g_shared_up") is not None:
-            g_w_shared_up = torch.einsum(
-                "td,tsf->sdf", x_2d.float(), d_x_shared_pre.float()
-            ).to(grads["g_shared_up"].dtype)
-            grads["g_shared_up"].add_(g_w_shared_up)
-        dx_via_shared_mlp = torch.einsum(
-            "tsf,sdf->td",
-            d_x_shared_pre.float(), weights["w_shared_up"].float(),
-        ).to(dy_resid.dtype)
+            elif grads.get("g_shared_expert_gate") is not None:
+                grads["g_shared_expert_gate"].addmm_(x_2d.T, d_sh_gate_pre)
+            dx_via_gate = d_sh_gate_pre @ weights["w_shared_expert_gate"].T  # (T, d)
+
+            if "g_shared_down" in skip_grads:
+                if lora_per_expert_callback is not None:
+                    for eid in range(S):
+                        lora_per_expert_callback(
+                            "g_shared_down", eid,
+                            sh_act[:, eid, :], d_sh_each[:, eid, :],
+                        )
+            elif grads.get("g_shared_down") is not None:
+                grads["g_shared_down"].add_(
+                    torch.einsum("tsf,tsd->sfd", sh_act, d_sh_each)
+                )
+            d_sh_act = torch.einsum(
+                "tsd,sfd->tsf", d_sh_each, weights["w_shared_down"]
+            )                                                                # (T, S, F)
+
+            # SwiGLU bwd, fused.
+            d_gate, d_up = flextrain_swiglu_bwd(gate_c, up_c, d_sh_act)
+            d_x_shared_pre = torch.cat([d_up, d_gate], dim=-1)               # (T, S, 2F)
+
+            if "g_shared_up" in skip_grads:
+                if lora_per_expert_callback is not None:
+                    for eid in range(S):
+                        lora_per_expert_callback(
+                            "g_shared_up", eid,
+                            x_2d, d_x_shared_pre[:, eid, :],
+                        )
+            elif grads.get("g_shared_up") is not None:
+                grads["g_shared_up"].add_(
+                    torch.einsum("td,tsf->sdf", x_2d, d_x_shared_pre)
+                )
+            dx_via_shared_mlp = torch.einsum(
+                "tsf,sdf->td", d_x_shared_pre, weights["w_shared_up"]
+            )                                                                # (T, d)
 
         # ------------------------------------------------------------------
         # Routed path bwd — delegate. The inner block accumulates

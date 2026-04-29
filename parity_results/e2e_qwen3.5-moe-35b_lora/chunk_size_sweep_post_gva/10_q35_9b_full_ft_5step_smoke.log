@@ -1,0 +1,63 @@
+Flash 3 not available. Exception: No module named 'flash_attn_interface'
+Memory budgets: gpu=22.0GiB (user), host=100.0GiB (user)
+Train config: model=models/Qwen3.5-9B mode=full seq_len=2048 steps=5 batch_tokens=16384
+Probing hardware (sustained matmul + memory bandwidth + PCIe; ~14s)...
+[HW Probe] sustained_tflops=64.4 (first half 64.1 -> second half 64.4, throttle drop -0.4%), pcie_bw_gbps=15.6, mem_bw_gbps=799.3 [matmul 4096^2 ran 14.5s; PCIe 256MiB per call 17.20ms]
+Preparing model from models/Qwen3.5-9B. This includes the working-set solve, engine construction, and HF weight load.
+[Working Set Log] Probing hardware capacity + bandwidth...
+[Working Set Log] Raw Observed Available GPU Memory Capacity of 22.83GiB and Host Memory Capacity of 118.19GiB
+[Working Set Log] Inputted Max GPU Memory of 22.00GiB
+[Working Set Log] Inputted Max Host Memory of 100.00GiB
+[Working Set Log] Using Leeway of 5.00GiB for GPU Memory and 10.00GiB for Host Memory
+[Working Set Log] After Baseline Model Memory Requirements and Accounting for Set Memory Bounds, Determined: Remaining GPU Memory of 1.03GiB and Remaining Host Memory of 22.77GiB
+[Working Set Log] Orig max tok per round: 64991
+	Max global batch tokens: 16384
+[Working Set Log] Determined Max Tokens Per Round of 16384 based on aggregate available memory of 23.80GiB, and GPU memory of 1.03GiB
+[Working Set Log] Observed Layer Transfer Duration of 27.99 ms, Estimated Peak TFLOPS: 64.39, PCIe BW: 15.60 GB/s
+[Working Set Log] Baseline Target Tokens Per Round for Sufficient Computation Time: 9342
+[Working Set Log] Based on aggregate available memory to save all activations must use <= 9276 tokens per round and to save minimum activations must use <= 64529 tokens per round
+[Working Set Log] Comparing prior tokens per round: 9342 with max seq len: 2048, full save tokens per round: 9276, min save tokens per round: 64529 and max tokens per round: 16384
+[Working Set Log] Comparing prior tokens per round: 8192 with min chunk size: None and max global batch tokens: 16384
+[Working Set Log] Determined Initial Target Min Chunk Size Est (based on Arithmetic Intensity bound x factor of 2) of: 165.45059481926324
+[Working Set Log] Chunk Size Options: [8192, 4096, 2048, 1024, 512, 256]
+[Working Set Log] Before deciding chunk size, observe remaining gpu mem bytes as: 1106001152, target tokens per round: 8192
+[Working Set Log] Selected Best Option: {'target_chunk_size': 512, 'target_num_chunks': 16, 'n_gpu_layers': 1, 'n_gpu_grad_layers': 1, 'n_gpu_opt_layers': 1, 'gpu_act_workspace_size_bytes': 921451776, 'gpu_act_slots': 14, 'total_act_slots': 512, 'act_slot_size_bytes': 65277952}
+[Working Set Log] Determined Target Max Chunk Size of 512, Target Tokens Per Round of 8192
+	Act Slot Size: 62.25MiB
+	# GPU Full Act Slots: 14
+	# Host Act Slots: 498
+	# GPU Act Buffer Size: 0.86GiB
+	# Host Act Buffer Size: 22.77GiB
+[Working Set Log] Expected GPU Memory Usage: 17.00GiB, Expected Host Memory Usage: 90.00GiB
+[from_pretrained] Building engine + pinning host buffers (this can take 10-60s for large models)...
+[BufferManager] Pinning host master/grad/opt for 32 backbone layers...
+[BufferManager]   layer 8/32 pinned
+[BufferManager]   layer 16/32 pinned
+[BufferManager]   layer 24/32 pinned
+[BufferManager]   layer 32/32 pinned
+[BufferManager] Pinning host activation buffer (22.77 GiB)... This is one big cudaHostRegister and can take 10-30s.
+[BufferManager] Host activation buffer pinned.
+[BufferManager] Allocating GPU embed+head buffers...
+[BufferManager] Allocating KV context windows...
+[BufferManager] BufferManager construction complete.
+[from_pretrained] Engine ready. GPU mem after engine init: 10.22 GiB used / 23.56 GiB total.
+[from_pretrained] Loading HF safetensors from models/Qwen3.5-9B...
+[from_pretrained] Weights loaded.
+Model is ready. Building tokenizer-backed SFT data source...
+Dataset ready from /home/shein/Documents/flextrain/datasets/mathinstruct.jsonl. Output dir: runs/Qwen3.5-9B_full_sl2048
+Starting training loop: steps=5 max_seq_len=2048 global_batch_tokens=16384
+First step may take a while due to weight staging, kernel warmup, and the initial forward/backward pass.
+[Save Level Plan] 16 chunks x 32 layers; breakdown: level 3: 457, level 0: 41, level -1: 14. Host act bytes saved: 20.81GiB / 22.77GiB. Final Recompute Time: 79.26ms / 1413.40ms, Final Recompute Frac: 0.0561
+[step     1/5]  lr=3.00e-05  loss=1.2585  smoothed=1.2585  tok/step=16249  tok/s=489  TFLOPS=21.21  max_alloc=13.2GiB  max_reserve=15.0GiB  step=33261ms  elapsed=33.3s
+[step     2/5]  lr=3.00e-05  loss=0.8474  smoothed=1.2379  tok/step=16309  tok/s=483  TFLOPS=21.00  max_alloc=13.2GiB  max_reserve=15.0GiB  step=33763ms  elapsed=67.1s
+[step     3/5]  lr=3.00e-05  loss=0.7261  smoothed=1.2123  tok/step=16259  tok/s=489  TFLOPS=21.21  max_alloc=13.2GiB  max_reserve=15.0GiB  step=33271ms  elapsed=100.4s
+[step     4/5]  lr=3.00e-05  loss=0.6996  smoothed=1.1867  tok/step=16303  tok/s=465  TFLOPS=20.19  max_alloc=13.2GiB  max_reserve=15.0GiB  step=35093ms  elapsed=135.5s
+[step     5/5]  lr=3.00e-06  loss=0.8225  smoothed=1.1685  tok/step=16356  tok/s=490  TFLOPS=21.30  max_alloc=13.2GiB  max_reserve=15.0GiB  step=33369ms  elapsed=168.9s
+
+Training complete.
+  total time:          2.8 min
+  total tokens:        0.08 M
+  overall tok/s:       482
+  overall TFLOPS:      20.95
+  max alloc / reserve: 13.24GiB / 15.00GiB
+Skipped final checkpoint export (--save not set)
