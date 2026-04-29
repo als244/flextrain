@@ -40,7 +40,9 @@ Activation schema (max_tier=3):
     ``lin_core_out``                                          -- FLA output
 * Tier 3 — recomputable via ``fwd_recompute_post_conv`` from x_inp:
     ``lin_conv_in``                                           -- pre-conv qkv concat
-    ``lin_post_conv_pre_silu``                                -- conv output (pre-silu)
+NOTE: post-conv (silu output) is NOT saved. Bwd recomputes pre-silu by
+re-running the conv with activation=None into a scratch buffer (FLA's
+pattern). Saves ~T*conv_dim bf16 per layer of activation memory.
 """
 from __future__ import annotations
 
@@ -96,14 +98,15 @@ def _fla_causal_conv1d_fwd_into(
     *,
     cu_seqlens: torch.Tensor | None = None,
     bt: int = 64,
+    activation: str | None = None,
 ) -> None:
     """Direct call into FLA's ``causal_conv1d_fwd_kernel`` writing into
     a caller-supplied output buffer.
 
     The upstream ``causal_conv1d_fwd`` python helper allocates output
-    via ``torch.empty_like(x)`` and returns it; for our use case we
-    want the kernel to write directly into ``slot.lin_post_conv_pre_silu``
-    so the post-conv ``slot.copy_(...)`` D2D memcpy can be eliminated.
+    via ``torch.empty_like(x)`` and returns it; bypassing it lets us
+    write the conv output directly into a caller-supplied scratch
+    buffer (avoiding a (T, conv_dim) bf16 D2D memcpy).
 
     We mimic that helper's preprocessing (rearrange, stride read,
     chunk_indices for varlen) but skip the allocation. The output
@@ -147,7 +150,7 @@ def _fla_causal_conv1d_fwd_into(
         stride_x_n=stride_x_n,
         stride_x_t=stride_x_t,
         stride_x_d=stride_x_d,
-        ACTIVATION=None,
+        ACTIVATION=activation,
     )
 
 
@@ -560,11 +563,12 @@ class GatedDeltaNetBlock:
                 lambda n, d: (n, 2 * cfg.key_dim + 2 * cfg.value_dim),
                 bf, tier=3,
             ),
-            ActivationField(
-                "lin_post_conv_pre_silu",
-                lambda n, d: (n, cfg.conv_dim),
-                bf, tier=3,
-            ),
+            # NB: post-conv (silu output) is NOT saved. Following FLA's
+            # pattern, the linear-attn bwd recomputes pre-silu by re-
+            # running the conv with activation=None into a scratch
+            # buffer; no separate persistent slot field is needed.
+            # Saves ~T*conv_dim bf16 per layer of activation memory
+            # (e.g. ~268 MiB at T=16k, conv_dim=8192).
         )
 
     def param_spec(self) -> ParamSpec:
@@ -674,54 +678,32 @@ class GatedDeltaNetBlock:
         self,
         conv_in: torch.Tensor,
         weights: Mapping[str, torch.Tensor],
-        slot,
-        *,
-        skip_already_saved: bool = False,
+        ctx: LayerContext,
     ) -> torch.Tensor:
-        """Stage 2: depthwise causal conv1d. Saves ``lin_post_conv_pre_silu``.
+        """Stage 2: depthwise causal conv1d + silu, fused.
 
-        Uses FLA's ``causal_conv1d_fwd`` Triton kernel (~16x faster
-        than torch's ``F.conv1d`` at our sizes, e.g. 20.8 ms -> 1.27
-        ms at T=32768 conv_dim=8192 on RTX 3090). FLA expects
-        ``x: (B, T, D)`` and ``weight: (D, W)``, matching our (T, D)
-        layout after a single ``unsqueeze(0)`` — no transpose needed.
+        Uses FLA's ``causal_conv1d_fwd_kernel`` with ``ACTIVATION='silu'``
+        — the kernel applies sigmoid(b_y)*b_y inside its epilogue, so we
+        avoid a separate ~T*conv_dim bf16 silu pass over HBM.
 
-        We pass ``activation=None`` here (we still need to save the
-        pre-silu intermediate for tier-3 recompute compatibility), then
-        apply silu separately. The activation fusion in FLA is ~5us at
-        these sizes — negligible vs the ~1ms conv body — so leaving it
-        out has no perf cost.
-
-        Returns ``post_conv`` (silu output, shape ``(T, conv_dim)``).
-
-        We call FLA's ``causal_conv1d_fwd_kernel`` directly through a
-        thin wrapper (:func:`_fla_causal_conv1d_fwd_into`) instead of
-        the python ``causal_conv1d_fwd`` helper so we can supply
-        ``slot.lin_post_conv_pre_silu`` as the output buffer — saving
-        a (T, conv_dim) bf16 D2D memcpy per layer per fwd. (FLA's
-        helper does ``y = torch.empty_like(x)`` internally, then we'd
-        have to ``slot.copy_(y)`` after.)
+        Returns ``post_conv`` (silu output, shape ``(T, conv_dim)``)
+        allocated from scratch — no slot field for the conv output. The
+        bwd path recomputes pre-silu via a conv with activation=None
+        when it needs to silu_bwd.
         """
         cfg = self.cfg
         # FLA weight shape is (D, W); our slot weight is (D, 1, W) for
         # depthwise compatibility with torch.conv1d. Squeeze the middle.
         w = weights["w_lin_conv"].squeeze(1).contiguous()
-        # cu_seqlens for varlen (None when no chunk metadata available).
-        # Currently the only caller of _fwd_conv is the fwd path which
-        # invokes us without chunk; the fla bwd recovers cu_seqlens
-        # via its own re-fwd call site so we don't need to pass here.
-        # Production callers thread chunk through _fwd_fla; conv runs
-        # the same depthwise op regardless.
-        if not (skip_already_saved and slot.has("lin_post_conv_pre_silu")):
-            _fla_causal_conv1d_fwd_into(
-                x_2d=conv_in,
-                weight=w,
-                out_2d=slot.lin_post_conv_pre_silu,
-            )
-        # F.silu over a contiguous slot tensor returns a fresh contiguous
-        # output; the trailing .contiguous() that used to be here was a
-        # no-op pass-through.
-        return F.silu(slot.lin_post_conv_pre_silu)
+        T = conv_in.shape[0]
+        post_conv = ctx.scratch((T, cfg.conv_dim), cfg.compute_dtype)
+        _fla_causal_conv1d_fwd_into(
+            x_2d=conv_in,
+            weight=w,
+            out_2d=post_conv,
+            activation="silu",
+        )
+        return post_conv
 
     def _fwd_qkv_heads(self, post_conv: torch.Tensor, slot) -> tuple[
         torch.Tensor, torch.Tensor, torch.Tensor,
@@ -894,7 +876,7 @@ class GatedDeltaNetBlock:
             chunk.fla_chunk_indices_64 if chunk is not None else None
         )
         z, conv_in = self._fwd_proj_split(x, weights, slot)
-        post_conv = self._fwd_conv(conv_in, weights, slot)
+        post_conv = self._fwd_conv(conv_in, weights, ctx)
         q_n, k_n, v_h, _q_rstd, _k_rstd = self._fwd_qkv_heads(post_conv, slot)
         b, a = _split_ba_ft(slot.lin_ba, self.cfg)
         g, beta = self._fwd_gate_and_beta(a, b, weights, slot)
@@ -937,35 +919,20 @@ class GatedDeltaNetBlock:
         x: torch.Tensor,
         weights: Mapping[str, torch.Tensor],
         slot,
+        ctx: LayerContext,
     ) -> torch.Tensor:
         """Tier-3 recompute: re-run ``x @ W_qkvz`` (and ``x @ W_ba``)
-        plus the conv stage when the saved ``lin_qkvz`` /
-        ``lin_post_conv_pre_silu`` weren't persisted by the save-level
-        DP. ``slot.has("lin_qkvz")`` / ``slot.has("lin_ba")`` short-
-        circuit when the slot already holds valid data from the original
-        fwd's persist; same for ``lin_post_conv_pre_silu``.
+        plus the conv stage when the saved ``lin_qkvz`` wasn't persisted
+        by the save-level DP. ``slot.has("lin_qkvz")`` /
+        ``slot.has("lin_ba")`` short-circuit when the slot already holds
+        valid data from the original fwd's persist.
 
-        Returns the post-silu ``post_conv`` tensor (T, conv_dim) for
-        the caller to feed into stage 3."""
+        Returns the post-silu ``post_conv`` tensor (T, conv_dim) from
+        scratch for the caller to feed into stage 3."""
         _z, conv_in = self._fwd_proj_split(
             x, weights, slot, skip_already_saved=True,
         )
-        return self._fwd_conv(conv_in, weights, slot, skip_already_saved=True)
-
-    def fwd_recompute_qkv_heads(self, slot) -> tuple[
-        torch.Tensor, torch.Tensor, torch.Tensor,
-    ]:
-        """Tier-2 recompute: re-derive Q/K/V from saved
-        ``lin_post_conv_pre_silu``. Cheaper than tier-3 (no conv1d
-        re-run, just silu + reshape + repeat-interleave).
-
-        Returns ``(q_h, k_h, v_h)``."""
-        cfg = self.cfg
-        # Reapply silu to saved pre-silu.
-        post_conv = F.silu(slot.lin_post_conv_pre_silu.float()).to(
-            slot.lin_post_conv_pre_silu.dtype
-        )
-        return self._fwd_qkv_heads(post_conv, slot)
+        return self._fwd_conv(conv_in, weights, ctx)
 
     def fwd_recompute_fla(
         self,
@@ -1095,7 +1062,8 @@ class GatedDeltaNetBlock:
           (``[:, 2*key_dim+value_dim:].view(T, HV, hv)``).
         * ``slot.lin_ba`` — full ``x @ W_ba`` output in FT ``[B | A]``
           layout. b/a are zero-copy slices.
-        * ``slot.lin_post_conv_pre_silu`` — conv1d output (silu input).
+        * (post-conv pre-silu is NOT saved; recomputed via conv-without-
+          activation into scratch at the top of bwd. FLA's pattern.)
         * ``slot.lin_q``, ``lin_k``, ``lin_v`` — post-conv-silu Q/K/V
           (the inputs to FLA).
         * ``slot.lin_g`` — pre-cumsum gate.
@@ -1136,7 +1104,19 @@ class GatedDeltaNetBlock:
         g = slot.lin_g                                       # (T, n_v_heads) fp32
         core_out = slot.lin_core_out                         # (T, n_v_heads, head_v_dim)
         conv_in = slot.lin_qkvz[:, :cfg.conv_dim]            # (T, conv_dim) view
-        post_conv_pre_silu = slot.lin_post_conv_pre_silu     # (T, conv_dim)
+        # post-conv pre-silu is no longer in the schema; recompute it
+        # by re-running the conv with activation=None into scratch (FLA
+        # does the same in their bwd path). flextrain_silu_bwd needs
+        # the pre-silu input, not post-silu.
+        post_conv_pre_silu = ctx.scratch(
+            (T, cfg.conv_dim), cfg.compute_dtype,
+        )
+        _fla_causal_conv1d_fwd_into(
+            x_2d=conv_in,
+            weight=weights["w_lin_conv"].squeeze(1).contiguous(),
+            out_2d=post_conv_pre_silu,
+            activation=None,
+        )
         # FLA outputs from fwd. ``lin_A_int`` shape is
         # (T, n_v_heads, 64); add batch dim for FLA. lin_A_int is bf16
         # in the slot but FLA's bwd accepts bf16 directly.

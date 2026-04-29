@@ -464,15 +464,17 @@ class Qwen3_5LinearLayer:
         self, slot, chunk: ChunkMeta, weights, ctx: LayerContext,
     ) -> None:
         cfg = self.cfg
-        if not slot.has("lin_post_conv_pre_silu"):
+        # post-conv is never saved (transient since Stage D2). If
+        # tier-2 Q/K/V are missing, re-run conv from x_inp into scratch
+        # then run qkv_heads.
+        if not slot.has("lin_q"):
             attn_norm_output = self.attn_norm.fwd_from_rstd(
                 slot.x_inp, weights, slot.attn_norm_rstd,
             )
-            self.lin_attn.fwd_recompute_post_conv(
-                attn_norm_output, weights, slot,
+            post_conv = self.lin_attn.fwd_recompute_post_conv(
+                attn_norm_output, weights, slot, ctx,
             )
-        if not slot.has("lin_q"):
-            self.lin_attn.fwd_recompute_qkv_heads(slot)
+            self.lin_attn._fwd_qkv_heads(post_conv, slot)
         if not slot.has("lin_core_out") or not slot.has("lin_A_int"):
             self.lin_attn.fwd_recompute_fla(weights, slot, chunk)
         recompute_x1 = not slot.has("x1")
