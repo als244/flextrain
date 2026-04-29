@@ -71,6 +71,11 @@ def main():
         k_seq_offsets=torch.tensor([0, T], dtype=torch.int32, device=DEVICE),
         q_seq_lens=seq_lens,
         k_seq_lens=seq_lens,
+        q_seq_offsets_i64=torch.tensor([0, T], dtype=torch.int64, device=DEVICE),
+        fla_chunk_indices_64=torch.tensor(
+            [[0, c] for c in range((T + 63) // 64)],
+            dtype=torch.int64, device=DEVICE,
+        ).reshape(-1, 2),
         seq_lens_host=[T],
         prior_seq_lens_host=[0],
         prior_seq_offsets_host=[0],

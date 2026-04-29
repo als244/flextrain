@@ -814,6 +814,7 @@ class GatedDeltaNetBlock:
     def _fwd_fla(
         self, q_n, k_n, v_h, g, beta, slot,
         cu_seqlens: torch.Tensor | None = None,
+        chunk_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Stage 5: FLA chunk-gated-delta-rule. Saves ``lin_core_out``,
         ``lin_A_int``, ``lin_g_post``. Returns ``core_out`` for the
@@ -828,6 +829,12 @@ class GatedDeltaNetBlock:
         packed sequence ends inside this chunk's flattened token axis;
         without it, FLA would let the recurrent state leak across
         sequence boundaries (treats the whole chunk as one sequence).
+
+        ``chunk_indices`` (shape ``(num_64_chunks, 2)``, int64) is FLA's
+        per-(seq, intra-seq-chunk) lookup table at chunk_size=64. When
+        passed, FLA skips its internal ``prepare_chunk_indices`` call
+        whose ``.tolist()`` is a D->H sync; we precompute host-side in
+        ``ChunkMeta.build``.
         """
         cfg = self.cfg
         bf = cfg.compute_dtype
@@ -841,6 +848,7 @@ class GatedDeltaNetBlock:
             beta.unsqueeze(0).contiguous(),
             scale=scale, initial_state=None,
             output_final_state=False, cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
         )
         o = o.squeeze(0)
         slot.lin_g_post.copy_(g_post.squeeze(0))
@@ -884,8 +892,9 @@ class GatedDeltaNetBlock:
         (e.g. unit tests on a single sequence); production layers
         always pass it.
         """
-        cu_seqlens = (
-            chunk.q_seq_offsets.to(torch.int64) if chunk is not None else None
+        cu_seqlens = chunk.q_seq_offsets_i64 if chunk is not None else None
+        chunk_indices = (
+            chunk.fla_chunk_indices_64 if chunk is not None else None
         )
         z, conv_in = self._fwd_proj_split(x, weights, slot)
         post_conv = self._fwd_conv(conv_in, weights, slot)
@@ -893,7 +902,8 @@ class GatedDeltaNetBlock:
         b, a = _split_ba_ft(slot.lin_ba, self.cfg)
         g, beta = self._fwd_gate_and_beta(a, b, weights, slot)
         core_out = self._fwd_fla(
-            q_n, k_n, v_h, g, beta, slot, cu_seqlens=cu_seqlens,
+            q_n, k_n, v_h, g, beta, slot,
+            cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
         )
         return self._fwd_norm_out(core_out, z, weights)
 
@@ -985,12 +995,14 @@ class GatedDeltaNetBlock:
             a, b,
             weights["w_lin_A_log"], weights["w_lin_dt_bias"],
         )
-        cu_seqlens = (
-            chunk.q_seq_offsets.to(torch.int64) if chunk is not None else None
+        cu_seqlens = chunk.q_seq_offsets_i64 if chunk is not None else None
+        chunk_indices = (
+            chunk.fla_chunk_indices_64 if chunk is not None else None
         )
         return self._fwd_fla(
             slot.lin_q, slot.lin_k, slot.lin_v,
-            slot.lin_g, beta, slot, cu_seqlens=cu_seqlens,
+            slot.lin_g, beta, slot,
+            cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
         )
 
     def _gated_rmsnorm_bwd(
@@ -1207,13 +1219,14 @@ class GatedDeltaNetBlock:
         beta_b = beta.unsqueeze(0).contiguous()
         do_b = do.unsqueeze(0).contiguous()
         scale = cfg.head_k_dim ** -0.5
-        cu_seqlens = (
-            chunk.q_seq_offsets.to(torch.int64) if chunk is not None else None
+        cu_seqlens = chunk.q_seq_offsets_i64 if chunk is not None else None
+        chunk_indices = (
+            chunk.fla_chunk_indices_64 if chunk is not None else None
         )
         dq_n, dk_n, dv_h, dbeta, dg, _, _, _ = chunk_gated_delta_rule_bwd(
             q=q_b, k=k_b, v=v_b, g=g_post, beta=beta_b, A=A_int,
             scale=scale, initial_state=None, do=do_b, dht=None,
-            cu_seqlens=cu_seqlens,
+            cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
         )
         dq_n = dq_n.squeeze(0)                               # (T, n_k_heads, head_k_dim)
         dk_n = dk_n.squeeze(0)

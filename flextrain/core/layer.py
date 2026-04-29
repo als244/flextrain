@@ -338,6 +338,22 @@ class ChunkMeta:
     k_seq_offsets: torch.Tensor
     q_seq_lens: torch.Tensor
     k_seq_lens: torch.Tensor
+    # int64 mirror of q_seq_offsets, kept stable per chunk for FLA's
+    # cu_seqlens kwarg. FLA's prepare_chunk_indices is identity-cached
+    # (fla.utils.tensor_cache); without a stable identity, every layer
+    # builds a fresh int64 tensor via .to(int64) and forces a D->H sync
+    # via .tolist() inside prepare_chunk_indices. Computing once here
+    # gives all linear-attn layers the same tensor object so the cache
+    # hits after layer 0.
+    q_seq_offsets_i64: torch.Tensor
+    # FLA chunk_indices for chunk_size=64 (the chunk size hard-coded in
+    # ``chunk_gated_delta_rule``). Shape (num_64_chunks, 2) int64:
+    # row k = (seq_idx, intra_seq_chunk_idx) for the k-th 64-token block
+    # in the packed flat-token axis. FLA derives this internally via
+    # ``prepare_chunk_indices`` whose .tolist() is the only D->H sync in
+    # the linear-attn fwd path; precomputing host-side from seq_lens
+    # eliminates that sync entirely.
+    fla_chunk_indices_64: torch.Tensor
     max_seqlen_q: int
     max_seqlen_k: int
     # per-sequence prior context length (host copies used for KV placement)
@@ -370,6 +386,20 @@ class ChunkMeta:
         q_seq_offsets = torch.tensor(
             [0] + list(np.cumsum(seq_lens)), dtype=torch.int32, device=device
         )
+        q_seq_offsets_i64 = q_seq_offsets.to(torch.int64)
+        # Precompute FLA's chunk_indices (chunk_size=64) host-side from
+        # seq_lens. Mirrors fla.ops.utils.index.prepare_chunk_indices but
+        # without the .tolist() D->H sync. Each row is (seq_idx,
+        # intra_seq_chunk_idx); rows ordered by chunk in the flat-token
+        # axis.
+        _ci_rows: list[tuple[int, int]] = []
+        for s_idx, L in enumerate(seq_lens):
+            n_chunks = (int(L) + 63) // 64
+            for c in range(n_chunks):
+                _ci_rows.append((s_idx, c))
+        fla_chunk_indices_64 = torch.tensor(
+            _ci_rows, dtype=torch.int64, device=device,
+        ).reshape(-1, 2)
         k_seq_offsets = torch.tensor(
             [0]
             + list(np.cumsum(np.array(seq_lens) + np.array(prior_seq_lens))),
@@ -401,6 +431,8 @@ class ChunkMeta:
             k_seq_offsets=k_seq_offsets,
             q_seq_lens=q_seq_lens,
             k_seq_lens=k_seq_lens,
+            q_seq_offsets_i64=q_seq_offsets_i64,
+            fla_chunk_indices_64=fla_chunk_indices_64,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
             prior_seq_lens_host=list(prior_seq_lens),
