@@ -390,6 +390,50 @@ def _baseline_gpu_activation_memory(
         chunk_size * (4 * n_h * hd + 4 * n_kv * hd) * sz_act
     )
 
+    # Per-chunk linear-attention bwd workspace (Qwen3-Next / Qwen3.5* /
+    # Qwen3.6* hybrid layers). Not all archs have linear-attn layers,
+    # but when they do they allocate substantial transient buffers in
+    # ``GatedDeltaNetBlock.bwd`` that the dense-transformer accounting
+    # above doesn't capture:
+    #   * ``q_n``, ``k_n`` fp32 promotions:        2 * T * key_dim * 4
+    #   * ``d_post_conv`` (cat of dq/dk/dv pre):   T * conv_dim * 2
+    #   * ``d_conv_in`` (conv1d input grad):       T * conv_dim * 2
+    #   * ``d_qkvz`` (cat output for proj wgrad):  T * proj_qkvz_dim * 2
+    #   * FLA bwd internal scratch (rough bound):  T * value_dim * 2
+    # We size for the worst case: every in-flight chunk could be on a
+    # linear-attn layer simultaneously. ``conv_dim = 2*key_dim + value_dim``
+    # and ``proj_qkvz_dim = 2*key_dim + 2*value_dim``.
+    num_v_heads = model_dims.get("num_v_heads") or model_dims.get(
+        "linear_num_v_heads"
+    )
+    head_v_dim = model_dims.get("head_v_dim") or model_dims.get(
+        "linear_head_v_dim"
+    )
+    num_k_heads = model_dims.get("num_k_heads") or model_dims.get(
+        "linear_num_k_heads"
+    )
+    head_k_dim = model_dims.get("head_k_dim") or model_dims.get(
+        "linear_head_k_dim"
+    )
+    if num_v_heads and head_v_dim and num_k_heads and head_k_dim:
+        key_dim = num_k_heads * head_k_dim
+        value_dim = num_v_heads * head_v_dim
+        conv_dim = 2 * key_dim + value_dim
+        proj_qkvz_dim = 2 * key_dim + 2 * value_dim
+        fp32 = torch.float32.itemsize
+        lin_attn_workspace = (
+            2 * chunk_size * key_dim * fp32          # q_n + k_n fp32
+            + chunk_size * conv_dim * sz_act          # d_post_conv
+            + chunk_size * conv_dim * sz_act          # d_conv_in
+            + chunk_size * proj_qkvz_dim * sz_act     # d_qkvz
+            + chunk_size * value_dim * sz_act         # FLA bwd scratch
+        )
+        # The fwd only needs the q_n/k_n fp32 promotions and the FLA
+        # outputs; bwd is the dominant case. Take ``max`` with attn
+        # workspace because they can't be live simultaneously (each
+        # layer is either full-attn or linear-attn, not both).
+        attn_workspace = max(attn_workspace, lin_attn_workspace)
+
     # Per-chunk MLP workspace: depends on whether routed experts exist.
     expert_dim = model_dims["expert_dim"]
     top_k = model_dims["top_k"]
