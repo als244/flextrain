@@ -1,0 +1,69 @@
+Flash 3 not available. Exception: No module named 'flash_attn_interface'
+Memory budgets: gpu=22.5GiB (user), host=110.0GiB (user)
+Train config: model=models/Qwen3.5-35B-A3B mode=lora seq_len=2048 steps=5 batch_tokens=65536
+Probing hardware (sustained matmul + memory bandwidth + PCIe; ~14s)...
+[HW Probe] sustained_tflops=63.9 (first half 64.3 -> second half 63.9, throttle drop 0.6%), pcie_bw_gbps=16.5, mem_bw_gbps=794.4 [matmul 4096^2 ran 14.5s; PCIe 256MiB per call 16.30ms]
+Preparing model from models/Qwen3.5-35B-A3B. This includes the working-set solve, engine construction, and HF weight load.
+[Working Set Log] Probing hardware capacity + bandwidth...
+[Working Set Log] Raw Observed Available GPU Memory Capacity of 22.83GiB and Host Memory Capacity of 118.11GiB
+[Working Set Log] Inputted Max GPU Memory of 22.50GiB
+[Working Set Log] Inputted Max Host Memory of 110.00GiB
+[Working Set Log] Using Leeway of 5.00GiB for GPU Memory and 10.00GiB for Host Memory
+[Working Set Log] After Baseline Model Memory Requirements and Accounting for Set Memory Bounds, Determined: Remaining GPU Memory of 13.95GiB and Remaining Host Memory of 28.33GiB
+[Working Set Log] Orig max tok per round: 184731
+	Max global batch tokens: 65536
+[Working Set Log] Determined Max Tokens Per Round of 65536 based on aggregate available memory of 42.28GiB, and GPU memory of 13.95GiB
+[Working Set Log] Observed Layer Transfer Duration of 105.18 ms, Estimated Peak TFLOPS: 63.93, PCIe BW: 16.47 GB/s
+[Working Set Log] Baseline Target Tokens Per Round for Sufficient Computation Time: 73191
+[Working Set Log] Based on aggregate available memory to save all activations must use <= 24289 tokens per round and to save minimum activations must use <= 144991 tokens per round
+[Working Set Log] Comparing prior tokens per round: 73191 with max seq len: 2048, full save tokens per round: 24289, min save tokens per round: 144991 and max tokens per round: 65536
+[Working Set Log] Comparing prior tokens per round: 65536 with min chunk size: None and max global batch tokens: 65536
+[Working Set Log] Determined Initial Target Min Chunk Size Est (based on Arithmetic Intensity bound x factor of 2) of: 6410.323432236998
+[Working Set Log] Chunk Size Options: [65536, 32768, 16384, 8192]
+[Working Set Log] Before deciding chunk size, observe remaining gpu mem bytes as: 14977306240, target tokens per round: 65536
+[Working Set Log] Selected Best Option: {'target_chunk_size': 32768, 'target_num_chunks': 2, 'n_gpu_layers': 2, 'n_gpu_grad_layers': 2, 'n_gpu_opt_layers': 40, 'gpu_act_workspace_size_bytes': 6487497984, 'gpu_act_slots': 2, 'total_act_slots': 80, 'act_slot_size_bytes': 3055879168}
+[Working Set Log] Determined Target Max Chunk Size of 32768, Target Tokens Per Round of 65536
+	Act Slot Size: 2914.31MiB
+	# GPU Full Act Slots: 2
+	# Host Act Slots: 78
+	# GPU Act Buffer Size: 6.04GiB
+	# Host Act Buffer Size: 28.33GiB
+[Working Set Log] Expected GPU Memory Usage: 17.50GiB, Expected Host Memory Usage: 100.00GiB
+[from_pretrained] Building engine + pinning host buffers (this can take 10-60s for large models)...
+[BufferManager] Pinning host master/grad/opt for 40 backbone layers...
+[BufferManager]   layer 8/40 pinned
+[BufferManager]   layer 16/40 pinned
+[BufferManager]   layer 24/40 pinned
+[BufferManager]   layer 32/40 pinned
+[BufferManager]   layer 40/40 pinned
+[BufferManager] Pinning host activation buffer (28.33 GiB)... This is one big cudaHostRegister and can take 10-30s.
+[BufferManager] Host activation buffer pinned.
+[BufferManager] Allocating GPU embed+head buffers...
+[BufferManager] Allocating KV context windows...
+[BufferManager] BufferManager construction complete.
+[from_pretrained] Engine ready. GPU mem after engine init: 12.35 GiB used / 23.56 GiB total.
+[from_pretrained] Loading HF safetensors from models/Qwen3.5-35B-A3B...
+[from_pretrained] Weights loaded.
+Model is ready. Building tokenizer-backed SFT data source...
+Dataset ready from /home/shein/Documents/flextrain/datasets/mathinstruct.jsonl. Output dir: runs/Qwen3.5-35B-A3B_lora_sl2048
+Starting training loop: steps=5 max_seq_len=2048 global_batch_tokens=65536
+First step may take a while due to weight staging, kernel warmup, and the initial forward/backward pass.
+[Save Level Plan] 2 chunks x 40 layers; breakdown: level 1: 78, level -1: 2. Host act bytes saved: 32.67GiB / 28.33GiB. Final Recompute Time: 3647.95ms / 5397.38ms, Final Recompute Frac: 0.6759
+Traceback (most recent call last):
+  File "/home/shein/Documents/flextrain/train.py", line 722, in <module>
+    raise SystemExit(main())
+                     ^^^^^^
+  File "/home/shein/Documents/flextrain/train.py", line 711, in main
+    return _run_training_loop(
+           ^^^^^^^^^^^^^^^^^^^
+  File "/home/shein/Documents/flextrain/train.py", line 219, in _run_training_loop
+    stats = am.fwd_bwd(
+            ^^^^^^^^^^^
+  File "/home/shein/Documents/flextrain/flextrain/engine/active_model.py", line 339, in fwd_bwd
+    self._setup_round(prepared, plan)
+  File "/home/shein/Documents/flextrain/flextrain/engine/active_model.py", line 970, in _setup_round
+    slot, _used = self.buffers.host_act_slot(
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/shein/Documents/flextrain/flextrain/engine/buffers.py", line 748, in host_act_slot
+    raise RuntimeError(
+RuntimeError: host act buffer exhausted: need 437174400 at cursor 30163441368, buffer size 30422279168

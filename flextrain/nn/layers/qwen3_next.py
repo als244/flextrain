@@ -220,7 +220,7 @@ class Qwen3NextLinearLayer:
         )
         # Linear attention is residual-aware via its caller. The block
         # returns ``(T, d_model)`` un-residualed; we add the residual.
-        lin_out = self.lin_attn.fwd(attn_norm_output, weights, slot, ctx)
+        lin_out = self.lin_attn.fwd(attn_norm_output, weights, slot, ctx, chunk)
         attn_output_with_residual = x + lin_out
         ffn_norm_output = self.ffn_norm.fwd(
             attn_output_with_residual.view(-1, self.cfg.d_model),
@@ -266,7 +266,7 @@ class Qwen3NextLinearLayer:
 
         if not slot.has("lin_core_out") or not slot.has("lin_A_int"):
             # Re-run FLA fwd from saved q/k/v/g/b.
-            self.lin_attn.fwd_recompute_fla(weights, slot)
+            self.lin_attn.fwd_recompute_fla(weights, slot, chunk)
 
         # MoE tier-3 recompute (x_up).
         if not slot.has("x_up"):
@@ -338,7 +338,7 @@ class Qwen3NextLinearLayer:
             slot.x_inp, weights, slot.attn_norm_rstd,
         )
         dx_lin = self.lin_attn.bwd(
-            dx, weights, grads, slot, ctx,
+            dx, weights, grads, slot, ctx, chunk,
             skip_grads=skip_g_inline, capture_xy=capture_xy,
         )
         dx_attn_norm_up = dx_lin

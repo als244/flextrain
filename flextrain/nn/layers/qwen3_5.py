@@ -448,7 +448,7 @@ class Qwen3_5LinearLayer:
         attn_norm_output = self.attn_norm.fwd(
             x, weights, slot.attn_norm_rstd, output=x_temp,
         )
-        lin_out = self.lin_attn.fwd(attn_norm_output, weights, slot, ctx)
+        lin_out = self.lin_attn.fwd(attn_norm_output, weights, slot, ctx, chunk)
         attn_output_with_residual = x + lin_out
         ffn_norm_output = self.ffn_norm.fwd(
             attn_output_with_residual.view(-1, self.cfg.d_model),
@@ -474,7 +474,7 @@ class Qwen3_5LinearLayer:
         if not slot.has("lin_q"):
             self.lin_attn.fwd_recompute_qkv_heads(slot)
         if not slot.has("lin_core_out") or not slot.has("lin_A_int"):
-            self.lin_attn.fwd_recompute_fla(weights, slot)
+            self.lin_attn.fwd_recompute_fla(weights, slot, chunk)
         recompute_x1 = not slot.has("x1")
         recompute_x3 = not slot.has("x3")
         if recompute_x1 or recompute_x3:
@@ -532,7 +532,7 @@ class Qwen3_5LinearLayer:
 
         # Linear-attn bwd. Skip-able for w_lin_out / w_lin_qkvz / w_lin_ba.
         dx_lin = self.lin_attn.bwd(
-            dx, weights, grads, slot, ctx,
+            dx, weights, grads, slot, ctx, chunk,
             skip_grads=skip_g_inline, capture_xy=capture_xy,
         )
         dx, _ = self.attn_norm.bwd(

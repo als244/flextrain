@@ -539,6 +539,7 @@ class GatedDeltaNetBlock:
 
     def _fwd_fla(
         self, q_n, k_n, v_h, g, beta, slot,
+        cu_seqlens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Stage 5: FLA chunk-gated-delta-rule. Saves ``lin_core_out``,
         ``lin_A_int``, ``lin_g_post``. Returns ``core_out`` for the
@@ -548,6 +549,11 @@ class GatedDeltaNetBlock:
         ``_fwd_qkv_heads``); ``beta`` is precomputed by
         ``_fwd_gate_and_beta``. The l2norm rstds are saved into the
         slot during ``_fwd_qkv_heads`` for the bwd's ``l2norm_bwd``.
+
+        ``cu_seqlens`` (shape ``[N+1]``, int64) tells FLA where each
+        packed sequence ends inside this chunk's flattened token axis;
+        without it, FLA would let the recurrent state leak across
+        sequence boundaries (treats the whole chunk as one sequence).
         """
         cfg = self.cfg
         bf = cfg.compute_dtype
@@ -560,7 +566,7 @@ class GatedDeltaNetBlock:
             g.unsqueeze(0).contiguous(),
             beta.unsqueeze(0).contiguous(),
             scale=scale, initial_state=None,
-            output_final_state=False, cu_seqlens=None,
+            output_final_state=False, cu_seqlens=cu_seqlens,
         )
         o = o.squeeze(0)
         slot.lin_g_post.copy_(g_post.squeeze(0))
@@ -587,6 +593,7 @@ class GatedDeltaNetBlock:
         weights: Mapping[str, torch.Tensor],
         slot,                      # ActivationSlot
         ctx: LayerContext,
+        chunk: ChunkMeta | None = None,
     ) -> torch.Tensor:
         """Forward pass. Saves activations into ``slot``; returns
         the linear-attention output of shape ``(T, d_model)``.
@@ -595,12 +602,24 @@ class GatedDeltaNetBlock:
         (``_fwd_proj_split`` → ``_fwd_conv`` → ``_fwd_qkv_heads`` →
         ``_fwd_gate_and_beta`` → ``_fwd_fla`` → ``_fwd_norm_out``).
         :meth:`fwd_recompute_*` re-runs only the missing stages.
+
+        ``chunk`` carries per-sequence offsets (``q_seq_offsets``)
+        which we forward to FLA as ``cu_seqlens`` so its recurrent
+        state resets at packed-sequence boundaries inside the chunk.
+        Optional only for callers that don't have a chunk handy
+        (e.g. unit tests on a single sequence); production layers
+        always pass it.
         """
+        cu_seqlens = (
+            chunk.q_seq_offsets.to(torch.int64) if chunk is not None else None
+        )
         z, conv_in = self._fwd_proj_split(x, weights, slot)
         post_conv = self._fwd_conv(conv_in, weights, slot)
         q_n, k_n, v_h, _q_rstd, _k_rstd = self._fwd_qkv_heads(post_conv, slot)
         g, beta = self._fwd_gate_and_beta(slot.lin_a, slot.lin_b, weights, slot)
-        core_out = self._fwd_fla(q_n, k_n, v_h, g, beta, slot)
+        core_out = self._fwd_fla(
+            q_n, k_n, v_h, g, beta, slot, cu_seqlens=cu_seqlens,
+        )
         return self._fwd_norm_out(core_out, z, weights)
 
     def _gated_rmsnorm_fwd(
@@ -670,6 +689,7 @@ class GatedDeltaNetBlock:
         self,
         weights: Mapping[str, torch.Tensor],
         slot,
+        chunk: ChunkMeta | None = None,
     ) -> torch.Tensor:
         """Tier-2 recompute (FLA half): re-run FLA fwd from saved
         Q/K/V/g/b to repopulate ``lin_core_out`` / ``lin_A_int`` /
@@ -678,15 +698,23 @@ class GatedDeltaNetBlock:
 
         Beta is recomputed from saved ``lin_b`` via the fused gate-
         prep kernel (which also recomputes g; we discard the recomputed
-        g since slot.lin_g is already valid)."""
+        g since slot.lin_g is already valid).
+
+        ``chunk`` is forwarded to ``_fwd_fla`` so the recompute uses
+        the same ``cu_seqlens`` as the original fwd — otherwise saved
+        and recomputed ``core_out`` would diverge across packed-seq
+        boundaries inside the chunk."""
         from flextrain.ops import flextrain_gate_prep_fwd
         _g, beta = flextrain_gate_prep_fwd(
             slot.lin_a, slot.lin_b,
             weights["w_lin_A_log"], weights["w_lin_dt_bias"],
         )
+        cu_seqlens = (
+            chunk.q_seq_offsets.to(torch.int64) if chunk is not None else None
+        )
         return self._fwd_fla(
             slot.lin_q, slot.lin_k, slot.lin_v,
-            slot.lin_g, beta, slot,
+            slot.lin_g, beta, slot, cu_seqlens=cu_seqlens,
         )
 
     def _gated_rmsnorm_bwd(
@@ -719,13 +747,14 @@ class GatedDeltaNetBlock:
             do_normed, o, z, weight, eps,
         )
 
-    def _fla_autograd_fn(self):
+    def _fla_autograd_fn(self, cu_seqlens: torch.Tensor | None = None):
         """A ``torch.autograd.Function`` wrapper around FLA's
         chunk-gated-delta-rule fwd/bwd. Used only inside :meth:`bwd`
         so we can run one autograd.backward over the local subgraph.
 
         Returns the class (not an instance — the class itself has
-        ``apply``).
+        ``apply``). ``cu_seqlens`` is captured by closure so the bwd
+        sees the same packed-sequence boundaries as fwd.
         """
         cfg = self.cfg
 
@@ -737,7 +766,7 @@ class GatedDeltaNetBlock:
                 g_chunk, o, A_int, _, _, _ = chunk_gated_delta_rule_fwd(
                     q_b, k_b, v_b, g_b, beta_b,
                     scale=scale, initial_state=None,
-                    output_final_state=False, cu_seqlens=None,
+                    output_final_state=False, cu_seqlens=cu_seqlens,
                 )
                 ctx_a.save_for_backward(
                     q_b, k_b, v_b, g_b, beta_b, A_int, g_chunk,
@@ -751,7 +780,7 @@ class GatedDeltaNetBlock:
                 dq, dk, dv, db, dg, _, _, _ = chunk_gated_delta_rule_bwd(
                     q=q_b, k=k_b, v=v_b, g=g_chunk, beta=beta_b, A=A_int,
                     scale=scale, initial_state=None,
-                    do=do, dht=None, cu_seqlens=None,
+                    do=do, dht=None, cu_seqlens=cu_seqlens,
                 )
                 return dq, dk, dv, dg, db
 
@@ -764,6 +793,7 @@ class GatedDeltaNetBlock:
         grads: MutableMapping[str, torch.Tensor],
         slot,
         ctx: LayerContext,
+        chunk: ChunkMeta | None = None,
         *,
         skip_grads: frozenset[str] = frozenset(),
         capture_xy: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
@@ -896,10 +926,13 @@ class GatedDeltaNetBlock:
         beta_b = beta.unsqueeze(0).contiguous()
         do_b = do.unsqueeze(0).contiguous()
         scale = cfg.head_k_dim ** -0.5
+        cu_seqlens = (
+            chunk.q_seq_offsets.to(torch.int64) if chunk is not None else None
+        )
         dq_n, dk_n, dv_h, dbeta, dg, _, _, _ = chunk_gated_delta_rule_bwd(
             q=q_b, k=k_b, v=v_b, g=g_post, beta=beta_b, A=A_int,
             scale=scale, initial_state=None, do=do_b, dht=None,
-            cu_seqlens=None,
+            cu_seqlens=cu_seqlens,
         )
         dq_n = dq_n.squeeze(0)                               # (T, n_k_heads, head_k_dim)
         dk_n = dk_n.squeeze(0)
