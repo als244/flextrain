@@ -75,11 +75,77 @@ try:
     # don't accept that flag, so we apply it explicitly here. Keeping
     # ``q_rstd``/``k_rstd`` for the bwd half of l2_norm.
     from fla.modules.l2norm import l2norm_fwd, l2norm_bwd
+    # FLA's causal_conv1d_fwd_kernel — called directly so we can
+    # supply our own output buffer (the upstream python helper
+    # allocates internally with torch.empty_like).
+    from fla.modules.conv.triton.ops import causal_conv1d_fwd_kernel
 except ImportError as e:  # pragma: no cover
     raise ImportError(
         "Qwen3NextLinearAttention requires `flash-linear-attention`. "
         "Install with: pip install flash-linear-attention"
     ) from e
+
+
+def _fla_causal_conv1d_fwd_into(
+    x_2d: torch.Tensor,                # (T, D), strided OK (kernel uses strides)
+    weight: torch.Tensor,              # (D, W) bf16
+    out_2d: torch.Tensor,              # (T, D) bf16, contiguous, written in-place
+    *,
+    cu_seqlens: torch.Tensor | None = None,
+    bt: int = 64,
+) -> None:
+    """Direct call into FLA's ``causal_conv1d_fwd_kernel`` writing into
+    a caller-supplied output buffer.
+
+    The upstream ``causal_conv1d_fwd`` python helper allocates output
+    via ``torch.empty_like(x)`` and returns it; for our use case we
+    want the kernel to write directly into ``slot.lin_post_conv_pre_silu``
+    so the post-conv ``slot.copy_(...)`` D2D memcpy can be eliminated.
+
+    We mimic that helper's preprocessing (rearrange, stride read,
+    chunk_indices for varlen) but skip the allocation. The output
+    must already be contiguous (the kernel writes contiguously, but
+    we read it back as a (T, D) view).
+    """
+    import triton  # local import to keep top-of-file imports light
+    from fla.modules.conv.triton.ops import prepare_chunk_indices, rearrange
+    # Treat as (B=1, T, D) for the kernel's grid layout.
+    if x_2d.shape[-1] != weight.shape[0]:
+        x_2d = rearrange(x_2d, 'b t ... -> b t (...)')
+    x = x_2d.unsqueeze(0)
+    y = out_2d.unsqueeze(0)
+    B, T, D = x.shape[0], x.shape[1], weight.shape[0]
+    W = weight.shape[1]
+    stride_x_n, stride_x_t, stride_x_d = x.stride()
+    BW = triton.next_power_of_2(W)
+    chunk_indices = None
+    if cu_seqlens is not None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, bt)
+    NT = (
+        len(chunk_indices) if cu_seqlens is not None
+        else triton.cdiv(T, bt)
+    )
+    NB = triton.cdiv(B * T, 1024)
+
+    def _grid(meta):
+        return (triton.cdiv(D, meta["BD"]), NT, B)
+
+    causal_conv1d_fwd_kernel[_grid](
+        x=x,
+        y=y,
+        weight=weight,
+        bias=None,
+        residual=None,
+        cu_seqlens=cu_seqlens,
+        initial_state=None,
+        chunk_indices=chunk_indices,
+        B=B, T=T, D=D, W=W,
+        BT=bt, BW=BW, NB=NB,
+        stride_x_n=stride_x_n,
+        stride_x_t=stride_x_t,
+        stride_x_d=stride_x_d,
+        ACTIVATION=None,
+    )
 
 
 @dataclass(frozen=True)
@@ -562,23 +628,33 @@ class GatedDeltaNetBlock:
         these sizes — negligible vs the ~1ms conv body — so leaving it
         out has no perf cost.
 
-        Returns ``post_conv`` (silu output, shape ``(T, conv_dim)``)."""
-        from fla.modules.conv.triton.ops import causal_conv1d_fwd
+        Returns ``post_conv`` (silu output, shape ``(T, conv_dim)``).
+
+        We call FLA's ``causal_conv1d_fwd_kernel`` directly through a
+        thin wrapper (:func:`_fla_causal_conv1d_fwd_into`) instead of
+        the python ``causal_conv1d_fwd`` helper so we can supply
+        ``slot.lin_post_conv_pre_silu`` as the output buffer — saving
+        a (T, conv_dim) bf16 D2D memcpy per layer per fwd. (FLA's
+        helper does ``y = torch.empty_like(x)`` internally, then we'd
+        have to ``slot.copy_(y)`` after.)
+        """
         cfg = self.cfg
-        bf = cfg.compute_dtype
         # FLA weight shape is (D, W); our slot weight is (D, 1, W) for
         # depthwise compatibility with torch.conv1d. Squeeze the middle.
         w = weights["w_lin_conv"].squeeze(1).contiguous()
-        # x: (1, T, D)
-        x = conv_in.unsqueeze(0)
-        post_conv_pre_silu, _ = causal_conv1d_fwd(
-            x=x, weight=w, bias=None, residual=None,
-            activation=None, output_final_state=False,
-        )
-        post_conv_pre_silu = post_conv_pre_silu.squeeze(0)  # (T, D)
+        # cu_seqlens for varlen (None when no chunk metadata available).
+        # Currently the only caller of _fwd_conv is the fwd path which
+        # invokes us without chunk; the fla bwd recovers cu_seqlens
+        # via its own re-fwd call site so we don't need to pass here.
+        # Production callers thread chunk through _fwd_fla; conv runs
+        # the same depthwise op regardless.
         if not (skip_already_saved and slot.has("lin_post_conv_pre_silu")):
-            slot.lin_post_conv_pre_silu.copy_(post_conv_pre_silu.to(bf))
-        post_conv = F.silu(post_conv_pre_silu)
+            _fla_causal_conv1d_fwd_into(
+                x_2d=conv_in,
+                weight=w,
+                out_2d=slot.lin_post_conv_pre_silu,
+            )
+        post_conv = F.silu(slot.lin_post_conv_pre_silu)
         return post_conv.contiguous()
 
     def _fwd_qkv_heads(self, post_conv: torch.Tensor, slot) -> tuple[
