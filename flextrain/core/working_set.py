@@ -1158,18 +1158,29 @@ def _pick_chunk_size(
             gpu_act_workspace += extra_opt
             cur_gpu -= extra_opt
 
-        # Prioritize 2 act slots, then 2 full layers (weights + grads).
-        temp_slots = gpu_act_workspace // full_act
-        if temp_slots < 2 and cur_gpu >= full_act:
-            gpu_act_workspace += full_act
-            cur_gpu -= full_act
-
+        # Prioritize 2 weight + 2 grad layers BEFORE the 2nd act slot.
+        # The AdaWS pipeline overlaps layer N+1's weight prefetch with
+        # layer N's compute, and layer N's grad eviction with layer
+        # N-1's bwd compute — both need n_gpu_*_layers >= 2 to hide
+        # PCIe latency. A 2nd act slot only buys per-chunk overlap on
+        # a single layer (less impactful when num_chunks is small),
+        # and adding it greedily at large chunks (e.g. Qwen3.6-35B-A3B
+        # at chunk=262144 where slot ~ 20-25 GiB) consumes nearly the
+        # whole post-baseline budget and leaves nothing for the 2nd
+        # weight/grad — yielding a save plan that runs entirely at
+        # level 0 with 60-70% of the step spent in recompute.
         if cur_gpu >= backbone.weight_bytes:
             n_gpu_layers = 2
             cur_gpu -= backbone.weight_bytes
         if cur_gpu >= backbone.grad_bytes:
             n_gpu_grad_layers = 2
             cur_gpu -= backbone.grad_bytes
+
+        # Now try a 2nd act slot if there's still room.
+        temp_slots = gpu_act_workspace // full_act
+        if temp_slots < 2 and cur_gpu >= full_act:
+            gpu_act_workspace += full_act
+            cur_gpu -= full_act
 
         # Fill act slots up through layer 1, then layer 2, with whatever
         # still fits (orig:553-581).
@@ -1269,15 +1280,45 @@ def _pick_chunk_size(
             "act_slot_size_bytes": full_act,
         }
 
-        # If we got >= 2 complete layers, take this option and stop looking
-        # (orig:631-634).
-        if addl_complete >= 1:
+        # Healthy AdaWS pipelining requires all four resources to have
+        # >= 2 GPU-resident copies: weights (so layer N+1 prefetch
+        # overlaps layer N compute), grads (so layer N's grad eviction
+        # overlaps layer N-1 bwd compute), opt state (so the optimizer
+        # step overlaps the next round's first-layer prefetch), and act
+        # slots (so chunk i+1's fwd overlaps chunk i's send-home /
+        # bwd's chunk i-1 fetch-home). Chunks are iterated largest -> smallest,
+        # so the first option that satisfies all four IS the largest
+        # such chunk — take it and stop.
+        healthy = (
+            option["n_gpu_layers"] >= 2
+            and option["n_gpu_grad_layers"] >= 2
+            and option["n_gpu_opt_layers"] >= 2
+            and option["gpu_act_slots"] >= 2
+        )
+        if healthy:
             return option
 
         if best_option is None:
             best_option = option
+            continue
 
-        # Tie-breakers (orig:639-652).
+        # Otherwise: prefer the option whose minimum across the four
+        # axes is highest (fewest pipelining shortfalls), with the
+        # original per-axis "promote 1 -> >1" rules as the secondary
+        # signal so we never regress on a measurable axis.
+        def _floor(opt):
+            return min(
+                opt["n_gpu_layers"],
+                opt["n_gpu_grad_layers"],
+                opt["n_gpu_opt_layers"],
+                opt["gpu_act_slots"],
+            )
+
+        if _floor(option) > _floor(best_option):
+            best_option = option
+            continue
+
+        # Same floor — fall back to per-axis promotions (orig:639-652).
         if best_option["gpu_act_slots"] == 1 and option["gpu_act_slots"] > 1:
             best_option = option
         if (
