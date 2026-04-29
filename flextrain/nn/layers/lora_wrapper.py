@@ -337,6 +337,15 @@ class LoRAWrapperLayer:
         if self.moe_chunk_config is None:
             # `Layer` Protocol probes this; absent on non-MoE base layers.
             pass
+        # Secondary-compute-stream marker passes through too. Without
+        # this, the engine sees ``getattr(wrapper, 'uses_secondary_stream',
+        # False) → False`` (the wrapper itself doesn't define the attr,
+        # only the inner base layer does), declines to allocate a
+        # secondary stream, and the MoE expert-loop alternation
+        # silently degrades to single-stream — losing the per-expert
+        # primary/secondary overlap entirely under --mode lora.
+        if getattr(base, "uses_secondary_stream", False):
+            self.uses_secondary_stream = True
 
         all_2d = _discover_2d_param_names(base.param_spec, dims)
         target_names = expand_targets(lora_targets, all_2d)
