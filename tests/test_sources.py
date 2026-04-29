@@ -131,8 +131,54 @@ def test_json_sft_source_loops_for_small_datasets() -> None:
             max_seq_len=64,
             loop=True,
         )
-        batch = source.get_sequences(max_token_count=40)
+        # max_token_count is a hard cap: we only pack as many sequences
+        # as fit at or under it (single ~36-token seq fits under 200 once;
+        # second pull goes over so it's parked for the next call).
+        batch = source.get_sequences(max_token_count=200)
         assert len(batch) >= 2
+        # Subsequent call returns the parked sequence first, confirming
+        # loop=True keeps producing.
+        batch2 = source.get_sequences(max_token_count=200)
+        assert len(batch2) >= 1
+
+
+def test_json_sft_source_never_exceeds_max_token_count() -> None:
+    """Regression test: ``get_sequences`` returns a batch whose total
+    token count is always ``<= max_token_count`` (the engine relies on
+    this cap to size its working set; greedily overflowing caused
+    chunk-size mispredictions silently)."""
+    import tempfile
+
+    records = [
+        {"instruction": f"Question {i}.", "output": f"Answer {i}."}
+        for i in range(20)
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "many.jsonl")
+        with open(path, "w") as f:
+            for rec in records:
+                f.write(json.dumps(rec) + "\n")
+        source = JsonSFTTokenSource(
+            path,
+            tokenizer=_FakeTokenizer(),
+            min_seq_len=4,
+            max_seq_len=64,
+            loop=False,
+        )
+        # Pull batches and assert each one stays under the cap.
+        cap = 100
+        seen_seqs = 0
+        for _ in range(10):
+            batch = source.get_sequences(max_token_count=cap)
+            if not batch:
+                break
+            total = sum(len(s) for s in batch)
+            assert total <= cap, (
+                f"batch total {total} exceeds cap {cap}; per-seq lens={[len(s) for s in batch]}"
+            )
+            seen_seqs += len(batch)
+        # Confirm we exercised the path (didn't just exit on first empty).
+        assert seen_seqs >= 5
 
 
 # ---------------------------------------------------------------------------

@@ -232,6 +232,10 @@ class JsonSFTTokenSource:
             self._tok = tokenizer
         self._records = self._load_records(path)
         self._cursor = 0
+        # Lookahead slot: a sequence pulled from the stream but
+        # rejected by ``get_sequences`` because adding it would push
+        # past ``max_token_count``. The next call returns it first.
+        self._pending: Sequence | None = None
 
     @staticmethod
     def _load_records(path: str) -> list[dict[str, Any]]:
@@ -256,6 +260,7 @@ class JsonSFTTokenSource:
 
     def reset(self) -> None:
         self._cursor = 0
+        self._pending = None
 
     def _build_prompt(self, rec: dict[str, Any]) -> tuple[str, str] | None:
         prompt = str(rec.get(self.prompt_field, "") or "").strip()
@@ -276,6 +281,9 @@ class JsonSFTTokenSource:
         return prompt_text, response
 
     def _next_seq(self) -> Sequence | None:
+        if self._pending is not None:
+            seq, self._pending = self._pending, None
+            return seq
         if not self._records:
             return None
         while True:
@@ -329,6 +337,22 @@ class JsonSFTTokenSource:
             yield seq
 
     def get_sequences(self, max_token_count: int) -> list[Sequence]:
+        """Pull packed sequences whose total token count is <= ``max_token_count``.
+
+        Greedy: keep adding sequences until the next one would push
+        the running total over the cap; that sequence is parked in
+        ``self._pending`` and returned at the start of the next call.
+        Guarantees the returned batch's total token count never
+        exceeds ``max_token_count`` (the engine and the working-set
+        solve both rely on this — going over caused chunk-size
+        mispredictions and silent host-act-buffer pressure).
+
+        Always returns at least one sequence (even if it's larger
+        than the cap) — caller asked for *something*; truncating to
+        zero sequences would stall the training loop. Callers who
+        want a hard cap should ensure ``max_token_count >=
+        max_seq_len``.
+        """
         out: list[Sequence] = []
         total = 0
         while True:
@@ -336,8 +360,8 @@ class JsonSFTTokenSource:
             if seq is None:
                 break
             if out and total + len(seq) > max_token_count:
-                out.append(seq)
-                total += len(seq)
+                # Park for next call; do NOT include in this batch.
+                self._pending = seq
                 break
             out.append(seq)
             total += len(seq)
