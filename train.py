@@ -451,6 +451,37 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "force a specific tile shape for profiling."
         ),
     )
+    p.add_argument(
+        "--master-dtype",
+        choices=("bfloat16", "float16", "float32"),
+        default="bfloat16",
+        help=(
+            "Master parameter dtype (the trainable weight copy the "
+            "optimizer step writes into). Default: bfloat16. Use "
+            "float32 only when you need the extra precision (e.g. "
+            "very-low-LR fine-tunes that drift in bf16 accumulation)."
+        ),
+    )
+    p.add_argument(
+        "--grad-dtype",
+        choices=("bfloat16", "float16", "float32"),
+        default="bfloat16",
+        help=(
+            "Gradient buffer dtype. Default: bfloat16. RMSNorm grads "
+            "stay fp32 internally for numerical stability regardless."
+        ),
+    )
+    p.add_argument(
+        "--opt-state-dtype",
+        choices=("bfloat16", "float16", "float32"),
+        default=None,
+        help=(
+            "Optimizer state dtype (AdamW m/v moments). Default: "
+            "bfloat16 for --mode full, float32 for --mode lora "
+            "(adapters are tiny; fp32 m/v is essentially free). "
+            "Override here to force a specific choice."
+        ),
+    )
     p.add_argument("--save", action="store_true", help="Export final.safetensors at the end of the run.")
     return p
 
@@ -459,9 +490,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return _build_arg_parser().parse_args(argv)
 
 
+_DTYPE_BY_NAME: dict[str, torch.dtype] = {
+    "bfloat16": torch.bfloat16,
+    "float16": torch.float16,
+    "float32": torch.float32,
+}
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _build_arg_parser()
     args = parser.parse_args(argv)
+
+    master_dtype = _DTYPE_BY_NAME[args.master_dtype]
+    grad_dtype = _DTYPE_BY_NAME[args.grad_dtype]
+    # opt-state default: bf16 for --mode full, fp32 for --mode lora.
+    if args.opt_state_dtype is not None:
+        opt_state_dtype = _DTYPE_BY_NAME[args.opt_state_dtype]
+    else:
+        opt_state_dtype = (
+            torch.float32 if args.mode == "lora" else torch.bfloat16
+        )
 
     local_model_dir, hf_repo_id = _resolve_model(args.model)
     output_dir = args.output_dir or (
@@ -496,7 +544,7 @@ def main(argv: list[str] | None = None) -> int:
                 eps=1e-8,
                 weight_decay=0.0,
             ),
-            state_dtype=torch.float32,
+            state_dtype=opt_state_dtype,
         )
         lora_targets = "all"
     elif args.use_muon:
@@ -523,7 +571,7 @@ def main(argv: list[str] | None = None) -> int:
                 eps=1e-8,
                 weight_decay=0.0,
             ),
-            state_dtype=torch.bfloat16,
+            state_dtype=opt_state_dtype,
         )
         lora_targets = None
 
@@ -609,6 +657,8 @@ def main(argv: list[str] | None = None) -> int:
         force_saved_act_level=args.force_save_level,
         min_chunk_size=args.min_chunk_size,
         max_chunk_size=args.max_chunk_size,
+        master_dtype=master_dtype,
+        grad_dtype=grad_dtype,
         strict=False,
         verbose=True,
     )
