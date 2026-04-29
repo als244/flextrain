@@ -1,36 +1,65 @@
 """High-level MoE composition ops.
 
-This module separates the *expert-compute* step (per-expert SwiGLU
-fwd/bwd via cuBLAS dispatcher matmuls + ``flextrain_swiglu_moe_*``
-Triton kernels) from the surrounding *routing infrastructure*
-(router projection, top-k softmax, sort, scatter, gather, gate-grad).
+The routed MoE forward/backward is composed of three stages:
 
-The routing infrastructure stays in :mod:`flextrain.nn.blocks.ffn_moe`'s
-:class:`MoESwiGLUFFN`. The expert-compute step is hot-swappable —
-this module provides the SwiGLU expert backend; an alternative
-backend (e.g. sonic-MoE) can replace these two functions while
-keeping the rest of the block untouched.
+1. **Routing** — router-gate matmul + top-k + softmax → ``(T, K)``
+   expert ids and weights.
+2. **Dispatch / scatter** — sort tokens by expert into a flat
+   ``(T*K, d_model)`` buffer; bookkeeping for the per-expert ranges.
+3. **Expert compute** — per-expert SwiGLU fwd/bwd (cuBLAS dispatcher
+   matmuls + Triton ``flextrain_swiglu_moe_*`` kernels).
+4. **Combine / gather** — weighted sum back to ``(T, d_model)``,
+   add residual.
 
-API
----
-:func:`swiglu_expert_loop_fwd` — given scattered input + per-expert
-counts, run all experts (with optional secondary-stream
-double-buffering), write per-slot pre-SwiGLU activations into
-``x_preact_buf`` and overwrite ``scattered_x`` with each expert's
-post-SwiGLU output.
+This module exposes the routed-SwiGLU pipeline at three levels of
+granularity so different MoE backends can hot-swap whichever stage
+they implement differently:
 
-:func:`swiglu_expert_loop_bwd` — given upstream grads + per-expert
-counts, run all experts' bwd, accumulating ``g_up`` / ``g_down``
-weight grads (or routing per-expert tiles to a LoRA callback) and
-writing per-slot input grads back into ``scattered_upstream``.
+End-to-end ops (the typical entry point — :class:`MoESwiGLUFFN` is a
+thin caller of these):
+
+* :func:`routed_swiglu_moe_fwd` — runs all four stages, populates
+  the activation slot's tier-0 fields and tier-3 ``x_up``, and
+  writes the post-residual output into ``out_tensor``.
+* :func:`routed_swiglu_moe_bwd` — mirror; consumes the tier-0
+  router state, runs the expert bwd, gather, router-gate-bwd,
+  optional load-balance bwd, and the router-Wgrad / FFN-norm-
+  upstream addmms.
+* :func:`routed_swiglu_moe_recompute_x_up` — tier-3 recompute hook
+  for save_level<3; rescatter + per-expert up-projection only.
+
+Phase ops (compose your own pipeline). Backends that don't use
+scatter/gather (e.g. sonic-MoE with a different dispatch shape) skip
+:func:`dispatch_scatter` / :func:`combine_gather` and substitute
+their own, but can still reuse :func:`route_topk_softmax` and the
+expert-loop ops below.
+
+* :func:`route_topk_softmax`
+* :func:`dispatch_scatter`
+* :func:`combine_gather`
+
+Expert-compute ops (the SwiGLU backend per se — swap this when
+plugging in a different expert kernel):
+
+* :func:`swiglu_expert_loop_fwd`
+* :func:`swiglu_expert_loop_bwd`
+* :func:`swiglu_expert_loop_recompute_x_up`
 """
 from __future__ import annotations
 
-from typing import Callable, Mapping, MutableMapping
+from typing import Any, Callable, Mapping, MutableMapping
 
 import torch
 
 from flextrain.ops import (
+    flextrain_copy_expert_counts,
+    flextrain_fused_topk_softmax,
+    flextrain_load_balance_bwd,
+    flextrain_moe_gather,
+    flextrain_moe_router_gate_bwd,
+    flextrain_moe_scatter,
+    flextrain_moe_scatter_routing_weights,
+    flextrain_moe_sort,
     flextrain_swiglu_moe_bwd,
     flextrain_swiglu_moe_fwd,
 )
@@ -38,6 +67,373 @@ from flextrain.ops._kernels._matmul_dispatchers import (
     dispatcher,
     dispatcher_secondary,
 )
+
+
+# ---------------------------------------------------------------------------
+# Phase ops.
+# ---------------------------------------------------------------------------
+
+
+def route_topk_softmax(
+    x: torch.Tensor,                       # (T, d_model)
+    w_router: torch.Tensor,                # (d_model, num_experts)
+    *,
+    top_k: int,
+    routing_mode: str,
+    gate_logits_out: torch.Tensor,         # (T, num_experts) -- written
+    topk_ids_out: torch.Tensor,            # (T, top_k)       -- written
+    topk_weights_out: torch.Tensor,        # (T, top_k)       -- written
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Router projection + top-k softmax.
+
+    Computes ``gate_logits = x @ w_router`` and then runs the fused
+    Triton top-k + softmax kernel. All three output buffers must be
+    pre-allocated by the caller (typically slot tier-0 fields), and
+    are written in place.
+
+    Returns ``(router_weights, topk_ids)`` views into the provided
+    buffers — same tensors as ``topk_weights_out`` / ``topk_ids_out``,
+    returned for ergonomic chaining.
+    """
+    torch.matmul(x, w_router, out=gate_logits_out)
+    router_weights, topk_ids = flextrain_fused_topk_softmax(
+        gate_logits_out,
+        top_k=top_k,
+        topk_ids_out=topk_ids_out,
+        topk_weights_out=topk_weights_out,
+        mode=routing_mode,
+    )
+    return router_weights, topk_ids
+
+
+def dispatch_scatter(
+    x: torch.Tensor,                       # (T, d_model)
+    router_weights: torch.Tensor,          # (T, top_k)
+    topk_ids: torch.Tensor,                # (T, top_k)
+    *,
+    num_experts: int,
+    index_mapping: torch.Tensor,           # (T, top_k) int32 -- written by sort
+    expert_counts_gpu: torch.Tensor,       # (E,) int32 -- written by sort
+    expert_counts_cpu: torch.Tensor,       # (E,) int32 pinned host -- written by D->H copy
+    scattered_x_out: torch.Tensor,         # (T*K, d_model) -- written
+    scattered_router_weights_out: torch.Tensor,  # (T*K, 1) bf16 -- written
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sort tokens by expert; scatter inputs + router weights into
+    sorted layout; copy expert counts to pinned host and sync.
+
+    On return, ``scattered_x_out`` holds ``x`` permuted by expert
+    (each expert's tokens contiguous), ``scattered_router_weights_out``
+    holds the per-slot router weights in matching order, and
+    ``expert_counts_cpu`` contains the per-expert token count. The
+    caller can read the CPU counts immediately (we sync inside).
+
+    Returns ``(indices, expert_counts_cpu)``: ``indices`` is the
+    ``(T, top_k)`` int32 mapping from original (token, k-slot) to
+    sorted-position; needed at bwd time.
+    """
+    indices, _expert_counts_gpu = flextrain_moe_sort(
+        topk_ids,
+        num_experts=num_experts,
+        indices=index_mapping,
+        expert_counts_gpu=expert_counts_gpu,
+    )
+    flextrain_moe_scatter(x, indices, out=scattered_x_out)
+    flextrain_moe_scatter_routing_weights(
+        router_weights, indices, out=scattered_router_weights_out,
+    )
+    flextrain_copy_expert_counts(expert_counts_gpu, expert_counts_cpu)
+    # Sync so the python loop in swiglu_expert_loop_fwd can read the
+    # per-expert counts on the CPU.
+    torch.cuda.current_stream().synchronize()
+    return indices, expert_counts_cpu
+
+
+def combine_gather(
+    scattered_y: torch.Tensor,             # (T*K, d_model) post-expert outputs
+    indices: torch.Tensor,                 # (T, top_k) int32
+    *,
+    router_weights: torch.Tensor,          # (T, top_k) bf16 -- ORIGINAL order, NOT scattered
+    residual: torch.Tensor,                # (T, d_model) bf16 -- added in-kernel
+    out_tensor: torch.Tensor,              # (T, d_model) bf16 -- written
+) -> torch.Tensor:
+    """Weighted gather + residual add.
+
+    Thin kwargs-only wrapper around :func:`flextrain_moe_gather` for
+    callers who always pass weights and residual.
+    """
+    return flextrain_moe_gather(
+        scattered_y, indices,
+        residual=residual,
+        weights=router_weights,
+        out=out_tensor,
+    )
+
+
+# ---------------------------------------------------------------------------
+# End-to-end ops. Block fwd/bwd reduce to a single call to one of these.
+# ---------------------------------------------------------------------------
+
+
+def routed_swiglu_moe_fwd(
+    ffn_norm_output: torch.Tensor,         # (T, d_model)
+    weights: Mapping[str, torch.Tensor],   # {w_router, w_up, w_down}
+    *,
+    out_tensor: torch.Tensor,              # (T, d_model) -- written
+    residual: torch.Tensor,                # (T, d_model) -- added during gather
+    slot: Any,                             # ActivationSlot with tier-0 fields + x_up
+    chunk_extra: Mapping[str, Any],        # chunk.meta.extra
+    layer_id: int,
+    top_k: int,
+    num_experts: int,
+    expert_dim: int,
+    routing_mode: str,
+    primary_stream: torch.cuda.Stream,
+    secondary_stream: torch.cuda.Stream | None,
+    scratch_fn: Callable[[tuple[int, ...], torch.dtype], torch.Tensor],
+) -> torch.Tensor:
+    """End-to-end routed-SwiGLU MoE forward.
+
+    Composes :func:`route_topk_softmax` -> :func:`dispatch_scatter` ->
+    :func:`swiglu_expert_loop_fwd` -> :func:`combine_gather`.
+    Writes router state into tier-0 slot fields, per-slot pre-SwiGLU
+    activations into tier-3 ``slot.x_up``, and the residual-added
+    output into ``out_tensor``.
+
+    Returns ``expert_counts_cpu`` (already synced) so the caller can
+    update any per-step expert-usage histogram. The block's bwd
+    reads ``chunk_extra["moe_expert_counts_host"][layer_id]``
+    directly — no need to thread the count through.
+    """
+    num_tokens, d_model = ffn_norm_output.shape
+
+    # 1) Routing.
+    router_weights, topk_ids = route_topk_softmax(
+        ffn_norm_output, weights["w_router"],
+        top_k=top_k,
+        routing_mode=routing_mode,
+        gate_logits_out=slot.x_router,
+        topk_ids_out=slot.chosen_experts,
+        topk_weights_out=slot.router_weights,
+    )
+
+    # 2) Dispatch + scatter. ``scattered_router_weights`` and ``x_up``
+    # were sized for max_chunk_size * top_k at slot-allocation time;
+    # narrow to this chunk's actual T*K window.
+    TK = num_tokens * top_k
+    scattered_x = scratch_fn((TK, d_model), ffn_norm_output.dtype)
+    srw = slot.scattered_router_weights[:TK, :]
+    indices, expert_counts_cpu = dispatch_scatter(
+        ffn_norm_output, router_weights, topk_ids,
+        num_experts=num_experts,
+        index_mapping=chunk_extra["moe_token_index_mapping"][layer_id],
+        expert_counts_gpu=slot.expert_counts,
+        expert_counts_cpu=chunk_extra["moe_expert_counts_host"][layer_id],
+        scattered_x_out=scattered_x,
+        scattered_router_weights_out=srw,
+    )
+
+    # 3) Expert compute. Allocate per-stream act scratch sized to the
+    # max per-expert count we just observed.
+    max_exp_tokens = int(expert_counts_cpu.max())
+    use_secondary = secondary_stream is not None
+    x_act_even = scratch_fn(
+        (max_exp_tokens, expert_dim), ffn_norm_output.dtype,
+    )
+    x_act_odd = (
+        scratch_fn((max_exp_tokens, expert_dim), ffn_norm_output.dtype)
+        if use_secondary else x_act_even
+    )
+    swiglu_expert_loop_fwd(
+        scattered_x=scattered_x,
+        x_preact_buf=slot.x_up,
+        w_up=weights["w_up"],
+        w_down=weights["w_down"],
+        expert_counts_cpu=expert_counts_cpu,
+        primary_stream=primary_stream,
+        secondary_stream=secondary_stream,
+        x_act_even=x_act_even,
+        x_act_odd=x_act_odd,
+    )
+
+    # 4) Combine + residual + gather. Writes directly into out_tensor.
+    combine_gather(
+        scattered_x, indices,
+        router_weights=router_weights,
+        residual=residual.view(-1, d_model),
+        out_tensor=out_tensor,
+    )
+    return expert_counts_cpu
+
+
+def routed_swiglu_moe_bwd(
+    dy_resid: torch.Tensor,                # (T, d_model)
+    weights: Mapping[str, torch.Tensor],
+    grads: MutableMapping[str, torch.Tensor],
+    slot: Any,
+    chunk_extra: Mapping[str, Any],
+    layer_id: int,
+    *,
+    ffn_norm_output: torch.Tensor,         # caller-recomputed (T, d_model)
+    top_k: int,
+    num_experts: int,
+    expert_dim: int,
+    routing_mode: str,
+    load_balance_coef: float,
+    total_tokens_per_step: int | None,
+    primary_stream: torch.cuda.Stream,
+    secondary_stream: torch.cuda.Stream | None,
+    scattered_x_recompute: torch.Tensor | None = None,
+    skip_grads: frozenset[str] = frozenset(),
+    lora_per_expert_callback: Callable | None = None,
+) -> torch.Tensor:
+    """End-to-end routed-SwiGLU MoE backward. Returns
+    ``ffn_norm_upstream`` (the d-loss/d-input gradient).
+
+    ``scattered_x_recompute`` is the caller-side handoff from
+    :func:`routed_swiglu_moe_recompute_x_up` (when save_level<3 and
+    that ran earlier in this bwd iter); pass ``None`` to re-scatter
+    here. Either way the per-slot ``x`` lives only for the duration
+    of this call.
+
+    Mirrors orig/moe_layer.backward_moe and the inline block bwd at
+    commit a47b8bd.
+    """
+    num_tokens, d_model = dy_resid.shape
+    TK = num_tokens * top_k
+    primary_stream_ptr = primary_stream.cuda_stream
+    index_mapping = chunk_extra["moe_token_index_mapping"][layer_id]
+    expert_counts_cpu = chunk_extra["moe_expert_counts_host"][layer_id]
+
+    # 1) Scatter upstream gradient by the saved sort indices.
+    scattered_upstream = torch.zeros(
+        (TK, d_model), dtype=dy_resid.dtype, device=dy_resid.device,
+    )
+    flextrain_moe_scatter(dy_resid, index_mapping, out=scattered_upstream)
+
+    # 2) Reuse the rescatter from fwd_recompute_x_up if it ran;
+    # otherwise re-scatter ffn_norm_output now (its target buffer is
+    # always ephemeral — local lifetime through the expert bwd).
+    if scattered_x_recompute is not None:
+        scattered_x = scattered_x_recompute
+    else:
+        scattered_x = torch.zeros(
+            (TK, d_model), dtype=dy_resid.dtype, device=dy_resid.device,
+        )
+        flextrain_moe_scatter(ffn_norm_output, index_mapping, out=scattered_x)
+
+    # 3) Expert bwd loop. Overwrites ``scattered_upstream`` with
+    # per-slot dx, accumulates g_up / g_down (or fires the LoRA
+    # callback per expert), and writes ``dprobs`` for use in router-
+    # gate-bwd below.
+    srw = slot.scattered_router_weights[:TK, :]
+    dprobs = torch.zeros_like(srw)
+    swiglu_expert_loop_bwd(
+        scattered_upstream=scattered_upstream,
+        scattered_x=scattered_x,
+        x_preact_buf=slot.x_up,
+        srw=srw,
+        dprobs=dprobs,
+        w_up=weights["w_up"],
+        w_down=weights["w_down"],
+        grads=grads,
+        expert_counts_cpu=expert_counts_cpu,
+        expert_dim=expert_dim,
+        primary_stream=primary_stream,
+        secondary_stream=secondary_stream,
+        skip_grads=skip_grads,
+        lora_per_expert_callback=lora_per_expert_callback,
+    )
+    del scattered_x
+
+    # 4) Gather per-slot dx back to per-token ffn-norm-upstream.
+    ffn_norm_upstream = torch.zeros_like(dy_resid)
+    flextrain_moe_gather(
+        scattered_upstream, index_mapping, out=ffn_norm_upstream,
+    )
+
+    # 5) Router gate gradient: per-token d_logit from per-slot dprobs.
+    dlogits = torch.zeros(
+        (num_tokens, num_experts),
+        dtype=dy_resid.dtype, device=dy_resid.device,
+    )
+    flextrain_moe_router_gate_bwd(
+        slot.router_weights, dprobs, index_mapping, slot.chosen_experts,
+        dlogits=dlogits,
+        mode=routing_mode,
+        logits=slot.x_router,
+    )
+
+    # 6) Optional load-balance loss gradient (added into dlogits).
+    if load_balance_coef > 0.0 and total_tokens_per_step is not None:
+        flextrain_load_balance_bwd(
+            logits=slot.x_router,
+            expert_counts=slot.expert_counts,
+            num_experts=num_experts,
+            alpha=load_balance_coef,
+            tokens_per_step=total_tokens_per_step,
+            top_k=top_k,
+            dlogits=dlogits,
+        )
+
+    # 7) Router weight gradient + downstream FFN-norm-upstream
+    # accumulation. dgrad always runs; wgrad is skip-able under LoRA.
+    dispatcher.matmul(
+        primary_stream_ptr,
+        A=dlogits, B=weights["w_router"].T,
+        C=ffn_norm_upstream, D=ffn_norm_upstream,
+        beta=1.0, alpha=1.0,
+    )
+    if "g_router" in skip_grads:
+        if lora_per_expert_callback is not None:
+            lora_per_expert_callback(
+                "g_router", -1, ffn_norm_output, dlogits,
+            )
+    elif grads.get("g_router") is not None:
+        dispatcher.matmul(
+            primary_stream_ptr,
+            A=ffn_norm_output.T, B=dlogits,
+            C=grads["g_router"], D=grads["g_router"],
+            beta=1.0, alpha=1.0,
+        )
+    # else: w_router frozen (LoRA on attn only). No wgrad to write.
+
+    return ffn_norm_upstream
+
+
+def routed_swiglu_moe_recompute_x_up(
+    ffn_norm_output: torch.Tensor,         # (T, d_model)
+    weights: Mapping[str, torch.Tensor],
+    slot: Any,
+    chunk_extra: Mapping[str, Any],
+    layer_id: int,
+    *,
+    top_k: int,
+) -> torch.Tensor:
+    """Tier-3 recompute. Refills ``slot.x_up`` (per-slot pre-SwiGLU)
+    by re-scattering the input and running each expert's up-projection.
+    Returns ``scattered_x`` so the caller can stash it for bwd to
+    reuse instead of re-scattering.
+
+    Single-stream — one matmul per expert is too small to benefit
+    from secondary-stream overlap.
+    """
+    num_tokens, d_model = ffn_norm_output.shape
+    index_mapping = chunk_extra["moe_token_index_mapping"][layer_id]
+    expert_counts_cpu = chunk_extra["moe_expert_counts_host"][layer_id]
+
+    scattered_x = torch.empty(
+        (num_tokens * top_k, d_model),
+        dtype=ffn_norm_output.dtype, device=ffn_norm_output.device,
+    )
+    flextrain_moe_scatter(ffn_norm_output, index_mapping, out=scattered_x)
+    swiglu_expert_loop_recompute_x_up(
+        scattered_x=scattered_x,
+        x_preact_buf=slot.x_up,
+        w_up=weights["w_up"],
+        expert_counts_cpu=expert_counts_cpu,
+        stream_ptr=torch.cuda.current_stream().cuda_stream,
+    )
+    return scattered_x
 
 
 def swiglu_expert_loop_fwd(
@@ -288,6 +684,15 @@ def swiglu_expert_loop_recompute_x_up(
 
 
 __all__ = (
+    # End-to-end ops (typical entry point).
+    "routed_swiglu_moe_fwd",
+    "routed_swiglu_moe_bwd",
+    "routed_swiglu_moe_recompute_x_up",
+    # Phase ops (compose your own pipeline).
+    "route_topk_softmax",
+    "dispatch_scatter",
+    "combine_gather",
+    # Expert-compute backend.
     "swiglu_expert_loop_fwd",
     "swiglu_expert_loop_bwd",
     "swiglu_expert_loop_recompute_x_up",
