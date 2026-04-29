@@ -24,10 +24,13 @@ Architecture (per Qwen3-Next, also Qwen 3.5 / 3.6 hybrid layers):
 
 Activation schema (max_tier=3):
 
-* Tier 0 — always saved (correctness-required, no recompute path):
+* Tier 0 — always saved (small ``(T, n_v_heads)`` scratches):
     ``lin_a`` (T, n_v_heads), ``lin_b`` (T, n_v_heads)        -- raw a/b
     ``lin_g`` / ``lin_g_post`` (T, n_v_heads) fp32           -- gate scalars
     ``lin_q_rstd`` / ``lin_k_rstd`` (T, n_v_heads) fp32       -- l2-norm rstds
+* Tier 1 — recomputable via ``fwd_recompute_post_conv`` (re-runs the
+  projection-split stage); saved by default to avoid the small
+  recompute cost when host budget allows:
     ``lin_z`` (T, n_v_heads, head_v_dim)                      -- gated-RMSNorm gate
 * Tier 2 — recomputable via ``fwd_recompute_fla`` from tier-3 + Q/K/V:
     ``lin_q``, ``lin_k``, ``lin_v`` (post-GVA, post-l2norm-input)
@@ -247,16 +250,24 @@ class GatedDeltaNetBlock:
                 lambda n, d: (n, cfg.num_v_heads),
                 torch.float32, tier=0,
             ),
-            # Gated-RMSNorm gate. ``z`` flows through gated-RMSNorm
-            # bwd directly and there is no recompute path for it
-            # (it's a separate projection ``x @ W_qkvz`` slice that
-            # we'd need to redo, but the recompute helpers don't
-            # produce z). So tier 0 — required-for-correctness, not
-            # an optional save.
+            # Gated-RMSNorm gate. Largest field in this block per
+            # token (``T * num_v_heads * head_v_dim * 2`` bytes — for
+            # Qwen3.6-35B-A3B with num_v_heads=32, head_v_dim=128 that's
+            # ~8 KiB/token, ~2 GiB at chunk=262144). It IS recomputable
+            # via ``fwd_recompute_post_conv`` (same stage that produces
+            # ``lin_conv_in`` from x_inp), so we put it at tier=1: at
+            # save level 1+ it is persisted (cheap save, no extra
+            # work in bwd), at save level 0 it is recomputed alongside
+            # the rest of the projection stage. Keeping it tier=0
+            # forced the host activation buffer to hold ~2x more
+            # level-0 bytes per (chunk, layer) for hybrid linear+full
+            # backbones, and that pushed ``target_tokens_per_round``
+            # 2x past what actually fits — the working_set solve
+            # failed on tight host budgets.
             ActivationField(
                 "lin_z",
                 lambda n, d: (n, cfg.num_v_heads, cfg.head_v_dim),
-                bf, tier=0,
+                bf, tier=1,
             ),
             # ==================================================
             # Tier 2: post-conv Q/K/V, FLA scratch, FLA core output.
@@ -376,11 +387,18 @@ class GatedDeltaNetBlock:
         x: torch.Tensor,
         weights: Mapping[str, torch.Tensor],
         slot,
+        *,
+        skip_already_saved: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Stage 1: x @ W_qkvz, x @ W_ba, splits, and cat → conv_in.
 
-        Saves tier-0 ``lin_a``, ``lin_b`` and tier-1 ``lin_z``;
-        saves tier-3 ``lin_conv_in``.
+        Saves tier-0 ``lin_a``, ``lin_b``, tier-1 ``lin_z``, and
+        tier-3 ``lin_conv_in``.
+
+        ``skip_already_saved=True`` (used from recompute paths only)
+        suppresses ``slot.X.copy_`` writes for fields already present
+        at this slot's level — chiefly ``lin_z`` (8 KiB/token at
+        Qwen3.6-35B-A3B; redundant write swamps PCIe at large chunks).
 
         Returns ``(z, conv_in)`` (z and conv_in are also re-derivable
         from saved fields, but returning saves a re-cast).
@@ -396,10 +414,14 @@ class GatedDeltaNetBlock:
         k_flat = k_pre.reshape(T, cfg.key_dim)
         v_flat = v_pre.reshape(T, cfg.value_dim)
         conv_in = torch.cat([q_flat, k_flat, v_flat], dim=-1)  # (T, conv_dim)
-        slot.lin_conv_in.copy_(conv_in.to(bf))
-        slot.lin_a.copy_(a.to(bf))
-        slot.lin_b.copy_(b.to(bf))
-        slot.lin_z.copy_(z.to(bf))
+        if not (skip_already_saved and slot.has("lin_conv_in")):
+            slot.lin_conv_in.copy_(conv_in.to(bf))
+        if not (skip_already_saved and slot.has("lin_a")):
+            slot.lin_a.copy_(a.to(bf))
+        if not (skip_already_saved and slot.has("lin_b")):
+            slot.lin_b.copy_(b.to(bf))
+        if not (skip_already_saved and slot.has("lin_z")):
+            slot.lin_z.copy_(z.to(bf))
         return z, conv_in
 
     def _fwd_conv(
@@ -407,6 +429,8 @@ class GatedDeltaNetBlock:
         conv_in: torch.Tensor,
         weights: Mapping[str, torch.Tensor],
         slot,
+        *,
+        skip_already_saved: bool = False,
     ) -> torch.Tensor:
         """Stage 2: depthwise causal conv1d. Saves ``lin_post_conv_pre_silu``.
 
@@ -420,9 +444,10 @@ class GatedDeltaNetBlock:
             conv_x, weights["w_lin_conv"], bias=None,
             padding=K - 1, groups=cfg.conv_dim,
         )[..., :T]
-        slot.lin_post_conv_pre_silu.copy_(
-            post_conv_pre_silu.squeeze(0).transpose(0, 1).contiguous().to(bf)
-        )
+        if not (skip_already_saved and slot.has("lin_post_conv_pre_silu")):
+            slot.lin_post_conv_pre_silu.copy_(
+                post_conv_pre_silu.squeeze(0).transpose(0, 1).contiguous().to(bf)
+            )
         post_conv = F.silu(post_conv_pre_silu)
         return post_conv.squeeze(0).transpose(0, 1).contiguous()
 
@@ -579,13 +604,17 @@ class GatedDeltaNetBlock:
     ) -> torch.Tensor:
         """Tier-3 recompute: ``lin_conv_in`` and ``lin_post_conv_pre_silu``
         weren't saved, so re-run projections + conv from ``x``.
-        Tier-0 ``lin_a/b`` and tier-1 ``lin_z`` are also re-derived
-        and copied (cheap; same matmul that produces conv_in).
+        Tier-0 ``lin_a/b`` and tier-1 ``lin_z`` are skipped if already
+        persisted at this slot's level (level 1 saves ``lin_z``;
+        level 0 doesn't, so we rewrite). The matmul itself is
+        unavoidable since we need ``conv_in`` for the conv stage.
 
         Returns the post-silu ``post_conv`` tensor (T, conv_dim) for
         the caller to feed into stage 3."""
-        _z, conv_in = self._fwd_proj_split(x, weights, slot)
-        return self._fwd_conv(conv_in, weights, slot)
+        _z, conv_in = self._fwd_proj_split(
+            x, weights, slot, skip_already_saved=True,
+        )
+        return self._fwd_conv(conv_in, weights, slot, skip_already_saved=True)
 
     def fwd_recompute_qkv_heads(self, slot) -> tuple[
         torch.Tensor, torch.Tensor, torch.Tensor,
