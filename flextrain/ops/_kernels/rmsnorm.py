@@ -12,61 +12,92 @@ def rms_norm_fwd_kernel(
     stride_x_t, stride_y_t, stride_rstd_t,
     N_COLS,               # Normalization dimension (D or head_dim)
     N_HEADS,              # Number of heads (1 for full_row)
-    EPSILON: tl.float32,  # Epsilon for numerical stability
+    TOTAL_ROWS,           # T * N_HEADS — flat row count
+    EPSILON: tl.float32,
     HAS_WEIGHTS: tl.constexpr,
     IS_BY_HEAD: tl.constexpr,
     BLOCK_SIZE_D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
 ):
-    """
-    Triton kernel for RMSNorm forward pass.
-    Grid is (T, N_HEADS).
-    """
-    pid_t = tl.program_id(axis=0)
-    pid_h = tl.program_id(axis=1)
+    """RMSNorm forward, BLOCK_M rows per program.
 
-    # --- Calculate pointers ---
-    row_x_ptr = X_ptr + pid_t * stride_x_t
-    row_y_ptr = Y_ptr + pid_t * stride_y_t
-    
-    start_col = pid_h * N_COLS
-    group_x_ptr = row_x_ptr + start_col
-    group_y_ptr = row_y_ptr + start_col
-    rstd_ptr = Rstd_ptr + pid_t * stride_rstd_t + pid_h
+    Grid: ``(cdiv(TOTAL_ROWS, BLOCK_M),)``. Each program normalizes
+    BLOCK_M contiguous (token, head) rows of length ``N_COLS``. This
+    is much better than one program per row when ``N_COLS`` is small
+    (e.g. head_dim=128 on Qwen3-30B-A3B q_norm at T=131072 used to
+    launch 4.2M programs each doing 128 elements; now T*32/BLOCK_M
+    programs each do BLOCK_M*128 elements).
 
-    # --- Compute RMS ---
+    Layout: row ``r`` corresponds to (pid_t=r // N_HEADS, pid_h=r % N_HEADS).
+    For ``IS_BY_HEAD=False`` this collapses to (pid_t=r, pid_h=0) and
+    the per-row stride is ``stride_x_t``.
+    """
+    pid = tl.program_id(axis=0)
+    row_start = pid * BLOCK_M
+    rows = row_start + tl.arange(0, BLOCK_M)
+    row_mask = rows < TOTAL_ROWS
+
+    # Decompose flat row -> (token, head). For !IS_BY_HEAD, N_HEADS=1
+    # so token=row, head=0. Triton requires the divisor to be a
+    # compile-time constant or runtime — N_HEADS is a runtime arg.
+    if IS_BY_HEAD:
+        token = rows // N_HEADS
+        head = rows % N_HEADS
+    else:
+        token = rows
+        head = rows * 0  # all zeros
+
     offs_d = tl.arange(0, BLOCK_SIZE_D)
     mask_d = offs_d < N_COLS
 
-    # Load x (fp16/bf16)
-    x = tl.load(group_x_ptr + offs_d, mask=mask_d, other=0.0)
-    
-    # Compute sum of squares in fp32
+    # Per-row x pointer: X[token, head*N_COLS + offs_d]
+    x_row_ptrs = (
+        X_ptr
+        + token[:, None] * stride_x_t
+        + head[:, None] * N_COLS
+        + offs_d[None, :]
+    )
+    full_mask = row_mask[:, None] & mask_d[None, :]
+    x = tl.load(x_row_ptrs, mask=full_mask, other=0.0)
     x_f32 = x.to(tl.float32)
-    var = tl.sum(x_f32 * x_f32, axis=0) / N_COLS
-    
-    # Compute rstd
-    rstd_val = tl.rsqrt(var + EPSILON)
-    tl.store(rstd_ptr, rstd_val)
 
-    # --- Normalize ---
-    # Match PyTorch: (x.float() * rstd).type_as(x)
-    x_norm_fp32 = x_f32 * rstd_val
-    x_norm_original_dtype = x_norm_fp32.to(X_ptr.dtype.element_ty)
-    
-    # --- Apply Weights ---
+    # Per-row variance.
+    var = tl.sum(x_f32 * x_f32, axis=1) / N_COLS
+    rstd_val = tl.rsqrt(var + EPSILON)
+
+    # Store rstd at (token, head). rstd buffer shape is (T, N_HEADS).
+    rstd_ptrs = (
+        Rstd_ptr + token * stride_rstd_t + head
+    )
+    tl.store(rstd_ptrs, rstd_val, mask=row_mask)
+
+    # Normalize.
+    x_norm = (x_f32 * rstd_val[:, None]).to(X_ptr.dtype.element_ty)
+
+    # Apply weights.
     if HAS_WEIGHTS:
         if IS_BY_HEAD:
-            w_ptr = W_ptr
+            # Same W for every head — broadcast.
+            w = tl.load(W_ptr + offs_d, mask=mask_d)
+            y = x_norm * w[None, :]
         else:
-            w_ptr = W_ptr + start_col 
-        
-        w = tl.load(w_ptr + offs_d, mask=mask_d)
-        y = x_norm_original_dtype * w
+            # Per-column W. Each row uses W[head*N_COLS + offs_d];
+            # for !IS_BY_HEAD, head=0, so W[offs_d] suffices but we
+            # need per-row in case n_heads>1 and !IS_BY_HEAD never
+            # happens (N_HEADS=1 always); use offs_d directly.
+            w = tl.load(W_ptr + offs_d, mask=mask_d)
+            y = x_norm * w[None, :]
     else:
-        y = x_norm_original_dtype
+        y = x_norm
 
-    # Store result
-    tl.store(group_y_ptr + offs_d, y, mask=mask_d)
+    # Store y to Y[token, head*N_COLS + offs_d]
+    y_row_ptrs = (
+        Y_ptr
+        + token[:, None] * stride_y_t
+        + head[:, None] * N_COLS
+        + offs_d[None, :]
+    )
+    tl.store(y_row_ptrs, y, mask=full_mask)
 
 
 @triton.jit
@@ -75,50 +106,61 @@ def rms_norm_fwd_recompute_kernel(
     stride_x_t, stride_y_t, stride_rstd_t,
     N_COLS,
     N_HEADS,
+    TOTAL_ROWS,
     HAS_WEIGHTS: tl.constexpr,
     IS_BY_HEAD: tl.constexpr,
     BLOCK_SIZE_D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
 ):
-    """
-    Triton kernel for RMSNorm recompute forward pass.
-    Uses pre-computed rstd values.
-    """
-    pid_t = tl.program_id(axis=0)
-    pid_h = tl.program_id(axis=1)
+    """RMSNorm recompute fwd, BLOCK_M rows per program. Uses
+    pre-computed rstd values from the original fwd. Same row-blocking
+    fix as ``rms_norm_fwd_kernel`` to avoid 4M-program launches at
+    head_dim=128 / large T."""
+    pid = tl.program_id(axis=0)
+    row_start = pid * BLOCK_M
+    rows = row_start + tl.arange(0, BLOCK_M)
+    row_mask = rows < TOTAL_ROWS
 
-    row_x_ptr = X_ptr + pid_t * stride_x_t
-    row_y_ptr = Y_ptr + pid_t * stride_y_t
-    
-    start_col = pid_h * N_COLS
-    group_x_ptr = row_x_ptr + start_col
-    group_y_ptr = row_y_ptr + start_col
-    rstd_ptr = Rstd_ptr + pid_t * stride_rstd_t + pid_h
-
-    # Load pre-computed rstd
-    rstd_val = tl.load(rstd_ptr).to(tl.float32)
+    if IS_BY_HEAD:
+        token = rows // N_HEADS
+        head = rows % N_HEADS
+    else:
+        token = rows
+        head = rows * 0
 
     offs_d = tl.arange(0, BLOCK_SIZE_D)
     mask_d = offs_d < N_COLS
 
-    x = tl.load(group_x_ptr + offs_d, mask=mask_d, other=0.0)
+    rstd_ptrs = Rstd_ptr + token * stride_rstd_t + head
+    rstd_val = tl.load(rstd_ptrs, mask=row_mask, other=0.0).to(tl.float32)
+
+    x_row_ptrs = (
+        X_ptr
+        + token[:, None] * stride_x_t
+        + head[:, None] * N_COLS
+        + offs_d[None, :]
+    )
+    full_mask = row_mask[:, None] & mask_d[None, :]
+    x = tl.load(x_row_ptrs, mask=full_mask, other=0.0)
     x_f32 = x.to(tl.float32)
-    
-    # Normalize
-    x_norm_fp32 = x_f32 * rstd_val
-    x_norm_original_dtype = x_norm_fp32.to(X_ptr.dtype.element_ty)
 
-    # Apply weights
+    x_norm = (x_f32 * rstd_val[:, None]).to(X_ptr.dtype.element_ty)
+
     if HAS_WEIGHTS:
-        if IS_BY_HEAD:
-            w_ptr = W_ptr
-        else:
-            w_ptr = W_ptr + start_col
-        w = tl.load(w_ptr + offs_d, mask=mask_d)
-        y = x_norm_original_dtype * w
+        # IS_BY_HEAD: same head_dim weight for every (token, head); broadcast.
+        # !IS_BY_HEAD: N_HEADS=1 so head=0 and the W slice is W[offs_d].
+        w = tl.load(W_ptr + offs_d, mask=mask_d)
+        y = x_norm * w[None, :]
     else:
-        y = x_norm_original_dtype
+        y = x_norm
 
-    tl.store(group_y_ptr + offs_d, y, mask=mask_d)
+    y_row_ptrs = (
+        Y_ptr
+        + token[:, None] * stride_y_t
+        + head[:, None] * N_COLS
+        + offs_d[None, :]
+    )
+    tl.store(y_row_ptrs, y, mask=full_mask)
 
 
 # ===================================================================
@@ -130,82 +172,106 @@ def rms_norm_bwd_dx_kernel(
     dY_ptr, X_ptr, W_ptr, Rstd_ptr,
     dX_ptr, Y_ptr,
     stride_dy_t, stride_x_t, stride_rstd_t, stride_dx_t, stride_y_t,
-    N_COLS,       
-    N_HEADS,      
+    N_COLS,
+    N_HEADS,
+    TOTAL_ROWS,
     HAS_WEIGHTS: tl.constexpr,
     IS_BY_HEAD: tl.constexpr,
     ACCUMULATE_DX: tl.constexpr,
     RECOMPUTE_OUTPUT: tl.constexpr,
     BLOCK_SIZE_D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
 ):
-    """
-    Calculates dX and optionally recomputes Y. 
-    This kernel is fully parallel over rows (T) and heads (N_HEADS).
-    It does NOT compute dW to avoid atomic contention.
-    """
-    pid_t = tl.program_id(axis=0)
-    pid_h = tl.program_id(axis=1)
+    """RMSNorm backward (dX path), BLOCK_M rows per program. Same
+    row-blocking fix as ``rms_norm_fwd_kernel``; eliminates the
+    one-program-per-row launch overhead at small N_COLS / large T.
 
-    # --- Pointers ---
-    row_dy_ptr = dY_ptr + pid_t * stride_dy_t
-    row_x_ptr = X_ptr + pid_t * stride_x_t
-    row_dx_ptr = dX_ptr + pid_t * stride_dx_t
-    rstd_ptr = Rstd_ptr + pid_t * stride_rstd_t + pid_h
+    dW is computed by a separate kernel
+    (``rms_norm_bwd_dw_partial_kernel`` / ``..._kernel_legacy``) so this
+    kernel doesn't contend on a shared output.
+    """
+    pid = tl.program_id(axis=0)
+    row_start = pid * BLOCK_M
+    rows = row_start + tl.arange(0, BLOCK_M)
+    row_mask = rows < TOTAL_ROWS
 
-    # Offsets for D dimension
+    if IS_BY_HEAD:
+        token = rows // N_HEADS
+        head = rows % N_HEADS
+    else:
+        token = rows
+        head = rows * 0
+
     offs_d = tl.arange(0, BLOCK_SIZE_D)
     mask_d = offs_d < N_COLS
-    
-    # Handle Heads
-    start_col = pid_h * N_COLS
-    group_dy_ptr = row_dy_ptr + start_col
-    group_x_ptr = row_x_ptr + start_col
-    group_dx_ptr = row_dx_ptr + start_col
+    full_mask = row_mask[:, None] & mask_d[None, :]
 
-    # --- Load Data ---
-    dy = tl.load(group_dy_ptr + offs_d, mask=mask_d, other=0.0).to(tl.float32)
-    x = tl.load(group_x_ptr + offs_d, mask=mask_d, other=0.0).to(tl.float32)
-    rstd_val = tl.load(rstd_ptr).to(tl.float32)
+    # Per-row pointers.
+    dy_ptrs = (
+        dY_ptr
+        + token[:, None] * stride_dy_t
+        + head[:, None] * N_COLS
+        + offs_d[None, :]
+    )
+    x_ptrs = (
+        X_ptr
+        + token[:, None] * stride_x_t
+        + head[:, None] * N_COLS
+        + offs_d[None, :]
+    )
+    rstd_ptrs = Rstd_ptr + token * stride_rstd_t + head
 
-    # --- Recompute Y (Standardized) ---
-    y_norm_f32 = x * rstd_val
-    
-    # --- Apply Weights to dY ---
+    dy = tl.load(dy_ptrs, mask=full_mask, other=0.0).to(tl.float32)
+    x = tl.load(x_ptrs, mask=full_mask, other=0.0).to(tl.float32)
+    rstd_val = tl.load(rstd_ptrs, mask=row_mask, other=0.0).to(tl.float32)
+
+    y_norm_f32 = x * rstd_val[:, None]
+
     if HAS_WEIGHTS:
-        if IS_BY_HEAD:
-            w_ptr = W_ptr
-        else:
-            w_ptr = W_ptr + start_col
-        w = tl.load(w_ptr + offs_d, mask=mask_d).to(tl.float32)
-        
-        # If we need to store Y, we multiply by W here
+        # IS_BY_HEAD: same head_dim weight for every (token, head).
+        # !IS_BY_HEAD: N_HEADS=1, head=0, so W_ptr + offs_d works.
+        w = tl.load(W_ptr + offs_d, mask=mask_d).to(tl.float32)
         if RECOMPUTE_OUTPUT:
-            y_final = y_norm_f32 * w
-            row_y_ptr = Y_ptr + pid_t * stride_y_t 
-            tl.store(row_y_ptr + start_col + offs_d, y_final.to(Y_ptr.dtype.element_ty), mask=mask_d)
-
-        # Pre-multiply dy by w for the dX calculation
-        dy_scaled = dy * w
+            y_final = y_norm_f32 * w[None, :]
+            y_ptrs = (
+                Y_ptr
+                + token[:, None] * stride_y_t
+                + head[:, None] * N_COLS
+                + offs_d[None, :]
+            )
+            tl.store(
+                y_ptrs, y_final.to(Y_ptr.dtype.element_ty), mask=full_mask,
+            )
+        dy_scaled = dy * w[None, :]
     else:
         dy_scaled = dy
         if RECOMPUTE_OUTPUT:
-            row_y_ptr = Y_ptr + pid_t * stride_y_t 
-            tl.store(row_y_ptr + start_col + offs_d, y_norm_f32.to(Y_ptr.dtype.element_ty), mask=mask_d)
+            y_ptrs = (
+                Y_ptr
+                + token[:, None] * stride_y_t
+                + head[:, None] * N_COLS
+                + offs_d[None, :]
+            )
+            tl.store(
+                y_ptrs, y_norm_f32.to(Y_ptr.dtype.element_ty), mask=full_mask,
+            )
 
-    # --- Compute dX ---
-    # Math: dX = rstd * ( dy_scaled - y_norm * sum(dy_scaled * y_norm) / N )
-    term_dot = tl.sum(y_norm_f32 * dy_scaled, axis=0)
+    # dX = rstd * ( dy_scaled - y_norm * sum(dy_scaled * y_norm) / N )
+    # Reduction is per-row (axis=1, the D axis).
+    term_dot = tl.sum(y_norm_f32 * dy_scaled, axis=1)
     k = term_dot / N_COLS
-    
-    dx = rstd_val * (dy_scaled - y_norm_f32 * k)
+    dx = rstd_val[:, None] * (dy_scaled - y_norm_f32 * k[:, None])
 
-    # --- Store ---
+    dx_ptrs = (
+        dX_ptr
+        + token[:, None] * stride_dx_t
+        + head[:, None] * N_COLS
+        + offs_d[None, :]
+    )
     if ACCUMULATE_DX:
-        dx_old = tl.load(group_dx_ptr + offs_d, mask=mask_d, other=0.0)
-        dx_final = dx_old + dx
-        tl.store(group_dx_ptr + offs_d, dx_final.to(dX_ptr.dtype.element_ty), mask=mask_d)
-    else:
-        tl.store(group_dx_ptr + offs_d, dx.to(dX_ptr.dtype.element_ty), mask=mask_d)
+        dx_old = tl.load(dx_ptrs, mask=full_mask, other=0.0).to(tl.float32)
+        dx = dx_old + dx
+    tl.store(dx_ptrs, dx.to(dX_ptr.dtype.element_ty), mask=full_mask)
 
 
 # Legacy single-stage kernel — kept for benchmarking / regression
@@ -416,16 +482,51 @@ def flextrain_rmsnorm_fwd(
         if not rstd.is_contiguous():
             raise ValueError("rstd tensor must be contiguous")
 
+    # Pick BLOCK_M (rows per program). Aim for ~1-4 KiB of data per
+    # program at bf16 to hide launch overhead while keeping enough
+    # programs to fill SMs. For dense (N_HEADS=1) the per-row width
+    # (N_COLS) is large, so BLOCK_M=1 already saturates each SM. For
+    # per-head (N_HEADS>1, N_COLS=head_dim small) we need BLOCK_M>1
+    # to amortize launch overhead — at head_dim=128 on Qwen3-30B-A3B
+    # the original BLOCK_M=1 launched 4M tiny programs.
+    total_rows = T * N_HEADS
+    n_sms = torch.cuda.get_device_properties(device).multi_processor_count
+    # Pick BLOCK_M (rows per program) to balance launch overhead vs
+    # register pressure. Heuristic targets ~4-8 KiB of payload per
+    # program at bf16, scaled down if SM occupancy would suffer.
+    if N_COLS >= 2048:
+        BLOCK_M = 4
+    elif N_COLS >= 1024:
+        BLOCK_M = 8
+    elif N_COLS >= 256:
+        BLOCK_M = 16
+    else:
+        BLOCK_M = 32
+    while BLOCK_M > 1 and total_rows // BLOCK_M < 4 * n_sms:
+        BLOCK_M //= 2
+    grid = (triton.cdiv(total_rows, BLOCK_M),)
+    # num_warps: bigger payload (BLOCK_M * BLOCK_SIZE_D) wants more
+    # warps to share the load and the per-row reduction.
+    payload = BLOCK_M * BLOCK_SIZE_D
+    if payload >= 8192:
+        num_warps = 8
+    elif payload >= 2048:
+        num_warps = 4
+    else:
+        num_warps = 2
     rms_norm_fwd_kernel[grid](
         X, Y, W, rstd,
         X.stride(0), Y.stride(0), rstd.stride(0),
         N_COLS, N_HEADS,
+        total_rows,
         rms_norm_eps,
         HAS_WEIGHTS=HAS_WEIGHTS,
         IS_BY_HEAD=IS_BY_HEAD,
         BLOCK_SIZE_D=BLOCK_SIZE_D,
+        BLOCK_M=BLOCK_M,
+        num_warps=num_warps,
     )
-    
+
     return Y, rstd
 
 def flextrain_rmsnorm_fwd_recompute(
@@ -451,13 +552,32 @@ def flextrain_rmsnorm_fwd_recompute(
              raise ValueError("Output tensor must be contiguous")
         Y = output
 
-    rms_norm_fwd_recompute_kernel[grid](
+    total_rows = T * N_HEADS
+    n_sms = torch.cuda.get_device_properties(device).multi_processor_count
+    if N_COLS >= 1024:
+        BLOCK_M = 1
+    elif N_COLS >= 256:
+        BLOCK_M = 4
+    else:
+        BLOCK_M = 16
+        while BLOCK_M > 1 and total_rows // BLOCK_M < 4 * n_sms:
+            BLOCK_M //= 2
+    grid_recompute = (triton.cdiv(total_rows, BLOCK_M),)
+    if BLOCK_SIZE_D >= 2048:
+        num_warps = 8
+    elif BLOCK_SIZE_D >= 512:
+        num_warps = 4
+    else:
+        num_warps = 2
+    rms_norm_fwd_recompute_kernel[grid_recompute](
         X, Y, W, rstd,
         X.stride(0), Y.stride(0), rstd.stride(0),
-        N_COLS, N_HEADS,
+        N_COLS, N_HEADS, total_rows,
         HAS_WEIGHTS=HAS_WEIGHTS,
         IS_BY_HEAD=IS_BY_HEAD,
         BLOCK_SIZE_D=BLOCK_SIZE_D,
+        BLOCK_M=BLOCK_M,
+        num_warps=num_warps,
     )
     
     return Y
@@ -531,18 +651,39 @@ def flextrain_rmsnorm_bwd(
         ACCUMULATE_DX = True
 
     # --- 1. Launch dX Kernel (Row Parallel) ---
-    # This kernel handles the math for dX and optional Y recompute.
-    # It does NOT handle dW.
-    rms_norm_bwd_dx_kernel[grid](
+    # Same row-blocking heuristic as the fwd kernel.
+    total_rows = T * N_HEADS
+    n_sms = torch.cuda.get_device_properties(device).multi_processor_count
+    if N_COLS >= 2048:
+        BLOCK_M_DX = 4
+    elif N_COLS >= 1024:
+        BLOCK_M_DX = 8
+    elif N_COLS >= 256:
+        BLOCK_M_DX = 16
+    else:
+        BLOCK_M_DX = 32
+    while BLOCK_M_DX > 1 and total_rows // BLOCK_M_DX < 4 * n_sms:
+        BLOCK_M_DX //= 2
+    grid_dx = (triton.cdiv(total_rows, BLOCK_M_DX),)
+    payload_dx = BLOCK_M_DX * BLOCK_SIZE_D
+    if payload_dx >= 8192:
+        num_warps_dx = 8
+    elif payload_dx >= 2048:
+        num_warps_dx = 4
+    else:
+        num_warps_dx = 2
+    rms_norm_bwd_dx_kernel[grid_dx](
         dY, X, W, rstd,
         dX, Y_ptr,
         dY.stride(0), X.stride(0), rstd.stride(0), dX.stride(0), Y_stride_0,
-        N_COLS, N_HEADS,
+        N_COLS, N_HEADS, total_rows,
         HAS_WEIGHTS=HAS_WEIGHTS,
         IS_BY_HEAD=IS_BY_HEAD,
         ACCUMULATE_DX=ACCUMULATE_DX,
         RECOMPUTE_OUTPUT=RECOMPUTE_OUTPUT,
         BLOCK_SIZE_D=BLOCK_SIZE_D,
+        BLOCK_M=BLOCK_M_DX,
+        num_warps=num_warps_dx,
     )
 
     # --- 2. Launch dW Kernel (Split-K Column Reduction) ---
