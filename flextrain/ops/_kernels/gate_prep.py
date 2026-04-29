@@ -103,15 +103,14 @@ def flextrain_gate_prep_fwd(
     assert A_log.shape == (H,), f"A_log shape {A_log.shape} != (H={H},)"
     assert dt_bias.shape == (H,), f"dt_bias shape {dt_bias.shape} != (H={H},)"
     assert a.is_cuda and b.is_cuda
-
-    if not a.is_contiguous():
-        a = a.contiguous()
-    if not b.is_contiguous():
-        b = b.contiguous()
-    if not A_log.is_contiguous():
-        A_log = A_log.contiguous()
-    if not dt_bias.is_contiguous():
-        dt_bias = dt_bias.contiguous()
+    # Kernel reads via ``t * stride_a_t + h`` — only requires last-axis
+    # stride 1, not full contiguity. The fwd call site passes
+    # ``slot.lin_ba[:, :HV]`` / ``slot.lin_ba[:, HV:]`` (last-axis-contig
+    # slices); previously we forced a redundant D2D contiguous-ify on
+    # each call. A_log / dt_bias are 1-D so .contiguous() was a no-op.
+    assert a.stride(-1) == 1 and b.stride(-1) == 1, (
+        "a/b must have last-axis stride 1"
+    )
 
     if g_out is None:
         g_out = torch.empty(T, H, dtype=torch.float32, device=a.device)
