@@ -24,25 +24,22 @@ Architecture (per Qwen3-Next, also Qwen 3.5 / 3.6 hybrid layers):
 
 Activation schema (max_tier=3):
 
-* Tier 0 — always saved (small ``(T, n_v_heads)`` scratches):
-    ``lin_a`` (T, n_v_heads), ``lin_b`` (T, n_v_heads)        -- raw a/b
-    ``lin_g`` / ``lin_g_post`` (T, n_v_heads) fp32           -- gate scalars
-    ``lin_q_rstd`` / ``lin_k_rstd`` (T, n_v_heads) fp32       -- l2-norm rstds
-* Tier 1 — recomputable via ``fwd_recompute_post_conv`` (re-runs the
-  projection-split stage); saved by default to avoid the small
-  recompute cost when host budget allows:
-    ``lin_z`` (T, n_v_heads, head_v_dim)                      -- gated-RMSNorm gate
-* Tier 2 — recomputable via ``fwd_recompute_fla`` from tier-3 + Q/K/V:
-    ``lin_q`` (T, n_k_heads, head_k_dim) -- post-l2norm; per-K-head.
-    ``lin_k`` (T, n_k_heads, head_k_dim) -- post-l2norm; per-K-head.
-    ``lin_v`` (T, n_v_heads, head_v_dim)
-    ``lin_A_int``                                             -- FLA scratch
-    ``lin_core_out``                                          -- FLA output
-* Tier 3 — recomputable via ``fwd_recompute_post_conv`` from x_inp:
-    ``lin_conv_in``                                           -- pre-conv qkv concat
-NOTE: post-conv (silu output) is NOT saved. Bwd recomputes pre-silu by
-re-running the conv with activation=None into a scratch buffer (FLA's
-pattern). Saves ~T*conv_dim bf16 per layer of activation memory.
+* Tier 0 — always saved (small):
+    ``lin_ba`` (T, 2*n_v_heads) bf16   -- raw b|a (post-projection)
+    ``lin_g`` / ``lin_g_post`` (T, n_v_heads) fp32   -- gate scalars
+* Tier 2 — FLA-output fields, expensive to recompute:
+    ``lin_A_int``     (T, n_v_heads, 64)              -- FLA intra-chunk scratch
+    ``lin_core_out``  (T, n_v_heads, head_v_dim)      -- FLA output
+* Tier 3 — biggest field, the projection output:
+    ``lin_qkvz``      (T, 2*key_dim + 2*value_dim) bf16  -- x @ W_qkvz
+
+Q/K/V (post-l2norm) and the l2norm rstds are NOT saved. Bwd already
+runs the conv to recover pre-silu (silu_bwd input), and the same conv
+with activation='silu' produces post-conv from which Q/K/V derive
+trivially. Stage D2 made the conv recompute mandatory; this collapses
+the schema accordingly.
+
+post-conv (silu output) is also NOT saved (transient scratch).
 """
 from __future__ import annotations
 
@@ -487,43 +484,14 @@ class GatedDeltaNetBlock:
                 lambda n, d: (n, cfg.num_v_heads),
                 torch.float32, tier=0,
             ),
-            # L2-norm reciprocal-stddev per (token, k_head). HF's linear
-            # attention uses ``use_qk_l2norm_in_kernel=True`` which wraps
-            # FLA's recurrence with ``l2norm_fwd``+``l2norm_bwd``; the
-            # lower-level kernel we drive directly doesn't, so we run
-            # l2 norm explicitly. We save only the rstd (small, fp32)
-            # and recompute the normalized q/k in bwd from the saved
-            # un-normalized q_h/k_h.
-            ActivationField(
-                "lin_q_rstd",
-                lambda n, d: (n, cfg.num_k_heads),
-                torch.float32, tier=0,
-            ),
-            ActivationField(
-                "lin_k_rstd",
-                lambda n, d: (n, cfg.num_k_heads),
-                torch.float32, tier=0,
-            ),
             # ==================================================
-            # Tier 2: post-conv Q/K/V, FLA scratch, FLA core output.
-            # All recomputable from saved qkvz via the projection /
-            # conv / l2norm stages.
+            # Tier 2: FLA scratch + FLA core output. Q/K/V/rstds are
+            # NOT saved: bwd already pays a conv recompute (see Stage D2)
+            # and post-conv is the input to qkv_heads, so deriving Q/K/V
+            # is essentially free once post-conv is in scratch. Saves
+            # ~T*(2*key_dim + value_dim) bf16 + 2*T*num_k_heads fp32
+            # per layer (~270 MiB at T=16k for Qwen3.5-MoE-35B-A3B).
             # ==================================================
-            ActivationField(
-                "lin_q",
-                lambda n, d: (n, cfg.num_k_heads, cfg.head_k_dim),
-                bf, tier=2,
-            ),
-            ActivationField(
-                "lin_k",
-                lambda n, d: (n, cfg.num_k_heads, cfg.head_k_dim),
-                bf, tier=2,
-            ),
-            ActivationField(
-                "lin_v",
-                lambda n, d: (n, cfg.num_v_heads, cfg.head_v_dim),
-                bf, tier=2,
-            ),
             ActivationField(
                 "lin_A_int",
                 lambda n, d: (n, cfg.num_v_heads, 64),
@@ -705,17 +673,20 @@ class GatedDeltaNetBlock:
         )
         return post_conv
 
-    def _fwd_qkv_heads(self, post_conv: torch.Tensor, slot) -> tuple[
+    def _fwd_qkv_heads(
+        self, post_conv: torch.Tensor, ctx: LayerContext,
+    ) -> tuple[
         torch.Tensor, torch.Tensor, torch.Tensor,
         torch.Tensor, torch.Tensor,
     ]:
         """Stage 3: split post_conv → Q/K/V heads + l2norm on q/k.
 
-        Saves tier-2 ``lin_q`` / ``lin_k`` (post-l2norm, per-K-head shape
-        ``(T, num_k_heads, head_k_dim)``) and ``lin_v``
-        (``(T, num_v_heads, head_v_dim)``), plus tier-0 ``lin_q_rstd`` /
-        ``lin_k_rstd`` (per-(t, k_head) reciprocal-stddev needed by
-        ``l2norm_bwd`` in the bwd path).
+        Allocates Q/K/rstds from scratch; v_h is a zero-copy view of
+        post_conv. None of these are saved to slot — bwd recomputes
+        them from saved ``lin_qkvz`` via the same conv + qkv_heads path
+        (the conv runs in bwd anyway for silu_bwd's pre-silu input).
+
+        Returns ``(q_n, k_n, v_h, q_rstd, k_rstd)`` for the FLA stage.
 
         **No GVA repeat_interleave**. FLA's
         ``chunk_gated_delta_rule_fwd_h`` / ``chunk_fwd_o`` kernels do the
@@ -724,14 +695,7 @@ class GatedDeltaNetBlock:
         (see fla/ops/common/chunk_o.py:76, chunk_delta_h.py). Passing
         un-expanded ``(T, num_k_heads, head_k_dim)`` q/k saves the
         ~2 GiB ``repeat_interleave`` materialization at
-        T=131072 H=32 K=128.
-
-        Saving the post-l2norm q/k (instead of the un-normalized values
-        and recomputing in bwd) eliminates a 2 GiB fp32 transient
-        (the ``q_h.float() * q_rstd.float()`` promotion in the old bwd)
-        and one redundant elementwise pass per layer per chunk.
-
-        Returns ``(q_n, k_n, v_h, q_rstd, k_rstd)`` for the FLA stage."""
+        T=131072 H=32 K=128."""
         cfg = self.cfg
         T = post_conv.shape[0]
         q_p, k_p, v_p = torch.split(
@@ -744,26 +708,20 @@ class GatedDeltaNetBlock:
         q_h = q_p.reshape(T, cfg.num_k_heads, cfg.head_k_dim)
         k_h = k_p.reshape(T, cfg.num_k_heads, cfg.head_k_dim)
         v_h = v_p.reshape(T, cfg.num_v_heads, cfg.head_v_dim)
-        # L2 norm per-(token, k_head) row, written directly into slot
-        # tensors. Our flextrain_l2norm_fwd_into accepts strided 3D
-        # input via runtime token/head strides, so q_h / k_h (which are
-        # strided slices of the conv output: stride(0)=conv_dim,
-        # stride(1)=head_k_dim, stride(2)=1) feed in zero-copy. The
-        # FLA wrapper required contiguous (T*H, D) input and forced a
-        # ~T*key_dim bf16 D2D copy per call before this change.
-        from flextrain.ops import flextrain_l2norm_fwd_into
-        flextrain_l2norm_fwd_into(q_h, slot.lin_q, slot.lin_q_rstd)
-        flextrain_l2norm_fwd_into(k_h, slot.lin_k, slot.lin_k_rstd)
-        # v has no l2norm; it just needs to land in slot.lin_v. v_h is
-        # a free view of post_conv (contiguous slice), but slot.lin_v
-        # is its own buffer — we still need the copy here. Cheap (one
-        # contig-to-contig D2D pass over T*value_dim bf16).
-        slot.lin_v.copy_(v_h)
-        # Return slot views so the rest of the fwd avoids re-deriving.
-        return (
-            slot.lin_q, slot.lin_k, v_h,
-            slot.lin_q_rstd, slot.lin_k_rstd,
+        # Allocate l2norm outputs from scratch (Q/K post-l2norm + rstds).
+        q_n = ctx.scratch(
+            (T, cfg.num_k_heads, cfg.head_k_dim), cfg.compute_dtype,
         )
+        k_n = ctx.scratch(
+            (T, cfg.num_k_heads, cfg.head_k_dim), cfg.compute_dtype,
+        )
+        q_rstd = ctx.scratch((T, cfg.num_k_heads), torch.float32)
+        k_rstd = ctx.scratch((T, cfg.num_k_heads), torch.float32)
+        # Strided l2norm (q_h/k_h are non-contig slices of post_conv).
+        from flextrain.ops import flextrain_l2norm_fwd_into
+        flextrain_l2norm_fwd_into(q_h, q_n, q_rstd)
+        flextrain_l2norm_fwd_into(k_h, k_n, k_rstd)
+        return q_n, k_n, v_h, q_rstd, k_rstd
 
     def _fwd_gate_and_beta(
         self,
@@ -877,7 +835,7 @@ class GatedDeltaNetBlock:
         )
         z, conv_in = self._fwd_proj_split(x, weights, slot)
         post_conv = self._fwd_conv(conv_in, weights, ctx)
-        q_n, k_n, v_h, _q_rstd, _k_rstd = self._fwd_qkv_heads(post_conv, slot)
+        q_n, k_n, v_h, _q_rstd, _k_rstd = self._fwd_qkv_heads(post_conv, ctx)
         b, a = _split_ba_ft(slot.lin_ba, self.cfg)
         g, beta = self._fwd_gate_and_beta(a, b, weights, slot)
         core_out = self._fwd_fla(
@@ -914,36 +872,33 @@ class GatedDeltaNetBlock:
     # only what's missing at the current save level.
     # ------------------------------------------------------------------
 
-    def fwd_recompute_post_conv(
+    def fwd_recompute_proj(
         self,
         x: torch.Tensor,
         weights: Mapping[str, torch.Tensor],
         slot,
-        ctx: LayerContext,
-    ) -> torch.Tensor:
-        """Tier-3 recompute: re-run ``x @ W_qkvz`` (and ``x @ W_ba``)
-        plus the conv stage when the saved ``lin_qkvz`` wasn't persisted
-        by the save-level DP. ``slot.has("lin_qkvz")`` /
-        ``slot.has("lin_ba")`` short-circuit when the slot already holds
-        valid data from the original fwd's persist.
-
-        Returns the post-silu ``post_conv`` tensor (T, conv_dim) from
-        scratch for the caller to feed into stage 3."""
-        _z, conv_in = self._fwd_proj_split(
-            x, weights, slot, skip_already_saved=True,
-        )
-        return self._fwd_conv(conv_in, weights, ctx)
+    ) -> None:
+        """Tier-3 recompute: re-run ``x @ W_qkvz`` and ``x @ W_ba`` to
+        repopulate slot.lin_qkvz / slot.lin_ba when they weren't
+        persisted by the save-level DP. ``skip_already_saved=True``
+        short-circuits per-tensor when the slot already holds valid
+        data from the original fwd's persist."""
+        self._fwd_proj_split(x, weights, slot, skip_already_saved=True)
 
     def fwd_recompute_fla(
         self,
+        q_n: torch.Tensor,
+        k_n: torch.Tensor,
+        v_h: torch.Tensor,
         weights: Mapping[str, torch.Tensor],
         slot,
         chunk: ChunkMeta | None = None,
     ) -> torch.Tensor:
-        """Tier-2 recompute (FLA half): re-run FLA fwd from saved
-        Q/K/V/g/b to repopulate ``lin_core_out`` / ``lin_A_int`` /
-        ``lin_g_post``. ``lin_g`` (raw) and ``lin_ba`` (b/a slots)
-        must already be present (tier-0 — always saved).
+        """Tier-2 recompute (FLA half): re-run FLA fwd from supplied
+        Q/K/V (typically scratch-allocated via _fwd_qkv_heads on a
+        recomputed post_conv) and saved ``lin_g`` / ``lin_ba`` to
+        repopulate ``lin_core_out`` / ``lin_A_int`` / ``lin_g_post``
+        in slot.
 
         Beta is recomputed from saved ``b`` (= ``slot.lin_ba[:, :HV]``)
         via the fused gate-prep kernel (which also recomputes g; we
@@ -964,7 +919,7 @@ class GatedDeltaNetBlock:
             chunk.fla_chunk_indices_64 if chunk is not None else None
         )
         return self._fwd_fla(
-            slot.lin_q, slot.lin_k, slot.lin_v,
+            q_n, k_n, v_h,
             slot.lin_g, beta, slot,
             cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
         )
@@ -1064,8 +1019,9 @@ class GatedDeltaNetBlock:
           layout. b/a are zero-copy slices.
         * (post-conv pre-silu is NOT saved; recomputed via conv-without-
           activation into scratch at the top of bwd. FLA's pattern.)
-        * ``slot.lin_q``, ``lin_k``, ``lin_v`` — post-conv-silu Q/K/V
-          (the inputs to FLA).
+        * (lin_q / lin_k / lin_v are NOT saved; recomputed from saved
+          lin_qkvz via conv → silu → split → l2norm into scratch at
+          the top of bwd. Stage D2.5.)
         * ``slot.lin_g`` — pre-cumsum gate.
         * ``slot.lin_core_out`` — FLA output before the gated norm.
         * ``slot.aux["lin_A_int"]`` — FLA's intra-chunk attention scratch.
@@ -1089,25 +1045,21 @@ class GatedDeltaNetBlock:
         dtype = dy.dtype
         device = dy.device
 
-        # Pull saved tensors. ``lin_q`` / ``lin_k`` are POST-l2norm and
-        # per-K-head (shape ``(T, num_k_heads, head_k_dim)``) — see
-        # ``_fwd_qkv_heads``. ``lin_qkvz`` and ``lin_ba`` are the full
+        # Pull saved tensors. ``lin_qkvz`` and ``lin_ba`` are the full
         # matmul outputs in FT block-major column layout; we view into
         # them for the per-component pieces (zero-copy).
         x = slot.x_inp                                       # (T, d_model)
         b, a = _split_ba_ft(slot.lin_ba, cfg)                # both (T, num_v_heads)
         _q_pre, _k_pre, _v_pre, z = _split_qkvz_ft(slot.lin_qkvz, cfg)
         # z: (T, num_v_heads, head_v_dim) view of slot.lin_qkvz
-        q_n = slot.lin_q                                     # (T, n_k_heads, head_k_dim) post-l2norm
-        k_n = slot.lin_k                                     # (T, n_k_heads, head_k_dim) post-l2norm
-        v_h = slot.lin_v                                     # (T, n_v_heads, head_v_dim)
         g = slot.lin_g                                       # (T, n_v_heads) fp32
         core_out = slot.lin_core_out                         # (T, n_v_heads, head_v_dim)
         conv_in = slot.lin_qkvz[:, :cfg.conv_dim]            # (T, conv_dim) view
-        # post-conv pre-silu is no longer in the schema; recompute it
-        # by re-running the conv with activation=None into scratch (FLA
-        # does the same in their bwd path). flextrain_silu_bwd needs
-        # the pre-silu input, not post-silu.
+        # Q/K/V post-l2norm + rstds are no longer saved (Stage D2.5).
+        # Recompute them here by re-running the conv (no activation,
+        # giving us pre-silu for silu_bwd later) then silu+l2norm. The
+        # conv was already mandatory in bwd since Stage D2 (FLA pattern).
+        # The added work vs pre-D2.5 is one silu + two strided l2norms.
         post_conv_pre_silu = ctx.scratch(
             (T, cfg.conv_dim), cfg.compute_dtype,
         )
@@ -1117,6 +1069,10 @@ class GatedDeltaNetBlock:
             out_2d=post_conv_pre_silu,
             activation=None,
         )
+        # post_conv = silu(post_conv_pre_silu); allocate fresh scratch
+        # since silu_bwd later needs pre-silu intact.
+        post_conv = F.silu(post_conv_pre_silu)
+        q_n, k_n, v_h, q_rstd, k_rstd = self._fwd_qkv_heads(post_conv, ctx)
         # FLA outputs from fwd. ``lin_A_int`` shape is
         # (T, n_v_heads, 64); add batch dim for FLA. lin_A_int is bf16
         # in the slot but FLA's bwd accepts bf16 directly.
@@ -1180,8 +1136,7 @@ class GatedDeltaNetBlock:
         # fla/ops/common/chunk_o.py:76, chunk_delta_h.py). No reverse
         # GVA repeat_interleave needed; the kernel returns dq/dk
         # already shaped ``(B, T, n_k_heads, head_k_dim)``.
-        q_rstd = slot.lin_q_rstd                             # (T, n_k_heads)
-        k_rstd = slot.lin_k_rstd
+        # q_rstd / k_rstd come from _fwd_qkv_heads above (scratch).
         # Pass the POST-cumsum g (= g_post saved from fwd) so FLA's
         # internal state matches what it computed during fwd. FLA's bwd
         # applies a reverse-cumsum at the end so the returned ``dg`` is

@@ -246,27 +246,48 @@ class Qwen3NextLinearLayer:
 
         # Linear-attn block stages.
         # ``lin_qkvz`` is tier 3 — present iff slot's level >= 3.
-        # ``lin_q`` is tier 2 — present iff level >= 2.
-        # post-conv is never saved (transient scratch since Stage D2).
+        # ``lin_core_out`` / ``lin_A_int`` are tier 2 — present iff
+        # level >= 2. Q/K/V/rstds are no longer saved (Stage D2.5);
+        # bwd recomputes them from lin_qkvz via conv + qkv_heads, the
+        # conv runs in bwd anyway for silu_bwd's pre-silu input.
         #
         # bwd reads slot.lin_qkvz directly (for z extraction and the
-        # conv_in slice), so we MUST repopulate it if level < 3 even
-        # when level==2 has Q/K/V already. Likewise lin_q if missing.
+        # conv_in slice), so it must be repopulated if level < 3.
         need_proj = not slot.has("lin_qkvz")
-        need_qkv = not slot.has("lin_q")
-        if need_proj or need_qkv:
+        need_fla = (
+            not slot.has("lin_core_out") or not slot.has("lin_A_int")
+        )
+        if need_proj:
             attn_norm_output = self.attn_norm.fwd_from_rstd(
                 slot.x_inp, weights, slot.attn_norm_rstd,
             )
-            post_conv = self.lin_attn.fwd_recompute_post_conv(
-                attn_norm_output, weights, slot, ctx,
+            self.lin_attn.fwd_recompute_proj(
+                attn_norm_output, weights, slot,
             )
-            if need_qkv:
-                self.lin_attn._fwd_qkv_heads(post_conv, slot)
-
-        if not slot.has("lin_core_out") or not slot.has("lin_A_int"):
-            # Re-run FLA fwd from saved q/k/v/g/b.
-            self.lin_attn.fwd_recompute_fla(weights, slot, chunk)
+        if need_fla:
+            # Recompute conv → qkv_heads into scratch, then FLA into slot.
+            # Conv input is slot.lin_qkvz (just repopulated above if
+            # need_proj) sliced to the first conv_dim columns.
+            from flextrain.nn.blocks.linear_attn import (
+                _fla_causal_conv1d_fwd_into,
+            )
+            la_cfg = self.lin_attn.cfg
+            conv_in = slot.lin_qkvz[:, :la_cfg.conv_dim]
+            post_conv = ctx.scratch(
+                (chunk.total_q, la_cfg.conv_dim), la_cfg.compute_dtype,
+            )
+            _fla_causal_conv1d_fwd_into(
+                x_2d=conv_in,
+                weight=weights["w_lin_conv"].squeeze(1).contiguous(),
+                out_2d=post_conv,
+                activation="silu",
+            )
+            q_n, k_n, v_h, _qr, _kr = self.lin_attn._fwd_qkv_heads(
+                post_conv, ctx,
+            )
+            self.lin_attn.fwd_recompute_fla(
+                q_n, k_n, v_h, weights, slot, chunk,
+            )
 
         # MoE tier-3 recompute (x_up).
         if not slot.has("x_up"):
