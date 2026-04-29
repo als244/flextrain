@@ -79,6 +79,9 @@ try:
     # supply our own output buffer (the upstream python helper
     # allocates internally with torch.empty_like).
     from fla.modules.conv.triton.ops import causal_conv1d_fwd_kernel
+    # FLA's l2norm fwd kernel pair — same trick: bypass the python
+    # helper's torch.empty_like to write directly into slot tensors.
+    from fla.modules.l2norm import l2norm_fwd_kernel, l2norm_fwd_kernel1
 except ImportError as e:  # pragma: no cover
     raise ImportError(
         "Qwen3NextLinearAttention requires `flash-linear-attention`. "
@@ -146,6 +149,67 @@ def _fla_causal_conv1d_fwd_into(
         stride_x_d=stride_x_d,
         ACTIVATION=None,
     )
+
+
+def _fla_l2norm_fwd_into(
+    x: torch.Tensor,           # (T_outer, D) where T_outer is product of leading dims
+    y_out: torch.Tensor,       # same shape as x; written in-place
+    rstd_out: torch.Tensor,    # (T_outer,) fp32; written in-place
+    *,
+    eps: float = 1e-6,
+) -> None:
+    """Direct call into FLA's ``l2norm_fwd_kernel`` writing into
+    caller-supplied output buffers.
+
+    Mirrors the upstream python ``l2norm_fwd`` preprocessing (flatten
+    leading dims, choose between the BT-tiled vs single-thread-per-row
+    kernel based on D) but skips the ``torch.empty_like`` allocations
+    so we can write the post-l2norm q/k directly into ``slot.lin_q``
+    and ``slot.lin_k``.
+
+    The two output buffers are written-in-place; they must already be
+    contiguous and dim-matched (``y_out.shape == x.shape`` after the
+    flatten, ``rstd_out`` is 1-D length ``T_outer``).
+    """
+    import triton  # local
+    assert x.shape == y_out.shape, (
+        f"x={tuple(x.shape)} y_out={tuple(y_out.shape)}"
+    )
+    assert y_out.is_contiguous() and rstd_out.is_contiguous()
+    assert y_out.stride(-1) == 1
+    T = x.shape[0]
+    D = x.shape[-1]
+    # Match the upstream MAX_FUSED_SIZE / BD logic.
+    MAX_FUSED_SIZE = 65536 // x.element_size()
+    BD = min(MAX_FUSED_SIZE, triton.next_power_of_2(D))
+    if D > BD:
+        raise RuntimeError("l2norm: feature dim >= 64KB unsupported.")
+    if D <= 512:
+        # NB heuristic from upstream — see fla l2norm_fwd().
+        NB = triton.cdiv(T, 2048 * 32)
+
+        def _grid(meta):
+            return (triton.cdiv(T, meta["BT"]),)
+
+        l2norm_fwd_kernel[_grid](
+            x=x,
+            y=y_out,
+            rstd=rstd_out,
+            eps=eps,
+            T=T,
+            D=D,
+            BD=BD,
+            NB=NB,
+        )
+    else:
+        l2norm_fwd_kernel1[(T,)](
+            x=x,
+            y=y_out,
+            rstd=rstd_out,
+            eps=eps,
+            D=D,
+            BD=BD,
+        )
 
 
 @dataclass(frozen=True)
@@ -685,24 +749,42 @@ class GatedDeltaNetBlock:
 
         Returns ``(q_n, k_n, v_h, q_rstd, k_rstd)`` for the FLA stage."""
         cfg = self.cfg
-        bf = cfg.compute_dtype
         T = post_conv.shape[0]
         q_p, k_p, v_p = torch.split(
             post_conv,
             [cfg.key_dim, cfg.key_dim, cfg.value_dim], dim=-1,
         )
+        # Under the FT layout, post_conv is contiguous per the conv kernel
+        # output, and q_p/k_p/v_p are contiguous slices: each .reshape
+        # below is a free view (no copy).
         q_h = q_p.reshape(T, cfg.num_k_heads, cfg.head_k_dim)
         k_h = k_p.reshape(T, cfg.num_k_heads, cfg.head_k_dim)
         v_h = v_p.reshape(T, cfg.num_v_heads, cfg.head_v_dim)
-        # L2 norm per-(token, k_head) row.
-        q_n, q_rstd = l2norm_fwd(q_h.contiguous())
-        k_n, k_rstd = l2norm_fwd(k_h.contiguous())
-        slot.lin_q.copy_(q_n.to(bf))
-        slot.lin_k.copy_(k_n.to(bf))
-        slot.lin_v.copy_(v_h.to(bf))
-        slot.lin_q_rstd.copy_(q_rstd.contiguous())
-        slot.lin_k_rstd.copy_(k_rstd.contiguous())
-        return q_n, k_n, v_h, q_rstd, k_rstd
+        # L2 norm per-(token, k_head) row, written directly into slot
+        # tensors (no torch.empty_like + .copy_ round-trip). Flatten the
+        # leading two axes for the FLA kernel; slot.lin_q is bf16
+        # contiguous (T, H, hk) so its .view(T*H, hk) is a free view.
+        TH = T * cfg.num_k_heads
+        _fla_l2norm_fwd_into(
+            x=q_h.contiguous().view(TH, cfg.head_k_dim),
+            y_out=slot.lin_q.view(TH, cfg.head_k_dim),
+            rstd_out=slot.lin_q_rstd.view(TH),
+        )
+        _fla_l2norm_fwd_into(
+            x=k_h.contiguous().view(TH, cfg.head_k_dim),
+            y_out=slot.lin_k.view(TH, cfg.head_k_dim),
+            rstd_out=slot.lin_k_rstd.view(TH),
+        )
+        # v has no l2norm; it just needs to land in slot.lin_v. v_h is
+        # a free view of post_conv (contiguous slice), but slot.lin_v
+        # is its own buffer — we still need the copy here. Cheap (one
+        # contig-to-contig D2D pass over T*value_dim bf16).
+        slot.lin_v.copy_(v_h)
+        # Return slot views so the rest of the fwd avoids re-deriving.
+        return (
+            slot.lin_q, slot.lin_k, v_h,
+            slot.lin_q_rstd, slot.lin_k_rstd,
+        )
 
     def _fwd_gate_and_beta(
         self,
@@ -721,10 +803,12 @@ class GatedDeltaNetBlock:
         the python pipeline. Saves ``lin_g`` to the slot.
         """
         from flextrain.ops import flextrain_gate_prep_fwd
+        # Write g directly into slot.lin_g; beta is a transient (not
+        # saved separately — bwd recomputes via gate_prep on saved b).
         g, beta = flextrain_gate_prep_fwd(
             a, b, weights["w_lin_A_log"], weights["w_lin_dt_bias"],
+            g_out=slot.lin_g,
         )
-        slot.lin_g.copy_(g)
         return g, beta
 
     def _fwd_fla(
