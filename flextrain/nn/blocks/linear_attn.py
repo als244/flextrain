@@ -434,22 +434,36 @@ class GatedDeltaNetBlock:
     ) -> torch.Tensor:
         """Stage 2: depthwise causal conv1d. Saves ``lin_post_conv_pre_silu``.
 
+        Uses FLA's ``causal_conv1d_fwd`` Triton kernel (~16x faster
+        than torch's ``F.conv1d`` at our sizes, e.g. 20.8 ms -> 1.27
+        ms at T=32768 conv_dim=8192 on RTX 3090). FLA expects
+        ``x: (B, T, D)`` and ``weight: (D, W)``, matching our (T, D)
+        layout after a single ``unsqueeze(0)`` — no transpose needed.
+
+        We pass ``activation=None`` here (we still need to save the
+        pre-silu intermediate for tier-3 recompute compatibility), then
+        apply silu separately. The activation fusion in FLA is ~5us at
+        these sizes — negligible vs the ~1ms conv body — so leaving it
+        out has no perf cost.
+
         Returns ``post_conv`` (silu output, shape ``(T, conv_dim)``)."""
+        from fla.modules.conv.triton.ops import causal_conv1d_fwd
         cfg = self.cfg
         bf = cfg.compute_dtype
-        T = conv_in.shape[0]
-        K = cfg.conv_kernel_size
-        conv_x = conv_in.transpose(0, 1).unsqueeze(0)  # (1, conv_dim, T)
-        post_conv_pre_silu = F.conv1d(
-            conv_x, weights["w_lin_conv"], bias=None,
-            padding=K - 1, groups=cfg.conv_dim,
-        )[..., :T]
+        # FLA weight shape is (D, W); our slot weight is (D, 1, W) for
+        # depthwise compatibility with torch.conv1d. Squeeze the middle.
+        w = weights["w_lin_conv"].squeeze(1).contiguous()
+        # x: (1, T, D)
+        x = conv_in.unsqueeze(0)
+        post_conv_pre_silu, _ = causal_conv1d_fwd(
+            x=x, weight=w, bias=None, residual=None,
+            activation=None, output_final_state=False,
+        )
+        post_conv_pre_silu = post_conv_pre_silu.squeeze(0)  # (T, D)
         if not (skip_already_saved and slot.has("lin_post_conv_pre_silu")):
-            slot.lin_post_conv_pre_silu.copy_(
-                post_conv_pre_silu.squeeze(0).transpose(0, 1).contiguous().to(bf)
-            )
+            slot.lin_post_conv_pre_silu.copy_(post_conv_pre_silu.to(bf))
         post_conv = F.silu(post_conv_pre_silu)
-        return post_conv.squeeze(0).transpose(0, 1).contiguous()
+        return post_conv.contiguous()
 
     def _fwd_qkv_heads(self, post_conv: torch.Tensor, slot) -> tuple[
         torch.Tensor, torch.Tensor, torch.Tensor,
@@ -967,39 +981,33 @@ class GatedDeltaNetBlock:
             post_conv_pre_silu, d_post_conv,
         )
 
-        # 7. Depthwise conv1d bwd.  fwd: post_conv = conv1d(conv_in.T)[..., :T].
-        # We pad on the left by K-1 then truncate to T at the right (causal).
-        # dW_conv via grad_input formulation; d_conv_in via convolve grad-output
-        # with weight. PyTorch's grad helpers do this:
-        K = cfg.conv_kernel_size
-        # We need d_post_conv_pre_silu in (1, conv_dim, T) layout.
-        d_post_TC = d_post_conv_pre_silu                      # (T, conv_dim)
-        d_post_conv_btc = d_post_TC.transpose(0, 1).unsqueeze(0)  # (1, conv_dim, T)
-        # Pad d_post on the right by (K-1) to mirror fwd's left-pad-then-truncate.
-        d_post_padded = F.pad(d_post_conv_btc, (0, K - 1))     # (1, conv_dim, T+K-1)
-
-        # dW_conv: depthwise conv1d input-gradient form = conv(conv_in_padded, d_post)
-        # Easiest: use torch.nn.grad helpers. Skip when frozen.
-        conv_in_btc = conv_in.transpose(0, 1).unsqueeze(0)     # (1, conv_dim, T)
-        if grads.get("g_lin_conv") is not None:
-            dW_conv = torch.nn.grad.conv1d_weight(
-                input=conv_in_btc,
-                weight_size=W_conv.shape,
-                grad_output=d_post_padded,
-                stride=1, padding=K - 1, dilation=1,
-                groups=cfg.conv_dim,
-            )
-            grads["g_lin_conv"].add_(dW_conv.to(grads["g_lin_conv"].dtype))
-
-        # d_conv_in: conv1d transpose with weight.
-        d_conv_in_btc = torch.nn.grad.conv1d_input(
-            input_size=conv_in_btc.shape,
-            weight=W_conv,
-            grad_output=d_post_padded,
-            stride=1, padding=K - 1, dilation=1,
-            groups=cfg.conv_dim,
+        # 7. Depthwise causal conv1d bwd via FLA's causal_conv1d_bwd
+        # Triton kernel — drop-in replacement for the previous
+        # torch.nn.grad.conv1d_input + conv1d_weight pair, which were
+        # very slow at large T (aten convolution_backward fell off a
+        # cliff at T>=32768 on RTX 3090, 86 ms at T=65536) and also
+        # required materializing d_post_conv_btc + d_post_padded
+        # transient buffers. FLA's bwd takes (x: (B,T,D), dy: (B,T,D),
+        # weight: (D,W)) directly with no transpose churn and produces
+        # dx + dw in one launch.
+        from fla.modules.conv.triton.ops import causal_conv1d_bwd
+        # Squeeze the depthwise-compat (D, 1, W) into FLA's (D, W).
+        W_fla = W_conv.squeeze(1).contiguous()
+        x_fla = conv_in.unsqueeze(0)                          # (1, T, D)
+        dy_fla = d_post_conv_pre_silu.unsqueeze(0)            # (1, T, D)
+        dx_fla, dw_fla, _db, _dr, _dh0 = causal_conv1d_bwd(
+            x=x_fla, dy=dy_fla, dht=None,
+            weight=W_fla, bias=None, residual=None,
+            initial_state=None, activation=None,
         )
-        d_conv_in = d_conv_in_btc.squeeze(0).transpose(0, 1).contiguous()  # (T, conv_dim)
+        d_conv_in = dx_fla.squeeze(0).contiguous()           # (T, conv_dim)
+
+        if grads.get("g_lin_conv") is not None:
+            # FLA returns dW with shape (D, W); reshape back to our
+            # depthwise-compat (D, 1, W) and accumulate in grads dtype.
+            grads["g_lin_conv"].add_(
+                dw_fla.unsqueeze(1).to(grads["g_lin_conv"].dtype)
+            )
 
         # 8. cat → d_q_flat, d_k_flat, d_v_flat (each pre-conv).
         d_q_flat, d_k_flat, d_v_flat = torch.split(
