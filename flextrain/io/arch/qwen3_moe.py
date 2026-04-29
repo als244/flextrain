@@ -28,7 +28,14 @@ def _qwen3_moe_post_load_hook(
     """Stack per-expert HF tensors into FT's ``w_up``/``w_down``. The
     packing order is ``[up, gate]`` so the orig swiglu_moe kernel
     reads ``x3`` (value) from the first half and ``x1`` (gate) from
-    the second half."""
+    the second half.
+
+    Open each shard exactly once and pull every expert tensor that
+    lives in it. The naive (L × E × 3) loop with a fresh ``safe_open``
+    per tensor sends ~18k metadata opens through the filesystem, which
+    is fine on local NVMe but pathological on GPFS / NFS / Lustre
+    where every open is an RPC.
+    """
     sample_w_up = dest.get(("layer_0", "w_up"))
     if sample_w_up is None:
         return
@@ -52,32 +59,47 @@ def _qwen3_moe_post_load_hook(
             )
         file_index = None
 
-    def _open_for(name: str):
+    def _shard_for(name: str) -> str:
         if file_index is not None:
-            shard = file_index[name]
-            return os.path.join(hf_path, shard)
+            return os.path.join(hf_path, file_index[name])
         return os.path.join(hf_path, "model.safetensors")
 
+    wanted_by_shard: dict[str, list[tuple[int, int, str, str]]] = {}
     for L in range(num_layers):
+        for e in range(E):
+            for kind in ("gate", "up", "down"):
+                hf_name = f"model.layers.{L}.mlp.experts.{e}.{kind}_proj.weight"
+                wanted_by_shard.setdefault(_shard_for(hf_name), []).append(
+                    (L, e, kind, hf_name)
+                )
+
+    pending: dict[tuple[int, int], dict[str, torch.Tensor]] = {}
+
+    def _flush_if_ready(L: int, e: int) -> None:
+        slot = pending.get((L, e))
+        if slot is None or not all(k in slot for k in ("gate", "up", "down")):
+            return
         w_up_ft = dest[(f"layer_{L}", "w_up")]
         w_down_ft = dest[(f"layer_{L}", "w_down")]
-        for e in range(E):
-            gate_name = f"model.layers.{L}.mlp.experts.{e}.gate_proj.weight"
-            up_name = f"model.layers.{L}.mlp.experts.{e}.up_proj.weight"
-            down_name = f"model.layers.{L}.mlp.experts.{e}.down_proj.weight"
+        dtype = w_up_ft.dtype
+        gate_t = slot["gate"].T.contiguous().to(dtype)
+        up_t = slot["up"].T.contiguous().to(dtype)
+        w_up_ft[e, :, :].copy_(torch.cat([up_t, gate_t], dim=1))  # [x3, x1]
+        w_down_ft[e, :, :].copy_(slot["down"].T.contiguous().to(dtype))
+        del pending[(L, e)]
 
-            with safe_open(_open_for(gate_name), framework="pt", device="cpu") as f:
-                gate = f.get_tensor(gate_name)
-            with safe_open(_open_for(up_name), framework="pt", device="cpu") as f:
-                up = f.get_tensor(up_name)
-            with safe_open(_open_for(down_name), framework="pt", device="cpu") as f:
-                down = f.get_tensor(down_name)
+    for shard_path, wanted in wanted_by_shard.items():
+        with safe_open(shard_path, framework="pt", device="cpu") as f:
+            for L, e, kind, hf_name in wanted:
+                pending.setdefault((L, e), {})[kind] = f.get_tensor(hf_name)
+                _flush_if_ready(L, e)
 
-            dtype = w_up_ft.dtype
-            gate_t = gate.T.contiguous().to(dtype)
-            up_t = up.T.contiguous().to(dtype)
-            w_up_ft[e, :, :].copy_(torch.cat([up_t, gate_t], dim=1))  # [x3, x1]
-            w_down_ft[e, :, :].copy_(down.T.contiguous().to(dtype))
+    if pending:
+        sample_keys = list(pending.keys())[:3]
+        raise RuntimeError(
+            f"qwen3_moe loader: {len(pending)} (layer, expert) entries "
+            f"never received all of (gate, up, down). Sample: {sample_keys}"
+        )
 
 
 QWEN3_MOE_ARCH = ArchSpec(
