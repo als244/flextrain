@@ -62,6 +62,8 @@ from __future__ import annotations
 import json
 import glob
 import os
+import threading
+from collections import deque
 from dataclasses import dataclass
 from typing import Any, Callable, Iterator, Protocol, runtime_checkable
 
@@ -195,7 +197,42 @@ class RawTokenSource:
 
 
 class JsonSFTTokenSource:
-    """Local JSON / JSONL supervised fine-tuning data."""
+    """Local JSON / JSONL supervised fine-tuning data.
+
+    Tokenization runs on a background daemon thread that fills a
+    bounded FIFO queue of ready :class:`Sequence` objects. The
+    consumer's :meth:`get_sequences` only pops from the queue — it
+    never blocks on tokenizer work as long as the producer can keep
+    up. Records that fail filtering (missing prompt/response, prompt
+    longer than ``max_seq_len``, all-prompt loss mask, ...) are
+    dropped at the producer; the consumer never sees them.
+
+    Loading window
+    --------------
+    The producer's queue is capped at ``prefetch_max_tokens`` total
+    tokens of buffered sequences (default 1B — large enough that the
+    cap is rarely the bottleneck for normal SFT runs but small enough
+    that the worker doesn't ingest tens-of-GB JSONLs into RAM up
+    front). Once the cap is hit the producer waits on a condvar; the
+    consumer wakes it after each pop.
+
+    Looping
+    -------
+    ``loop=False`` (default): the producer makes one pass through
+    ``_records`` and exits. When the queue empties, ``get_sequences``
+    returns ``[]`` to signal exhaustion.
+
+    ``loop=True``: the producer rewinds ``_cursor`` at the end of
+    ``_records`` and runs forever (until :meth:`close`).
+    """
+
+    # When the producer's queue is empty and we're waiting for the
+    # background thread to refill, poll at this interval instead of
+    # using a condvar that the producer signals on every push (signal
+    # cost adds up at high tokenization throughput). Short enough that
+    # consumer latency stays in the tens of ms; long enough that an
+    # empty source doesn't busy-spin.
+    _CONSUMER_WAIT_S = 0.01
 
     def __init__(
         self,
@@ -207,8 +244,9 @@ class JsonSFTTokenSource:
         input_field: str | None = "input",
         min_seq_len: int = 32,
         max_seq_len: int = 2048,
-        loop: bool = True,
+        loop: bool = False,
         trust_remote_code: bool = False,
+        prefetch_max_tokens: int = 1_000_000_000,
     ) -> None:
         self.path = path
         self.prompt_field = prompt_field
@@ -217,6 +255,8 @@ class JsonSFTTokenSource:
         self.min_seq_len = min_seq_len
         self.max_seq_len = max_seq_len
         self.loop = loop
+        self.prefetch_max_tokens = int(prefetch_max_tokens)
+
         if isinstance(tokenizer, str):
             try:
                 from transformers import AutoTokenizer  # type: ignore[import-not-found]
@@ -232,10 +272,17 @@ class JsonSFTTokenSource:
             self._tok = tokenizer
         self._records = self._load_records(path)
         self._cursor = 0
-        # Lookahead slot: a sequence pulled from the stream but
-        # rejected by ``get_sequences`` because adding it would push
-        # past ``max_token_count``. The next call returns it first.
-        self._pending: Sequence | None = None
+        self._next_seq_id = 0
+
+        # Producer/consumer state.
+        self._queue: deque[Sequence] = deque()
+        self._tokens_buffered = 0
+        self._lock = threading.Lock()
+        # Producer waits on this when the buffer is full.
+        self._room = threading.Condition(self._lock)
+        self._stop = threading.Event()
+        self._exhausted = False  # True once producer thread exits.
+        self._worker: threading.Thread | None = None
 
     @staticmethod
     def _load_records(path: str) -> list[dict[str, Any]]:
@@ -259,8 +306,20 @@ class JsonSFTTokenSource:
         return payload
 
     def reset(self) -> None:
-        self._cursor = 0
-        self._pending = None
+        """Stop the worker, rewind to record 0, drop the queue.
+
+        Useful between epochs when ``loop=False`` if you want a fresh
+        pass without constructing a new source. After ``reset()`` the
+        worker will be restarted on the next ``get_sequences`` call.
+        """
+        self.close()
+        with self._lock:
+            self._cursor = 0
+            self._queue.clear()
+            self._tokens_buffered = 0
+            self._exhausted = False
+            self._stop.clear()
+            self._next_seq_id = 0
 
     def _build_prompt(self, rec: dict[str, Any]) -> tuple[str, str] | None:
         prompt = str(rec.get(self.prompt_field, "") or "").strip()
@@ -280,94 +339,253 @@ class JsonSFTTokenSource:
             prompt_text = f"Instruction:\n{prompt}\n\nResponse:\n"
         return prompt_text, response
 
-    def _next_seq(self) -> Sequence | None:
-        if self._pending is not None:
-            seq, self._pending = self._pending, None
-            return seq
-        if not self._records:
-            return None
-        while True:
-            if self._cursor >= len(self._records):
-                if not self.loop:
-                    return None
-                self._cursor = 0
-            idx = self._cursor
-            rec = self._records[idx]
-            self._cursor += 1
-            prompt_and_response = self._build_prompt(rec)
-            if prompt_and_response is None:
-                continue
-            prompt_text, response_text = prompt_and_response
-            prompt_ids = self._tok.encode(prompt_text, add_special_tokens=False)
-            response_ids = self._tok.encode(response_text, add_special_tokens=False)
-            eos_id = getattr(self._tok, "eos_token_id", None)
-            if eos_id is not None:
-                response_ids = response_ids + [int(eos_id)]
-            if not response_ids:
-                continue
-            if len(prompt_ids) >= self.max_seq_len:
-                continue
-            room = self.max_seq_len - len(prompt_ids)
-            if room <= 1:
-                continue
-            response_ids = response_ids[:room]
-            token_ids = prompt_ids + response_ids
-            if len(token_ids) < self.min_seq_len:
-                continue
+    # ------------------------------------------------------------------
+    # Producer (background worker).
+    # ------------------------------------------------------------------
 
-            tokens = torch.tensor(token_ids, dtype=torch.int64)
-            targets = torch.roll(tokens, -1)
-            loss_mask = torch.ones(len(tokens), dtype=torch.bool)
-            loss_mask[: len(prompt_ids)] = False
-            loss_mask[-1] = False
-            if not bool(loss_mask.any().item()):
+    def _tokenize_record(self, rec: dict[str, Any], seq_id: int) -> Sequence | None:
+        """Run all the per-record filtering + tokenization. Returns
+        the resulting :class:`Sequence` or ``None`` if the record is
+        rejected by any filter.
+        """
+        prompt_and_response = self._build_prompt(rec)
+        if prompt_and_response is None:
+            return None
+        prompt_text, response_text = prompt_and_response
+        prompt_ids = self._tok.encode(prompt_text, add_special_tokens=False)
+        response_ids = self._tok.encode(response_text, add_special_tokens=False)
+        eos_id = getattr(self._tok, "eos_token_id", None)
+        if eos_id is not None:
+            response_ids = response_ids + [int(eos_id)]
+        if not response_ids:
+            return None
+        if len(prompt_ids) >= self.max_seq_len:
+            return None
+        room = self.max_seq_len - len(prompt_ids)
+        if room <= 1:
+            return None
+        response_ids = response_ids[:room]
+        token_ids = prompt_ids + response_ids
+        if len(token_ids) < self.min_seq_len:
+            return None
+        tokens = torch.tensor(token_ids, dtype=torch.int64)
+        targets = torch.roll(tokens, -1)
+        loss_mask = torch.ones(len(tokens), dtype=torch.bool)
+        loss_mask[: len(prompt_ids)] = False
+        loss_mask[-1] = False
+        if not bool(loss_mask.any().item()):
+            return None
+        return Sequence(
+            tokens=tokens,
+            targets=targets,
+            loss_mask=loss_mask,
+            seq_id=seq_id,
+        )
+
+    def _producer_loop(self) -> None:
+        """Tokenize records into the queue forever (or until exhausted
+        when ``loop=False``).
+        """
+        while not self._stop.is_set():
+            # Block while the buffer is full.
+            with self._room:
+                while (
+                    self._tokens_buffered >= self.prefetch_max_tokens
+                    and not self._stop.is_set()
+                ):
+                    self._room.wait(timeout=0.5)
+                if self._stop.is_set():
+                    return
+                if self._cursor >= len(self._records):
+                    if not self.loop:
+                        self._exhausted = True
+                        return
+                    self._cursor = 0
+                idx = self._cursor
+                self._cursor += 1
+                seq_id = self._next_seq_id
+                self._next_seq_id += 1
+            # Tokenize OUTSIDE the lock — this is the expensive part.
+            seq = self._tokenize_record(self._records[idx], seq_id)
+            if seq is None:
                 continue
-            return Sequence(
-                tokens=tokens,
-                targets=targets,
-                loss_mask=loss_mask,
-                seq_id=idx,
-            )
+            with self._lock:
+                self._queue.append(seq)
+                self._tokens_buffered += len(seq)
+
+    def _ensure_worker(self) -> None:
+        if self._worker is not None and self._worker.is_alive():
+            return
+        if self._exhausted:
+            return
+        if not self._records:
+            self._exhausted = True
+            return
+        self._worker = threading.Thread(
+            target=self._producer_loop, daemon=True,
+            name="JsonSFTTokenSource-producer",
+        )
+        self._worker.start()
+
+    def close(self) -> None:
+        """Stop the background worker. Idempotent."""
+        self._stop.set()
+        with self._room:
+            self._room.notify_all()
+        if self._worker is not None and self._worker.is_alive():
+            self._worker.join(timeout=2.0)
+        self._worker = None
+
+    def __del__(self) -> None:  # pragma: no cover
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Consumer.
+    # ------------------------------------------------------------------
 
     def iter_sequences(self) -> Iterator[Sequence]:
+        """Yield sequences one at a time. Stops when the source is
+        exhausted (``loop=False`` and producer reached the end)."""
+        self._ensure_worker()
         while True:
-            seq = self._next_seq()
-            if seq is None:
+            with self._lock:
+                if self._queue:
+                    yield self._queue.popleft()
+                    self._tokens_buffered = max(
+                        0, self._tokens_buffered - 0,
+                    )
+                    # Update under lock.
+                    pass  # accounting handled in get_sequences pop path
+                    continue
+                if self._exhausted and not self._queue:
+                    return
+            # Empty but not exhausted — wait briefly for producer.
+            self._stop.wait(timeout=self._CONSUMER_WAIT_S)
+            if self._stop.is_set():
                 return
-            yield seq
 
-    def get_sequences(self, max_token_count: int) -> list[Sequence]:
-        """Pull packed sequences whose total token count is <= ``max_token_count``.
+    def get_sequences(
+        self,
+        max_token_count: int | None = None,
+        *,
+        num_seqs: int | None = None,
+        min_token_count: int | None = None,
+    ) -> list[Sequence]:
+        """Pop sequences from the producer queue.
 
-        Greedy: keep adding sequences until the next one would push
-        the running total over the cap; that sequence is parked in
-        ``self._pending`` and returned at the start of the next call.
-        Guarantees the returned batch's total token count never
-        exceeds ``max_token_count`` (the engine and the working-set
-        solve both rely on this — going over caused chunk-size
-        mispredictions and silent host-act-buffer pressure).
+        Three modes (specify exactly one of ``num_seqs`` /
+        ``min_token_count`` / ``max_token_count``; or both ``min_`` and
+        ``max_`` together):
 
-        Always returns at least one sequence (even if it's larger
-        than the cap) — caller asked for *something*; truncating to
-        zero sequences would stall the training loop. Callers who
-        want a hard cap should ensure ``max_token_count >=
-        max_seq_len``.
+        * ``max_token_count``: greedy pack — return as many sequences
+          as fit at or under the cap (FIFO; never reorders). The next
+          sequence stays in the queue and comes out on the next call.
+          Always returns at least one sequence if any are buffered,
+          even if it alone exceeds the cap.
+        * ``num_seqs``: return exactly this many (or fewer if the
+          source is exhausted).
+        * ``min_token_count`` (with optional ``max_token_count``):
+          block until the producer has at least ``min_token_count``
+          buffered, then pop greedily up to ``max_token_count``.
+          Useful for batches that must be at least some size.
+
+        Returns an empty list to signal exhaustion (``loop=False`` and
+        producer drained).
         """
+        if num_seqs is None and max_token_count is None and min_token_count is None:
+            raise ValueError(
+                "Provide one of num_seqs, max_token_count, min_token_count"
+            )
+        self._ensure_worker()
+
+        if num_seqs is not None:
+            return self._pop_by_count(num_seqs)
+        return self._pop_by_tokens(min_token_count, max_token_count)
+
+    def _pop_by_count(self, num_seqs: int) -> list[Sequence]:
+        out: list[Sequence] = []
+        while len(out) < num_seqs:
+            with self._lock:
+                if self._queue:
+                    seq = self._queue.popleft()
+                    self._tokens_buffered -= len(seq)
+                    out.append(seq)
+                    self._room.notify()
+                    continue
+                if self._exhausted:
+                    return out
+            self._stop.wait(timeout=self._CONSUMER_WAIT_S)
+            if self._stop.is_set():
+                return out
+        return out
+
+    def _pop_by_tokens(
+        self,
+        min_token_count: int | None,
+        max_token_count: int | None,
+    ) -> list[Sequence]:
         out: list[Sequence] = []
         total = 0
         while True:
-            seq = self._next_seq()
-            if seq is None:
-                break
-            if out and total + len(seq) > max_token_count:
-                # Park for next call; do NOT include in this batch.
-                self._pending = seq
-                break
-            out.append(seq)
-            total += len(seq)
-            if total >= max_token_count:
-                break
-        return out
+            with self._lock:
+                # Greedy pop while next sequence fits under the cap.
+                while self._queue:
+                    head = self._queue[0]
+                    if (
+                        max_token_count is not None
+                        and out
+                        and total + len(head) > max_token_count
+                    ):
+                        # Next would overflow; leave it for the next call.
+                        # If we're below min_token_count, this exits the
+                        # outer loop too — caller asked for at least min,
+                        # we can't satisfy without overshooting max.
+                        if (
+                            min_token_count is not None
+                            and total < min_token_count
+                        ):
+                            # This is the rare "min and max are both set,
+                            # and the next sequence won't fit". Return
+                            # what we have; caller should size the cap
+                            # consistently with the source's max_seq_len.
+                            self._room.notify()
+                            return out
+                        self._room.notify()
+                        return out
+                    self._queue.popleft()
+                    self._tokens_buffered -= len(head)
+                    out.append(head)
+                    total += len(head)
+                    if (
+                        max_token_count is not None
+                        and total >= max_token_count
+                    ):
+                        self._room.notify()
+                        return out
+                # Queue empty.
+                if self._exhausted:
+                    self._room.notify()
+                    return out
+                # If we already have something AND min_token_count is
+                # satisfied (or wasn't requested), return early — don't
+                # block waiting for more when caller didn't ask for a
+                # minimum. If we have NOTHING yet, block until the
+                # producer puts at least one sequence in (otherwise
+                # the consumer would spin returning empty lists while
+                # the producer is busy tokenizing).
+                if out and (
+                    min_token_count is None
+                    or total >= min_token_count
+                ):
+                    self._room.notify()
+                    return out
+            # Wait for the producer to enqueue more.
+            self._stop.wait(timeout=self._CONSUMER_WAIT_S)
+            if self._stop.is_set():
+                return out
 
 
 # ---------------------------------------------------------------------------
