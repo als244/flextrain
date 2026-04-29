@@ -421,18 +421,47 @@ def _baseline_gpu_activation_memory(
         conv_dim = 2 * key_dim + value_dim
         proj_qkvz_dim = 2 * key_dim + 2 * value_dim
         fp32 = torch.float32.itemsize
-        lin_attn_workspace = (
-            2 * chunk_size * key_dim * fp32          # q_n + k_n fp32
+        # FLA's chunk_gated_delta_rule_fwd / _bwd allocates substantial
+        # internal scratch tensors (see fla/ops/common/chunk_delta_h.py
+        # and chunk_o.py). The dominant ones are per-FLA-chunk state
+        # tensors of shape (B, NT, HV, V, K) where NT = T / FLA_CHUNK
+        # (FLA's internal chunk size is 64 for the gated-delta-rule):
+        #   * h, v_new (fwd)
+        #   * dh, dv2 (bwd)
+        # plus several T*value_dim and T*key_dim sized tensors (o, dq,
+        # dk, dv, w, u, A) that don't depend on the FLA chunk axis.
+        FLA_INTERNAL_CHUNK = 64
+        nt_chunks = max(1, chunk_size // FLA_INTERNAL_CHUNK)
+        # Per-state-tensor bytes; multiply by ~4 for the worst case
+        # (h + v_new in fwd OR dh + dv2 in bwd, plus headroom).
+        per_state = (
+            nt_chunks * num_v_heads * head_v_dim * head_k_dim * sz_act
+        )
+        # Per-token tensor bytes (o / dq / dk / dv / w / u / A and
+        # similar). ~6 of these are live simultaneously in bwd.
+        per_token_scratch = chunk_size * value_dim * sz_act
+        fla_scratch = 4 * per_state + 6 * per_token_scratch
+        lin_attn_fwd_workspace = (
+            2 * chunk_size * key_dim * fp32           # q_n + k_n fp32
+            + fla_scratch                              # FLA fwd internals
+            + chunk_size * value_dim * sz_act          # FLA core_out
+        )
+        lin_attn_bwd_workspace = (
+            2 * chunk_size * key_dim * fp32           # q_n + k_n fp32
             + chunk_size * conv_dim * sz_act          # d_post_conv
             + chunk_size * conv_dim * sz_act          # d_conv_in
             + chunk_size * proj_qkvz_dim * sz_act     # d_qkvz
-            + chunk_size * value_dim * sz_act         # FLA bwd scratch
+            + fla_scratch                              # FLA bwd internals
         )
-        # The fwd only needs the q_n/k_n fp32 promotions and the FLA
-        # outputs; bwd is the dominant case. Take ``max`` with attn
-        # workspace because they can't be live simultaneously (each
-        # layer is either full-attn or linear-attn, not both).
-        attn_workspace = max(attn_workspace, lin_attn_workspace)
+        # Take ``max`` of fwd vs bwd (only one runs at a time per layer)
+        # and ``max`` against the dense full-attn workspace (each layer
+        # is either full-attn or linear-attn, not both simultaneously
+        # in flight on the same chunk).
+        attn_workspace = max(
+            attn_workspace,
+            lin_attn_fwd_workspace,
+            lin_attn_bwd_workspace,
+        )
 
     # Per-chunk MLP workspace: depends on whether routed experts exist.
     expert_dim = model_dims["expert_dim"]
