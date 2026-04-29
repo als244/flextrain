@@ -33,7 +33,9 @@ Activation schema (max_tier=3):
   recompute cost when host budget allows:
     ``lin_z`` (T, n_v_heads, head_v_dim)                      -- gated-RMSNorm gate
 * Tier 2 — recomputable via ``fwd_recompute_fla`` from tier-3 + Q/K/V:
-    ``lin_q``, ``lin_k``, ``lin_v`` (post-GVA, post-l2norm-input)
+    ``lin_q`` (T, n_k_heads, head_k_dim) -- post-l2norm; per-K-head.
+    ``lin_k`` (T, n_k_heads, head_k_dim) -- post-l2norm; per-K-head.
+    ``lin_v`` (T, n_v_heads, head_v_dim)
     ``lin_A_int``                                             -- FLA scratch
     ``lin_core_out``                                          -- FLA output
 * Tier 3 — recomputable via ``fwd_recompute_post_conv`` from x_inp:
@@ -242,12 +244,12 @@ class GatedDeltaNetBlock:
             # grp=2 it's num_v_heads.)
             ActivationField(
                 "lin_q_rstd",
-                lambda n, d: (n, cfg.num_v_heads),
+                lambda n, d: (n, cfg.num_k_heads),
                 torch.float32, tier=0,
             ),
             ActivationField(
                 "lin_k_rstd",
-                lambda n, d: (n, cfg.num_v_heads),
+                lambda n, d: (n, cfg.num_k_heads),
                 torch.float32, tier=0,
             ),
             # Gated-RMSNorm gate. Largest field in this block per
@@ -275,12 +277,12 @@ class GatedDeltaNetBlock:
             # ==================================================
             ActivationField(
                 "lin_q",
-                lambda n, d: (n, cfg.num_v_heads, cfg.head_k_dim),
+                lambda n, d: (n, cfg.num_k_heads, cfg.head_k_dim),
                 bf, tier=2,
             ),
             ActivationField(
                 "lin_k",
-                lambda n, d: (n, cfg.num_v_heads, cfg.head_k_dim),
+                lambda n, d: (n, cfg.num_k_heads, cfg.head_k_dim),
                 bf, tier=2,
             ),
             ActivationField(
@@ -467,10 +469,31 @@ class GatedDeltaNetBlock:
 
     def _fwd_qkv_heads(self, post_conv: torch.Tensor, slot) -> tuple[
         torch.Tensor, torch.Tensor, torch.Tensor,
+        torch.Tensor, torch.Tensor,
     ]:
-        """Stage 3: split post_conv → Q/K/V heads + repeat-interleave for GVA.
+        """Stage 3: split post_conv → Q/K/V heads + l2norm on q/k.
 
-        Saves tier-2 ``lin_q``, ``lin_k``, ``lin_v``."""
+        Saves tier-2 ``lin_q`` / ``lin_k`` (post-l2norm, per-K-head shape
+        ``(T, num_k_heads, head_k_dim)``) and ``lin_v``
+        (``(T, num_v_heads, head_v_dim)``), plus tier-0 ``lin_q_rstd`` /
+        ``lin_k_rstd`` (per-(t, k_head) reciprocal-stddev needed by
+        ``l2norm_bwd`` in the bwd path).
+
+        **No GVA repeat_interleave**. FLA's
+        ``chunk_gated_delta_rule_fwd_h`` / ``chunk_fwd_o`` kernels do the
+        GVA index mapping themselves: each v-head ``i_h`` reads from
+        k-head ``i_h // (HV // H)`` via raw pointer arithmetic
+        (see fla/ops/common/chunk_o.py:76, chunk_delta_h.py). Passing
+        un-expanded ``(T, num_k_heads, head_k_dim)`` q/k saves the
+        ~2 GiB ``repeat_interleave`` materialization at
+        T=131072 H=32 K=128.
+
+        Saving the post-l2norm q/k (instead of the un-normalized values
+        and recomputing in bwd) eliminates a 2 GiB fp32 transient
+        (the ``q_h.float() * q_rstd.float()`` promotion in the old bwd)
+        and one redundant elementwise pass per layer per chunk.
+
+        Returns ``(q_n, k_n, v_h, q_rstd, k_rstd)`` for the FLA stage."""
         cfg = self.cfg
         bf = cfg.compute_dtype
         T = post_conv.shape[0]
@@ -481,14 +504,15 @@ class GatedDeltaNetBlock:
         q_h = q_p.reshape(T, cfg.num_k_heads, cfg.head_k_dim)
         k_h = k_p.reshape(T, cfg.num_k_heads, cfg.head_k_dim)
         v_h = v_p.reshape(T, cfg.num_v_heads, cfg.head_v_dim)
-        if cfg.num_v_heads // cfg.num_k_heads > 1:
-            rep = cfg.num_v_heads // cfg.num_k_heads
-            q_h = q_h.repeat_interleave(rep, dim=1)
-            k_h = k_h.repeat_interleave(rep, dim=1)
-        slot.lin_q.copy_(q_h.to(bf))
-        slot.lin_k.copy_(k_h.to(bf))
+        # L2 norm per-(token, k_head) row.
+        q_n, q_rstd = l2norm_fwd(q_h.contiguous())
+        k_n, k_rstd = l2norm_fwd(k_h.contiguous())
+        slot.lin_q.copy_(q_n.to(bf))
+        slot.lin_k.copy_(k_n.to(bf))
         slot.lin_v.copy_(v_h.to(bf))
-        return q_h, k_h, v_h
+        slot.lin_q_rstd.copy_(q_rstd.contiguous())
+        slot.lin_k_rstd.copy_(k_rstd.contiguous())
+        return q_n, k_n, v_h, q_rstd, k_rstd
 
     def _fwd_gate_and_beta(
         self,
@@ -514,36 +538,20 @@ class GatedDeltaNetBlock:
         return g, beta
 
     def _fwd_fla(
-        self, q_h, k_h, v_h, g, beta, slot,
+        self, q_n, k_n, v_h, g, beta, slot,
     ) -> torch.Tensor:
         """Stage 5: FLA chunk-gated-delta-rule. Saves ``lin_core_out``,
         ``lin_A_int``, ``lin_g_post``. Returns ``core_out`` for the
         gated norm + out projection downstream.
 
-        ``beta`` is precomputed by ``_fwd_gate_and_beta`` (fused gate-prep
-        kernel) so we avoid the per-call ``b.float().sigmoid().to(bf)``
-        elementwise pipeline.
-
-        L2-normalizes q/k per-(token, k_head) before the recurrence to
-        match HF's ``use_qk_l2norm_in_kernel=True``. ``lin_q_rstd`` /
-        ``lin_k_rstd`` are saved (tier 0) so bwd can apply the
-        complementary ``l2norm_bwd`` to the gradients FLA returns.
+        ``q_n``/``k_n`` are already l2-normalized (done in
+        ``_fwd_qkv_heads``); ``beta`` is precomputed by
+        ``_fwd_gate_and_beta``. The l2norm rstds are saved into the
+        slot during ``_fwd_qkv_heads`` for the bwd's ``l2norm_bwd``.
         """
         cfg = self.cfg
         bf = cfg.compute_dtype
         scale = cfg.head_k_dim ** -0.5
-
-        # L2 norm on q/k. l2norm_fwd treats the last dim as the
-        # normalization axis; q_h / k_h have shape (T, num_k_heads,
-        # head_k_dim), so per-(t, h) row of length head_k_dim is
-        # normalized as expected. l2norm_fwd internally calls
-        # ``.view(-1, last_dim)`` which requires contiguous input.
-        # FLA's chunk kernel reads with elementwise pointer arithmetic and
-        # silently produces wrong results on non-contiguous inputs.
-        # ``torch.split`` + ``.reshape`` upstream can yield non-contiguous
-        # views, so force contiguity on every kernel input here.
-        q_n, q_rstd = l2norm_fwd(q_h.contiguous())
-        k_n, k_rstd = l2norm_fwd(k_h.contiguous())
 
         g_post, o, A_int, _, _, _ = chunk_gated_delta_rule_fwd(
             q_n.unsqueeze(0).contiguous(),
@@ -558,12 +566,6 @@ class GatedDeltaNetBlock:
         slot.lin_g_post.copy_(g_post.squeeze(0))
         slot.lin_A_int.copy_(A_int.squeeze(0).to(bf))
         slot.lin_core_out.copy_(o.to(bf))
-        # Save rstds (tier 0). Bwd will recompute q_n / k_n from the
-        # saved un-normalized q_h / k_h (in slot.lin_q / slot.lin_k)
-        # and these rstds. q_rstd has shape (T, num_k_heads); make
-        # contiguous for the slot copy.
-        slot.lin_q_rstd.copy_(q_rstd.contiguous())
-        slot.lin_k_rstd.copy_(k_rstd.contiguous())
         return o
 
     def _fwd_norm_out(
@@ -596,9 +598,9 @@ class GatedDeltaNetBlock:
         """
         z, conv_in = self._fwd_proj_split(x, weights, slot)
         post_conv = self._fwd_conv(conv_in, weights, slot)
-        q_h, k_h, v_h = self._fwd_qkv_heads(post_conv, slot)
+        q_n, k_n, v_h, _q_rstd, _k_rstd = self._fwd_qkv_heads(post_conv, slot)
         g, beta = self._fwd_gate_and_beta(slot.lin_a, slot.lin_b, weights, slot)
-        core_out = self._fwd_fla(q_h, k_h, v_h, g, beta, slot)
+        core_out = self._fwd_fla(q_n, k_n, v_h, g, beta, slot)
         return self._fwd_norm_out(core_out, z, weights)
 
     def _gated_rmsnorm_fwd(
@@ -801,13 +803,15 @@ class GatedDeltaNetBlock:
         dtype = dy.dtype
         device = dy.device
 
-        # Pull saved tensors.
+        # Pull saved tensors. ``lin_q`` / ``lin_k`` are POST-l2norm and
+        # per-K-head (shape ``(T, num_k_heads, head_k_dim)``) — see
+        # ``_fwd_qkv_heads``.
         x = slot.x_inp                                       # (T, d_model)
         a = slot.lin_a                                       # (T, n_v_heads)
         b = slot.lin_b                                       # (T, n_v_heads)
         z = slot.lin_z                                       # (T, n_v_heads, head_v_dim)
-        q_h = slot.lin_q                                     # (T, n_v_heads, head_k_dim)
-        k_h = slot.lin_k                                     # (T, n_v_heads, head_k_dim)
+        q_n = slot.lin_q                                     # (T, n_k_heads, head_k_dim) post-l2norm
+        k_n = slot.lin_k                                     # (T, n_k_heads, head_k_dim) post-l2norm
         v_h = slot.lin_v                                     # (T, n_v_heads, head_v_dim)
         g = slot.lin_g                                       # (T, n_v_heads) fp32
         core_out = slot.lin_core_out                         # (T, n_v_heads, head_v_dim)
@@ -868,30 +872,23 @@ class GatedDeltaNetBlock:
         if g_w_norm is not None:
             g_w_norm.add_(dw_norm.to(g_w_norm.dtype))
 
-        # 3. FLA bwd. Fwd l2-normalized q/k before feeding to the FLA
-        # kernel; bwd has to consume the SAME (post-l2-norm) q_n / k_n
-        # as the kernel saw and return gradients in that space, which we
-        # then back-prop through l2norm_bwd to get ∂L/∂q_h / ∂L/∂k_h.
-        # Recompute q_n / k_n from saved un-normalized q_h / k_h plus
-        # saved rstds (cheap: one elementwise mul per element). The
-        # fp32 promotion is required for bit-parity with FLA's
-        # ``l2norm_fwd`` output (verified empirically: bf16 path
-        # diverges by ~2e-3/element from FLA's fp32 reference, which
-        # compounds through the chunk-recurrence). For memory accounting
-        # this allocates 2 * T * key_dim * 4 bytes of transient fp32
-        # — captured in the working_set's per-chunk linear-attn
-        # workspace estimate.
-        q_rstd = slot.lin_q_rstd
+        # 3. FLA bwd. ``q_n``/``k_n`` are already post-l2norm and
+        # per-K-head; FLA's chunk_gated_delta_rule_bwd accepts GVA
+        # natively (q.shape[2]=H_k, v.shape[2]=H_v with H_v % H_k == 0;
+        # the kernel reads each v-head from k-head ``i_h // (HV//H)``
+        # via raw pointer arithmetic — see
+        # fla/ops/common/chunk_o.py:76, chunk_delta_h.py). No reverse
+        # GVA repeat_interleave needed; the kernel returns dq/dk
+        # already shaped ``(B, T, n_k_heads, head_k_dim)``.
+        q_rstd = slot.lin_q_rstd                             # (T, n_k_heads)
         k_rstd = slot.lin_k_rstd
-        q_n = (q_h.float() * q_rstd.float().unsqueeze(-1)).to(dtype).contiguous()
-        k_n = (k_h.float() * k_rstd.float().unsqueeze(-1)).to(dtype).contiguous()
         # Pass the POST-cumsum g (= g_post saved from fwd) so FLA's
         # internal state matches what it computed during fwd. FLA's bwd
         # applies a reverse-cumsum at the end so the returned ``dg`` is
         # in raw pre-cumsum g_input space — i.e. ∂L/∂(g_input).
         # Force ``.contiguous()`` on every kernel input -- FLA's kernels
         # use raw pointer arithmetic and silently produce wrong results
-        # on non-contiguous strides (same issue as the fwd path).
+        # on non-contiguous strides.
         q_b = q_n.unsqueeze(0).contiguous()
         k_b = k_n.unsqueeze(0).contiguous()
         v_b = v_h.unsqueeze(0).contiguous()
@@ -904,15 +901,14 @@ class GatedDeltaNetBlock:
             scale=scale, initial_state=None, do=do_b, dht=None,
             cu_seqlens=None,
         )
-        dq_n = dq_n.squeeze(0)                               # (T, n_v_heads, head_k_dim)
+        dq_n = dq_n.squeeze(0)                               # (T, n_k_heads, head_k_dim)
         dk_n = dk_n.squeeze(0)
-        dv_h = dv_h.squeeze(0)
+        dv_h = dv_h.squeeze(0)                               # (T, n_v_heads, head_v_dim)
         dbeta = dbeta.squeeze(0)                             # (T, n_v_heads)
         dg = dg.squeeze(0)                                   # (T, n_v_heads)
-        # 3b. Back-propagate through the l2 norm: dq_h = l2norm_bwd(q_n,
-        # q_rstd, dq_n). l2norm_bwd takes the *normalized* tensor (y),
-        # the saved rstd, and the upstream gradient (dy), and returns
-        # the gradient in input-space.
+        # 3b. Back-propagate through the l2 norm. l2norm_bwd takes the
+        # *normalized* tensor (y), the saved rstd, and upstream
+        # gradient (dy); returns gradient in pre-l2norm space.
         dq_h = l2norm_bwd(
             q_n.contiguous(), q_rstd.contiguous(), dq_n.contiguous(),
             eps=1e-6,
@@ -951,22 +947,12 @@ class GatedDeltaNetBlock:
         if grads.get("g_lin_dt_bias") is not None:
             grads["g_lin_dt_bias"].add_(d_dt_bias.to(grads["g_lin_dt_bias"].dtype))
 
-        # 5. GVA reverse repeat_interleave for q_h, k_h: pre-repeat had
-        # cfg.num_k_heads heads; we repeated each by `rep`.
-        rep = cfg.num_v_heads // cfg.num_k_heads
-        if rep > 1:
-            # Sum over each group of `rep` heads.
-            dq_pre = dq_h.reshape(T, cfg.num_k_heads, rep, cfg.head_k_dim).sum(dim=2)
-            dk_pre = dk_h.reshape(T, cfg.num_k_heads, rep, cfg.head_k_dim).sum(dim=2)
-        else:
-            dq_pre = dq_h
-            dk_pre = dk_h
-        dv_pre = dv_h                                          # already n_v_heads
-
-        # Flatten back to (T, key_dim) / (T, key_dim) / (T, value_dim).
-        d_q_p = dq_pre.reshape(T, cfg.key_dim)
-        d_k_p = dk_pre.reshape(T, cfg.key_dim)
-        d_v_p = dv_pre.reshape(T, cfg.value_dim)
+        # 5. dq_h / dk_h are already per-K-head (no reverse expand
+        # needed — FLA's GVA-aware bwd returned them already-collapsed).
+        # Flatten to (T, key_dim) / (T, key_dim) / (T, value_dim).
+        d_q_p = dq_h.reshape(T, cfg.key_dim)
+        d_k_p = dk_h.reshape(T, cfg.key_dim)
+        d_v_p = dv_h.reshape(T, cfg.value_dim)
         # cat reverse → d_post_conv (T, conv_dim).
         d_post_conv = torch.cat([d_q_p, d_k_p, d_v_p], dim=-1)
 

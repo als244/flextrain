@@ -395,11 +395,15 @@ def _baseline_gpu_activation_memory(
     # but when they do they allocate substantial transient buffers in
     # ``GatedDeltaNetBlock.bwd`` that the dense-transformer accounting
     # above doesn't capture:
-    #   * ``q_n``, ``k_n`` fp32 promotions:        2 * T * key_dim * 4
     #   * ``d_post_conv`` (cat of dq/dk/dv pre):   T * conv_dim * 2
     #   * ``d_conv_in`` (conv1d input grad):       T * conv_dim * 2
+    #     (this lives in FLA's causal_conv1d_bwd output buffer; counted
+    #     in fla_conv_scratch below.)
     #   * ``d_qkvz`` (cat output for proj wgrad):  T * proj_qkvz_dim * 2
-    #   * FLA bwd internal scratch (rough bound):  T * value_dim * 2
+    #   * FLA bwd internal scratch (rough bound).
+    # The old ``q_n``/``k_n`` fp32 promotion (2 * T * key_dim * 4
+    # bytes) is gone — q_n/k_n are now saved post-l2norm in the slot
+    # (lin_q/lin_k tier-2) and read directly in bwd; no recompute.
     # We size for the worst case: every in-flight chunk could be on a
     # linear-attn layer simultaneously. ``conv_dim = 2*key_dim + value_dim``
     # and ``proj_qkvz_dim = 2*key_dim + 2*value_dim``.
@@ -442,16 +446,15 @@ def _baseline_gpu_activation_memory(
         per_token_scratch = chunk_size * value_dim * sz_act
         fla_scratch = 4 * per_state + 6 * per_token_scratch
         lin_attn_fwd_workspace = (
-            2 * chunk_size * key_dim * fp32           # q_n + k_n fp32
-            + fla_scratch                              # FLA fwd internals
+            fla_scratch                                # FLA fwd internals
             + chunk_size * value_dim * sz_act          # FLA core_out
         )
         lin_attn_bwd_workspace = (
-            2 * chunk_size * key_dim * fp32           # q_n + k_n fp32
-            + chunk_size * conv_dim * sz_act          # d_post_conv
-            + chunk_size * conv_dim * sz_act          # d_conv_in
-            + chunk_size * proj_qkvz_dim * sz_act     # d_qkvz
-            + fla_scratch                              # FLA bwd internals
+            chunk_size * conv_dim * sz_act             # d_post_conv (pre-silu-bwd cat)
+            + chunk_size * conv_dim * sz_act           # d_post_conv_pre_silu (silu_bwd output)
+            + chunk_size * conv_dim * sz_act           # FLA conv1d_bwd dx output
+            + chunk_size * proj_qkvz_dim * sz_act      # d_qkvz (pre-projection-wgrad cat)
+            + fla_scratch                              # FLA gated-delta-rule bwd internals
         )
         # Take ``max`` of fwd vs bwd (only one runs at a time per layer)
         # and ``max`` against the dense full-attn workspace (each layer
