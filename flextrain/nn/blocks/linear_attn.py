@@ -147,23 +147,28 @@ def _split_qkvz(qkvz: torch.Tensor, cfg: GatedDeltaNetConfig):
     """Match HF's ``fix_query_key_value_ordering``.
 
     qkvz: (T, proj_qkvz_dim) -> reshape to (T, n_k_heads, ?) and split.
+
+    NOTE: this is the HF-compatible decomposition. The FT-side fast-path
+    (``_split_qkvz_ft``) requires the load-time column permutation
+    (:func:`build_qkvz_perm`) and produces zero-copy contiguous views.
+    Until the loader / exporter / bwd are all updated together, the
+    block stays on this path.
     """
     T = qkvz.shape[0]
     H = cfg.num_k_heads
     HV = cfg.num_v_heads
     hk = cfg.head_k_dim
     hv = cfg.head_v_dim
-    # The qkvz row layout is interleaved per-K-head with v-grouping.
     qkvz = qkvz.view(T, H, 2 * hk + 2 * (HV // H) * hv)
     parts = [hk, hk, (HV // H) * hv, (HV // H) * hv]
     q, k, v_grp, z_grp = torch.split(qkvz, parts, dim=-1)
-    # q, k: (T, H, hk).  v, z: (T, H * (HV/H), hv) = (T, HV, hv) after reshape.
     v = v_grp.reshape(T, HV, hv)
     z = z_grp.reshape(T, HV, hv)
     return q, k, v, z
 
 
 def _split_ba(ba: torch.Tensor, cfg: GatedDeltaNetConfig):
+    """HF-compatible ``ba`` decomposition. See :func:`_split_qkvz` note."""
     T = ba.shape[0]
     H = cfg.num_k_heads
     HV = cfg.num_v_heads
@@ -173,6 +178,122 @@ def _split_ba(ba: torch.Tensor, cfg: GatedDeltaNetConfig):
     b = b.reshape(T, HV)
     a = a.reshape(T, HV)
     return b, a
+
+
+def _split_qkvz_ft(qkvz: torch.Tensor, cfg: GatedDeltaNetConfig):
+    """Decompose qkvz in FT's column-grouped layout (post-permutation).
+
+    qkvz columns are ``[Q | K | V | Z]`` (block-major), each block laid
+    out as ``(head, dim)`` row-major. All four returned views are
+    zero-copy contiguous. Eliminates the 4 reshape-copies + cat that
+    the HF-layout :func:`_split_qkvz` forces in the fwd hot path.
+
+    Requires the load-time column permutation in
+    :func:`build_qkvz_perm` (and its inverse in the exporter).
+    """
+    T = qkvz.shape[0]
+    H = cfg.num_k_heads
+    HV = cfg.num_v_heads
+    hk = cfg.head_k_dim
+    hv = cfg.head_v_dim
+    key_dim = H * hk
+    value_dim = HV * hv
+    q = qkvz[:, :key_dim].view(T, H, hk)
+    k = qkvz[:, key_dim:2 * key_dim].view(T, H, hk)
+    v = qkvz[:, 2 * key_dim:2 * key_dim + value_dim].view(T, HV, hv)
+    z = qkvz[:, 2 * key_dim + value_dim:].view(T, HV, hv)
+    return q, k, v, z
+
+
+def _split_ba_ft(ba: torch.Tensor, cfg: GatedDeltaNetConfig):
+    """FT layout: ``[B | A]``. Zero-copy. Requires :func:`build_ba_perm`."""
+    HV = cfg.num_v_heads
+    return ba[:, :HV], ba[:, HV:]
+
+
+def build_qkvz_perm(cfg: GatedDeltaNetConfig) -> torch.Tensor:
+    """Permutation tensor mapping FT column order to HF column order.
+
+    Use as ``W_qkvz_ft = W_qkvz_hf[:, perm].contiguous()``. Saving:
+    inverse permutation is :func:`build_qkvz_perm_inverse`. Index
+    tensor is on CPU; loaders / exporters are CPU-side.
+
+    HF layout (per-K-head h, intra-head local position):
+      [0..hk-1]                           : Q[h, :]
+      [hk..2hk-1]                         : K[h, :]
+      [2hk..2hk + grp*hv - 1]             : V slice for v-heads h*grp..(h+1)*grp-1
+      [2hk + grp*hv..2hk + 2*grp*hv - 1]  : Z slice (same v-heads)
+
+    FT target layout:
+      [0..key_dim-1]                                   : Q (head varies first, dim fast)
+      [key_dim..2*key_dim-1]                           : K
+      [2*key_dim..2*key_dim+value_dim-1]               : V (head varies first, dim fast)
+      [2*key_dim+value_dim..]                          : Z
+    """
+    H = cfg.num_k_heads
+    HV = cfg.num_v_heads
+    hk = cfg.head_k_dim
+    hv = cfg.head_v_dim
+    grp = HV // H
+    per_k_head = 2 * hk + 2 * grp * hv
+    perm: list[int] = []
+    # Q block.
+    for h in range(H):
+        off = h * per_k_head
+        for d in range(hk):
+            perm.append(off + d)
+    # K block.
+    for h in range(H):
+        off = h * per_k_head
+        for d in range(hk):
+            perm.append(off + hk + d)
+    # V block.
+    for h in range(H):
+        for gh in range(grp):
+            off = h * per_k_head + 2 * hk + gh * hv
+            for d in range(hv):
+                perm.append(off + d)
+    # Z block.
+    for h in range(H):
+        for gh in range(grp):
+            off = h * per_k_head + 2 * hk + grp * hv + gh * hv
+            for d in range(hv):
+                perm.append(off + d)
+    return torch.tensor(perm, dtype=torch.int64)
+
+
+def build_ba_perm(cfg: GatedDeltaNetConfig) -> torch.Tensor:
+    """Permutation for the ``ba`` projection. HF interleaves
+    ``[b_grp, a_grp]`` per K-head; FT wants ``[B | A]`` flat.
+    """
+    H = cfg.num_k_heads
+    HV = cfg.num_v_heads
+    grp = HV // H
+    perm: list[int] = []
+    for h in range(H):
+        for gh in range(grp):
+            perm.append(h * (2 * grp) + gh)
+    for h in range(H):
+        for gh in range(grp):
+            perm.append(h * (2 * grp) + grp + gh)
+    return torch.tensor(perm, dtype=torch.int64)
+
+
+def build_qkvz_perm_inverse(cfg: GatedDeltaNetConfig) -> torch.Tensor:
+    """Inverse of :func:`build_qkvz_perm` for HF safetensors export.
+    ``W_qkvz_hf = W_qkvz_ft[:, inv_perm]``."""
+    perm = build_qkvz_perm(cfg)
+    inv = torch.empty_like(perm)
+    inv[perm] = torch.arange(perm.numel(), dtype=perm.dtype)
+    return inv
+
+
+def build_ba_perm_inverse(cfg: GatedDeltaNetConfig) -> torch.Tensor:
+    """Inverse of :func:`build_ba_perm`."""
+    perm = build_ba_perm(cfg)
+    inv = torch.empty_like(perm)
+    inv[perm] = torch.arange(perm.numel(), dtype=perm.dtype)
+    return inv
 
 
 # ---------------------------------------------------------------------------
@@ -410,12 +531,15 @@ class GatedDeltaNetBlock:
         T = x.shape[0]
         qkvz = x @ weights["w_lin_qkvz"]
         ba = x @ weights["w_lin_ba"]
-        q_pre, k_pre, v_pre, z = _split_qkvz(qkvz, cfg)
-        b, a = _split_ba(ba, cfg)
-        q_flat = q_pre.reshape(T, cfg.key_dim)
-        k_flat = k_pre.reshape(T, cfg.key_dim)
-        v_flat = v_pre.reshape(T, cfg.value_dim)
-        conv_in = torch.cat([q_flat, k_flat, v_flat], dim=-1)  # (T, conv_dim)
+        # FT-layout decomposition (post column-permutation): q/k/v/z and
+        # b/a are contiguous slices/views of qkvz/ba — zero-copy. The
+        # old HF-layout code path required 4 reshape-copies + a cat to
+        # gather the per-K-head-interleaved columns into a flat conv_in.
+        q_pre, k_pre, v_pre, z = _split_qkvz_ft(qkvz, cfg)
+        b, a = _split_ba_ft(ba, cfg)
+        # conv_in = qkvz[:, :conv_dim] is the same memory as
+        # cat(q.flat, k.flat, v.flat) under the FT layout — zero-copy.
+        conv_in = qkvz[:, :cfg.conv_dim]
         if not (skip_already_saved and slot.has("lin_conv_in")):
             slot.lin_conv_in.copy_(conv_in.to(bf))
         if not (skip_already_saved and slot.has("lin_a")):
@@ -1028,38 +1152,33 @@ class GatedDeltaNetBlock:
                 dw_fla.unsqueeze(1).to(grads["g_lin_conv"].dtype)
             )
 
-        # 8. cat → d_q_flat, d_k_flat, d_v_flat (each pre-conv).
+        # 8. Split d_conv_in into d_q_flat / d_k_flat / d_v_flat. Under
+        # the FT layout these are contiguous slices that match the
+        # ``[Q | K | V]`` blocks of qkvz at the front of the column axis;
+        # no reshape-copies needed.
         d_q_flat, d_k_flat, d_v_flat = torch.split(
             d_conv_in,
             [cfg.key_dim, cfg.key_dim, cfg.value_dim], dim=-1,
         )
-        # Pre-conv q_pre/k_pre were (T, n_k_heads, head_k_dim); v_pre was
-        # (T, n_v_heads, head_v_dim). Reshape grads back.
-        d_q_pre = d_q_flat.reshape(T, cfg.num_k_heads, cfg.head_k_dim)
-        d_k_pre = d_k_flat.reshape(T, cfg.num_k_heads, cfg.head_k_dim)
-        d_v_pre = d_v_flat.reshape(T, cfg.num_v_heads, cfg.head_v_dim)
 
-        # 9. Reverse the qkvz / ba splits to assemble dqkvz, dba.
-        # qkvz layout: per-K-head, [q (head_k_dim), k (head_k_dim),
-        #                            v_grp ((HV/H)*hv), z_grp ((HV/H)*hv)].
-        H = cfg.num_k_heads
-        HV = cfg.num_v_heads
-        grp = HV // H
-        # v_pre and z came from (T, H, grp*hv) before reshape to (T, HV, hv).
-        d_v_grp = d_v_pre.reshape(T, H, grp * cfg.head_v_dim)
-        d_z_grp = dz.reshape(T, H, grp * cfg.head_v_dim).to(dtype)
-        # Assemble dqkvz per-K-head row.
-        d_qkvz = torch.cat(
-            [d_q_pre, d_k_pre, d_v_grp, d_z_grp], dim=-1,
-        )                                                          # (T, H, qkvz_per_head)
-        d_qkvz_2d = d_qkvz.reshape(T, cfg.proj_qkvz_dim)
+        # 9. Assemble d_qkvz in the FT block-major column layout
+        # ``[Q | K | V | Z]``. d_z (gated-rmsnorm bwd output) becomes
+        # the Z block. All four pieces are already in the right
+        # head-major layout per FT convention.
+        # NB: dz comes from ``_gated_rmsnorm_bwd`` with shape
+        # (T, num_v_heads, head_v_dim); reshape to (T, value_dim).
+        d_z_flat = dz.reshape(T, cfg.value_dim).to(dtype)
+        d_qkvz_2d = torch.cat(
+            [d_q_flat, d_k_flat, d_v_flat, d_z_flat], dim=-1,
+        )                                                          # (T, proj_qkvz_dim)
 
-        # ba layout: per-K-head, [b (grp), a (grp)].
+        # 10. Assemble d_ba in the FT block-major layout ``[B | A]``.
         # db = db_via_beta (sigmoid bwd of b), da = da_via_g (gate bwd).
-        d_b_grp = db_via_beta.reshape(T, H, grp)
-        d_a_grp = da_via_g.reshape(T, H, grp)
-        d_ba = torch.cat([d_b_grp, d_a_grp], dim=-1)                # (T, H, 2*grp)
-        d_ba_2d = d_ba.reshape(T, cfg.proj_ba_dim)
+        d_ba_2d = torch.cat(
+            [db_via_beta.reshape(T, cfg.num_v_heads),
+             da_via_g.reshape(T, cfg.num_v_heads)],
+            dim=-1,
+        )                                                          # (T, proj_ba_dim)
 
         # 10. Linear bwd for x @ W_qkvz and x @ W_ba.
         # Wgrad addmms are skip-able (LoRA fast path); the dx accumulations

@@ -219,18 +219,28 @@ def _qwen3_5_moe_post_load_hook(
             f"{num_k*head_block}"
         )
 
-        q_view = hf_qkv[:key_dim, :].reshape(num_k, hk, hidden)
-        k_view = hf_qkv[key_dim:2*key_dim, :].reshape(num_k, hk, hidden)
-        v_view = hf_qkv[2*key_dim:, :].reshape(num_k, grp * hv, hidden)
-        z_view = hf_z.reshape(num_k, grp * hv, hidden)
-        bundled = torch.cat([q_view, k_view, v_view, z_view], dim=1)
-        bundled = bundled.reshape(num_k * head_block, hidden).T.contiguous()
+        # FT block-major column layout: ``[Q | K | V | Z]`` over the
+        # column axis; each block laid out as (head, dim) row-major.
+        # See :func:`flextrain.nn.blocks.linear_attn.build_qkvz_perm` for
+        # why and the inverse permutation used by the exporter.
+        # HF input shapes are (out, in); we transpose to (in, out) at
+        # the end. ``hf_qkv`` is the fused [Q-block | K-block | V-block]
+        # along its first axis already (Qwen3.5 stored them split that
+        # way per the in_proj_qkv tensor).
+        q_block = hf_qkv[:key_dim, :]                           # (key_dim, hidden)
+        k_block = hf_qkv[key_dim:2*key_dim, :]                  # (key_dim, hidden)
+        v_block = hf_qkv[2*key_dim:, :]                         # (value_dim, hidden)
+        z_block = hf_z                                          # (value_dim, hidden)
+        # Stack along the out-axis: ``[Q | K | V | Z]`` then transpose
+        # to (in, out) for FT.
+        bundled = torch.cat([q_block, k_block, v_block, z_block], dim=0)
+        bundled = bundled.T.contiguous()                        # (hidden, proj_qkvz_dim)
         ft_qkvz.copy_(bundled.to(ft_dtype))
 
-        b_view = hf_b.reshape(num_k, grp, hidden)
-        a_view = hf_a.reshape(num_k, grp, hidden)
-        bundled_ba = torch.cat([b_view, a_view], dim=1)
-        bundled_ba = bundled_ba.reshape(num_k * 2 * grp, hidden).T.contiguous()
+        # FT ba layout: ``[B | A]`` along columns (no per-K-head structure).
+        # HF stores in_proj_b and in_proj_a as separate (num_v, hidden) tensors.
+        bundled_ba = torch.cat([hf_b, hf_a], dim=0)             # (2*num_v, hidden)
+        bundled_ba = bundled_ba.T.contiguous()                  # (hidden, proj_ba_dim)
         ft_ba.copy_(bundled_ba.to(ft_dtype))
 
     # ----- (3) Stack routed expert weights (fused HF format). -----

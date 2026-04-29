@@ -67,6 +67,45 @@ def _qwen3_next_post_load_hook(
     if final_norm is not None:
         final_norm.add_(1.0)
 
+    # ----- (1.5) Linear-attn column permutation. -----
+    # The HF in_proj_qkvz weight has columns interleaved per-K-head:
+    # for each K-head h, the row of columns is
+    # ``[Q[h] | K[h] | V_grp[h] | Z_grp[h]]``. FT wants the column-block-
+    # major layout ``[Q | K | V | Z]`` (head-major within each block),
+    # which lets the fwd pass q/k/v/z as zero-copy contiguous slices of
+    # the matmul output instead of cat-ing per-K-head.
+    # (Same idea for in_proj_ba: HF is ``[B_grp | A_grp]`` per-K-head;
+    # FT is ``[B | A]`` flat.)
+    # The exporter applies the inverse permutation when serializing.
+    cfg_path = os.path.join(hf_path, "config.json")
+    if os.path.isfile(cfg_path):
+        with open(cfg_path) as f:
+            hf_cfg = json.load(f)
+        from flextrain.nn.blocks.linear_attn import (
+            GatedDeltaNetConfig,
+            build_qkvz_perm, build_ba_perm,
+        )
+        # Read the linear-attn dims via the same getters used in
+        # ``hf_config_to_flextrain``.
+        _LA_CFG = GatedDeltaNetConfig(
+            d_model=hf_cfg.get("hidden_size", 0),
+            num_v_heads=hf_cfg.get("linear_num_value_heads", 32),
+            num_k_heads=hf_cfg.get("linear_num_key_heads", 16),
+            head_k_dim=hf_cfg.get("linear_key_head_dim", 128),
+            head_v_dim=hf_cfg.get("linear_value_head_dim", 128),
+            conv_kernel_size=hf_cfg.get("linear_conv_kernel_dim", 4),
+        )
+        perm_qkvz = build_qkvz_perm(_LA_CFG)
+        perm_ba = build_ba_perm(_LA_CFG)
+        for L in range(num_layers):
+            t_qkvz = dest.get((f"layer_{L}", "w_lin_qkvz"))
+            if t_qkvz is not None:
+                # In-place column permute: t_qkvz is (hidden, proj_qkvz_dim).
+                t_qkvz.copy_(t_qkvz[:, perm_qkvz].contiguous())
+            t_ba = dest.get((f"layer_{L}", "w_lin_ba"))
+            if t_ba is not None:
+                t_ba.copy_(t_ba[:, perm_ba].contiguous())
+
     # ----- (2) Stack per-expert MoE weights. -----
     # Two HF formats observed:
     #   * fused (newer):    experts.gate_up_proj  (E, 2F, d_model)
