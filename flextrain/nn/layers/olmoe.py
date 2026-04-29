@@ -83,6 +83,12 @@ class OLMoEBlockConfig:
 
 
 class OLMoEBlock:
+    # Tells ``ActiveModel.__post_init__`` to allocate a secondary
+    # CUDA compute stream so ``MoESwiGLUFFN.fwd`` / ``bwd`` can
+    # alternate per-expert matmuls between primary and secondary
+    # streams (see flextrain/nn/blocks/ffn_moe.py).
+    uses_secondary_stream = True
+
     """OLMoE-style MoE transformer layer.
 
     Activation schema (max_tier=3)

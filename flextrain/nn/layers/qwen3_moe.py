@@ -80,6 +80,10 @@ class Qwen3MoEBlockConfig:
 
 
 class Qwen3MoEBlock:
+    # Allocate a secondary CUDA compute stream so the MoE expert loop
+    # can overlap per-expert matmuls (see ffn_moe.py).
+    uses_secondary_stream = True
+
     """Qwen3-MoE full-context layer.
 
     Per-head QK-norm (like Qwen3-dense) + MoE FFN (like OLMoE), with

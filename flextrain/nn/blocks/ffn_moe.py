@@ -79,6 +79,7 @@ from flextrain.ops import (
     flextrain_swiglu_moe_bwd,
     flextrain_swiglu_moe_fwd,
     dispatcher,
+    dispatcher_secondary,
 )
 
 
@@ -334,11 +335,34 @@ class MoESwiGLUFFN:
         # does swiglu_up / swiglu_act / swiglu_down, writes back to its
         # slice of scattered_x (in-place). The tier-3 x_up field holds
         # the pre-activation; expert views are slot.x_up[start:end, :].
+        # When the engine provides a secondary compute stream, alternate
+        # odd/even experts between primary and secondary streams to
+        # overlap their cuBLAS matmuls — mirrors orig/awsm_transformer/
+        # moe_layer.py:200-269 which proved a meaningful speedup at
+        # large E because per-expert tiles are small (T_e ~= T*K/E)
+        # and don't saturate the GPU on their own.
         max_exp_tokens = int(expert_counts_cpu.max())
-        x_act_scratch = ctx.scratch(
-            (max_exp_tokens, expert_dim), ffn_norm_output.dtype
-        )
-        stream_ptr = torch.cuda.current_stream().cuda_stream
+        primary_stream = ctx.stream
+        primary_stream_ptr = primary_stream.cuda_stream
+        secondary_stream = ctx.secondary_stream
+        use_secondary = secondary_stream is not None
+        if use_secondary:
+            # Two distinct scratch buffers so even-/odd-expert swiglu
+            # activations don't stomp on each other across streams.
+            x_act_even = ctx.scratch(
+                (max_exp_tokens, expert_dim), ffn_norm_output.dtype,
+            )
+            x_act_odd = ctx.scratch(
+                (max_exp_tokens, expert_dim), ffn_norm_output.dtype,
+            )
+            secondary_stream_ptr = secondary_stream.cuda_stream
+            secondary_stream.wait_stream(primary_stream)
+        else:
+            x_act_even = ctx.scratch(
+                (max_exp_tokens, expert_dim), ffn_norm_output.dtype,
+            )
+            x_act_odd = x_act_even
+            secondary_stream_ptr = primary_stream_ptr
         cur_offset = 0
         for eid in range(num_experts):
             n_exp_tokens = int(expert_counts_cpu[eid].item())
@@ -352,15 +376,33 @@ class MoESwiGLUFFN:
             w_up = weights["w_up"][eid, :, :]
             x_preact = slot.x_up[start:end, :]
 
-            # gate/up together: (T_e, d_model) @ (d_model, 2F) -> (T_e, 2F)
-            dispatcher.matmul(stream_ptr, A=x_inp, B=w_up, D=x_preact)
+            # Pick stream + dispatcher based on parity. Even -> primary,
+            # odd -> secondary (when available).
+            if use_secondary and (eid % 2 == 1):
+                cur_dispatcher = dispatcher_secondary
+                cur_stream_ptr = secondary_stream_ptr
+                cur_stream = secondary_stream
+                x_act = x_act_odd[:n_exp_tokens, :]
+            else:
+                cur_dispatcher = dispatcher
+                cur_stream_ptr = primary_stream_ptr
+                cur_stream = primary_stream
+                x_act = x_act_even[:n_exp_tokens, :]
 
-            x_act = x_act_scratch[:n_exp_tokens, :]
-            flextrain_swiglu_moe_fwd(x_preact, out=x_act)
+            with torch.cuda.stream(cur_stream):
+                # gate/up together: (T_e, d_model) @ (d_model, 2F) -> (T_e, 2F)
+                cur_dispatcher.matmul(
+                    cur_stream_ptr, A=x_inp, B=w_up, D=x_preact,
+                )
+                flextrain_swiglu_moe_fwd(x_preact, out=x_act)
+                w_down = weights["w_down"][eid, :, :]
+                # Write expert output back into the same scattered_x slice.
+                cur_dispatcher.matmul(
+                    cur_stream_ptr, A=x_act, B=w_down, D=x_inp,
+                )
 
-            w_down = weights["w_down"][eid, :, :]
-            # Write expert output back into the same scattered_x slice.
-            dispatcher.matmul(stream_ptr, A=x_act, B=w_down, D=x_inp)
+        if use_secondary:
+            primary_stream.wait_stream(secondary_stream)
 
         # 6) Gather back to (T, d_model), scaling by router weights and
         # adding the block's residual input (attn_output_with_residual).
@@ -412,7 +454,9 @@ class MoESwiGLUFFN:
         x_sorted = flextrain_moe_scatter(
             ffn_norm_output, index_mapping, out=scattered_x
         )
-        # Per-expert up-projection.
+        # Per-expert up-projection. Recompute path stays on primary
+        # stream — only one matmul per expert (no swiglu-act / down),
+        # not enough work to justify the secondary-stream fork-join.
         stream_ptr = torch.cuda.current_stream().cuda_stream
         cur_offset = 0
         for eid in range(num_experts):
@@ -510,15 +554,35 @@ class MoESwiGLUFFN:
         #    e) g_up[e] += x_pre.T @ dx_up_up         (weight grad for this expert)
         # slot.scattered_router_weights was allocated at max_chunk_size
         # * top_k; narrow to this chunk's TK.
+        # When the engine provides a secondary compute stream, alternate
+        # odd/even experts between primary and secondary streams to
+        # overlap their cuBLAS matmuls (4 matmuls per expert: dx_act_up,
+        # g_down accum, dx_pre, g_up accum). Mirrors orig moe_layer
+        # bwd at lines 335-369.
         TK = num_tokens * top_k
         srw = slot.scattered_router_weights[:TK, :]
         dprobs = torch.zeros_like(srw)
         max_exp_tokens = int(expert_counts_cpu.max())
-        X_temp = torch.zeros(
+        primary_stream = ctx.stream
+        primary_stream_ptr = primary_stream.cuda_stream
+        secondary_stream = ctx.secondary_stream
+        use_secondary = secondary_stream is not None
+        # Two scratch buffers (one per stream) so even/odd expert
+        # bwds don't race on the same X_temp.
+        X_temp_even = torch.zeros(
             max_exp_tokens * (4 * expert_dim),
             dtype=dy_resid.dtype, device=dy_resid.device,
         )
-        stream_ptr = torch.cuda.current_stream().cuda_stream
+        if use_secondary:
+            X_temp_odd = torch.zeros(
+                max_exp_tokens * (4 * expert_dim),
+                dtype=dy_resid.dtype, device=dy_resid.device,
+            )
+            secondary_stream_ptr = secondary_stream.cuda_stream
+            secondary_stream.wait_stream(primary_stream)
+        else:
+            X_temp_odd = X_temp_even
+            secondary_stream_ptr = primary_stream_ptr
         cur_offset = 0
         for eid in range(num_experts):
             n_exp_tokens = int(expert_counts_cpu[eid].item())
@@ -535,6 +599,18 @@ class MoESwiGLUFFN:
             exp_probs = srw[start:end]
             exp_dprobs = dprobs[start:end]
 
+            # Pick stream + dispatcher + scratch by parity.
+            if use_secondary and (eid % 2 == 1):
+                cur_dispatcher = dispatcher_secondary
+                cur_stream_ptr = secondary_stream_ptr
+                cur_stream = secondary_stream
+                X_temp = X_temp_odd
+            else:
+                cur_dispatcher = dispatcher
+                cur_stream_ptr = primary_stream_ptr
+                cur_stream = primary_stream
+                X_temp = X_temp_even
+
             # Temp buffers carved out of X_temp:
             toff = 0
             dx_act_up = X_temp[toff : toff + n_exp_tokens * expert_dim].view(
@@ -550,56 +626,61 @@ class MoESwiGLUFFN:
             )
             toff += n_exp_tokens * expert_dim
 
-            # a) dx_act_up = exp_upstream @ w_down.T
-            dispatcher.matmul(stream_ptr, A=exp_upstream, B=w_down.T, D=dx_act_up)
-
-            # b) swiglu_moe bwd returns rescaled dx_up_up and per-token
-            # d_router_weight (dot product of dx_act_up and recomputed
-            # swiglu-forward output). Writes fwd_act (scaled).
-            dx_up_up, exp_dprobs = flextrain_swiglu_moe_bwd(
-                dx_act_up, x_preact, exp_probs,
-                dx=dx_up_up, dw=exp_dprobs, fwd_act=fwd_act,
-            )
-
-            # c) g_down[e] += fwd_act.T @ exp_upstream
-            if "g_down" in skip_grads:
-                if lora_per_expert_callback is not None:
-                    # Hand back X=fwd_act, dY=exp_upstream for this expert.
-                    # No clones: the wrapper's callback consumes them
-                    # immediately into rank-r accumulators (still inside
-                    # this loop iteration; no lifetime issues).
-                    lora_per_expert_callback("g_down", eid, fwd_act, exp_upstream)
-            elif grads.get("g_down") is not None:
-                g_down_e = grads["g_down"][eid, :, :]
-                dispatcher.matmul(
-                    stream_ptr,
-                    A=fwd_act.T, B=exp_upstream,
-                    C=g_down_e, D=g_down_e,
-                    beta=1.0, alpha=1.0,
+            with torch.cuda.stream(cur_stream):
+                # a) dx_act_up = exp_upstream @ w_down.T
+                cur_dispatcher.matmul(
+                    cur_stream_ptr, A=exp_upstream, B=w_down.T, D=dx_act_up,
                 )
-            # else: w_down is frozen (LoRA-only on attn, MoE base frozen) —
-            # buffer manager skipped grad allocation; no wgrad to write.
 
-            # d) dx_pre = dx_up_up @ w_up.T (overwrites exp_upstream to
-            # carry the pre-scatter gradient for the gather step below).
-            # MUST run for both fast and slow LoRA paths (it's part of
-            # dgrad, not Wgrad).
-            dispatcher.matmul(stream_ptr, A=dx_up_up, B=w_up.T, D=exp_upstream)
-
-            # e) g_up[e] += scattered_x[start:end].T @ dx_up_up
-            exp_inp = scattered_x[start:end, :]
-            if "g_up" in skip_grads:
-                if lora_per_expert_callback is not None:
-                    lora_per_expert_callback("g_up", eid, exp_inp, dx_up_up)
-            elif grads.get("g_up") is not None:
-                g_up_e = grads["g_up"][eid, :, :]
-                dispatcher.matmul(
-                    stream_ptr,
-                    A=exp_inp.T, B=dx_up_up,
-                    C=g_up_e, D=g_up_e,
-                    beta=1.0, alpha=1.0,
+                # b) swiglu_moe bwd returns rescaled dx_up_up and per-
+                # token d_router_weight (dot product of dx_act_up and
+                # recomputed swiglu-forward output). Writes fwd_act
+                # (scaled).
+                dx_up_up, exp_dprobs = flextrain_swiglu_moe_bwd(
+                    dx_act_up, x_preact, exp_probs,
+                    dx=dx_up_up, dw=exp_dprobs, fwd_act=fwd_act,
                 )
-            # else: frozen — see g_down branch above.
+
+                # c) g_down[e] += fwd_act.T @ exp_upstream
+                if "g_down" in skip_grads:
+                    if lora_per_expert_callback is not None:
+                        lora_per_expert_callback(
+                            "g_down", eid, fwd_act, exp_upstream,
+                        )
+                elif grads.get("g_down") is not None:
+                    g_down_e = grads["g_down"][eid, :, :]
+                    cur_dispatcher.matmul(
+                        cur_stream_ptr,
+                        A=fwd_act.T, B=exp_upstream,
+                        C=g_down_e, D=g_down_e,
+                        beta=1.0, alpha=1.0,
+                    )
+                # else: w_down is frozen — no wgrad to write.
+
+                # d) dx_pre = dx_up_up @ w_up.T (overwrites exp_upstream).
+                cur_dispatcher.matmul(
+                    cur_stream_ptr, A=dx_up_up, B=w_up.T, D=exp_upstream,
+                )
+
+                # e) g_up[e] += scattered_x[start:end].T @ dx_up_up
+                exp_inp = scattered_x[start:end, :]
+                if "g_up" in skip_grads:
+                    if lora_per_expert_callback is not None:
+                        lora_per_expert_callback(
+                            "g_up", eid, exp_inp, dx_up_up,
+                        )
+                elif grads.get("g_up") is not None:
+                    g_up_e = grads["g_up"][eid, :, :]
+                    cur_dispatcher.matmul(
+                        cur_stream_ptr,
+                        A=exp_inp.T, B=dx_up_up,
+                        C=g_up_e, D=g_up_e,
+                        beta=1.0, alpha=1.0,
+                    )
+                # else: frozen — see g_down branch above.
+
+        if use_secondary:
+            primary_stream.wait_stream(secondary_stream)
 
         del scattered_x
 
@@ -640,10 +721,12 @@ class MoESwiGLUFFN:
                 dlogits=dlogits,
             )
 
-        # 7) Router weight gradient + downstream FFN-norm-upstream accumulation.
+        # 7) Router weight gradient + downstream FFN-norm-upstream
+        # accumulation. These run AFTER the secondary-stream join above,
+        # always on the primary stream/dispatcher.
         # ffn_norm_upstream += dlogits @ w_router.T (always runs -- dgrad).
         dispatcher.matmul(
-            stream_ptr,
+            primary_stream_ptr,
             A=dlogits, B=weights["w_router"].T,
             C=ffn_norm_upstream, D=ffn_norm_upstream,
             beta=1.0, alpha=1.0,
@@ -658,7 +741,7 @@ class MoESwiGLUFFN:
                 )
         elif grads.get("g_router") is not None:
             dispatcher.matmul(
-                stream_ptr,
+                primary_stream_ptr,
                 A=ffn_norm_output.T, B=dlogits,
                 C=grads["g_router"], D=grads["g_router"],
                 beta=1.0, alpha=1.0,

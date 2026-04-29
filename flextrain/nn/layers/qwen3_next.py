@@ -122,6 +122,11 @@ class Qwen3NextLayerConfig:
 
 
 class Qwen3NextLinearLayer:
+    # Allocate a secondary CUDA compute stream so the MoE expert loop
+    # (in MoESwiGLUSharedExpertFFN / MoESwiGLUFFN) can overlap per-
+    # expert matmuls between primary and secondary streams.
+    uses_secondary_stream = True
+
     """Qwen3-Next layer with gated-DeltaNet linear attention + MoE FFN."""
 
     def __init__(self, layer_id: int, cfg: Qwen3NextLayerConfig) -> None:
@@ -386,6 +391,11 @@ class Qwen3NextLinearLayer:
 
 
 class Qwen3NextFullLayer:
+    # Allocate a secondary CUDA compute stream so the MoE expert loop
+    # can overlap per-expert matmuls between primary and secondary
+    # streams (see ffn_moe.py / ffn_moe_shared.py).
+    uses_secondary_stream = True
+
     """Qwen3-Next full-attention layer.
 
     Composition:
