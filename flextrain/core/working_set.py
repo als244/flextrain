@@ -1090,7 +1090,31 @@ def _pick_chunk_size(
         if min_chunk_size is not None and chunk_size < min_chunk_size:
             break
 
-        target_num_chunks = target_tokens_per_round // chunk_size
+        # Pick ``target_num_chunks``. The default is
+        # ``target_tokens_per_round // chunk_size`` (largest nc that
+        # fits inside the target round). But if ``chunk_size`` divides
+        # ``max_global_batch_tokens`` cleanly, we can do better: pick
+        # the largest nc such that (nc * chunk) divides batch — that
+        # gives a *zero-tail* round structure. Without this, e.g.
+        # chunk=131072 with target=478800 and batch=524288 picks
+        # nc=3 → total_round=393216 → tail=131072 (25% of step!),
+        # which the tail-round filter then rejects, leaving us with
+        # only chunk=262144 nc=1 (the lone zero-tail option in the
+        # divisor list of target=478800).
+        default_nc = target_tokens_per_round // chunk_size
+        target_num_chunks = default_nc
+        if (
+            chunk_size > 0
+            and max_global_batch_tokens % chunk_size == 0
+            and default_nc > 0
+        ):
+            # Largest nc <= default_nc such that nc divides
+            # (max_global_batch_tokens // chunk_size).
+            max_nc_in_batch = max_global_batch_tokens // chunk_size
+            for nc_candidate in range(default_nc, 0, -1):
+                if max_nc_in_batch % nc_candidate == 0:
+                    target_num_chunks = nc_candidate
+                    break
         temp_round_tokens = target_num_chunks * chunk_size
         final_round_tokens = max_global_batch_tokens % temp_round_tokens
         # Skip configs where the last round would be both (a) absolutely
