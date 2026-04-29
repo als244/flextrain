@@ -62,6 +62,7 @@ from __future__ import annotations
 import json
 import glob
 import os
+import sys
 import threading
 from collections import deque
 from dataclasses import dataclass
@@ -420,33 +421,51 @@ class JsonSFTTokenSource:
     def _producer_loop(self) -> None:
         """Tokenize records into the queue forever (or until exhausted
         when ``loop=False``).
+
+        Wraps the body in ``try/except`` so any exception during
+        interpreter teardown (modules being torn down out from under
+        a C extension call, etc.) exits the thread cleanly instead of
+        propagating out and triggering glibc's ``FATAL: exception not
+        rethrown``. Errors before teardown still get re-raised after
+        marking the source exhausted, so a real bug isn't hidden.
         """
         while not self._stop.is_set():
-            # Block while the buffer is full.
-            with self._room:
-                while (
-                    self._tokens_buffered >= self.prefetch_max_tokens
-                    and not self._stop.is_set()
-                ):
-                    self._room.wait(timeout=0.5)
-                if self._stop.is_set():
-                    return
-                if self._cursor >= len(self._records):
-                    if not self.loop:
-                        self._exhausted = True
+            try:
+                # Block while the buffer is full.
+                with self._room:
+                    while (
+                        self._tokens_buffered >= self.prefetch_max_tokens
+                        and not self._stop.is_set()
+                    ):
+                        self._room.wait(timeout=0.5)
+                    if self._stop.is_set():
                         return
-                    self._cursor = 0
-                idx = self._cursor
-                self._cursor += 1
-                seq_id = self._next_seq_id
-                self._next_seq_id += 1
-            # Tokenize OUTSIDE the lock — this is the expensive part.
-            seq = self._tokenize_record(self._records[idx], seq_id)
-            if seq is None:
-                continue
-            with self._lock:
-                self._queue.append(seq)
-                self._tokens_buffered += len(seq)
+                    if self._cursor >= len(self._records):
+                        if not self.loop:
+                            self._exhausted = True
+                            return
+                        self._cursor = 0
+                    idx = self._cursor
+                    self._cursor += 1
+                    seq_id = self._next_seq_id
+                    self._next_seq_id += 1
+                # Tokenize OUTSIDE the lock — this is the expensive part.
+                seq = self._tokenize_record(self._records[idx], seq_id)
+                if seq is None:
+                    continue
+                with self._lock:
+                    self._queue.append(seq)
+                    self._tokens_buffered += len(seq)
+            except BaseException:
+                # If the interpreter is finalizing, just exit silently —
+                # half-torn-down globals can break torch / tokenizer
+                # calls in unfixable ways. Otherwise mark exhausted +
+                # re-raise so a real bug surfaces.
+                self._exhausted = True
+                self._stop.set()
+                if sys.is_finalizing():
+                    return
+                raise
 
     def _ensure_worker(self) -> None:
         if self._worker is not None and self._worker.is_alive():
@@ -472,6 +491,14 @@ class JsonSFTTokenSource:
         self._worker = None
 
     def __del__(self) -> None:  # pragma: no cover
+        # During interpreter teardown, half the globals (and C
+        # extension state) may already be gone — calling close() can
+        # raise from inside threading / torch and produce
+        # "FATAL: exception not rethrown" on the way out. Skip the
+        # cleanup entirely; the daemon worker will be killed when the
+        # process exits anyway.
+        if sys.is_finalizing():
+            return
         try:
             self.close()
         except Exception:
