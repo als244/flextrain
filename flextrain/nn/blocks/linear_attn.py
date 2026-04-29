@@ -799,8 +799,16 @@ class GatedDeltaNetBlock:
         else:
             g_w_out = grads.get("g_lin_out")
             if g_w_out is not None:
-                g_w_out.add_(
-                    (o_normed_2d.T.float() @ dy.float()).to(g_w_out.dtype)
+                # Fused bf16 @ bf16 -> fp32 accumulate via cuBLAS
+                # ``addmm`` (alpha*A@B + beta*C, fp32 internal accum
+                # for bf16 inputs). Avoids materializing fp32 copies of
+                # ``o_normed_2d`` (T*value_dim*4 bytes) and ``dy`` —
+                # these are large at hybrid linear+full backbones with
+                # big chunks (e.g. ~6 GiB transient at chunk=131072 on
+                # Qwen3.6-35B-A3B).
+                torch.addmm(
+                    g_w_out, o_normed_2d.T, dy,
+                    alpha=1.0, beta=1.0, out=g_w_out,
                 )
         # do_normed = dy @ W_out^T. Keep matmul in compute_dtype (bf16)
         # to avoid materializing a fp32 copy of the (potentially frozen)
@@ -999,24 +1007,26 @@ class GatedDeltaNetBlock:
             if capture_xy is not None:
                 capture_xy["g_lin_qkvz"] = (x_2d_dt, d_qkvz_2d)
         elif grads.get("g_lin_qkvz") is not None:
-            # Promote to fp32 only when we need to accumulate into a
-            # fp32 grad buffer (full-FT path with master_dtype=fp32).
-            x_2d_f = x_2d_dt.float()
-            grads["g_lin_qkvz"].add_(
-                (x_2d_f.T @ d_qkvz_2d.float())
-                .to(grads["g_lin_qkvz"].dtype)
+            # Fused bf16 @ bf16 -> fp32 accumulate. cuBLAS uses fp32
+            # internal accumulators for bf16 tensor-core matmuls, so
+            # the numeric result is identical to (x.float() @
+            # d_qkvz.float()) but avoids materializing fp32 copies of
+            # ``x_2d_dt`` (T*d_model*4) and ``d_qkvz_2d``
+            # (T*proj_qkvz_dim*4). For Qwen3.6-35B-A3B at chunk=131072
+            # that's ~7 GiB of transient fp32 per linear-attn layer
+            # per chunk, eliminated.
+            torch.addmm(
+                grads["g_lin_qkvz"], x_2d_dt.T, d_qkvz_2d.to(x_2d_dt.dtype),
+                alpha=1.0, beta=1.0, out=grads["g_lin_qkvz"],
             )
-            del x_2d_f
         if "g_lin_ba" in skip_grads:
             if capture_xy is not None:
                 capture_xy["g_lin_ba"] = (x_2d_dt, d_ba_2d)
         elif grads.get("g_lin_ba") is not None:
-            x_2d_f = x_2d_dt.float()
-            grads["g_lin_ba"].add_(
-                (x_2d_f.T @ d_ba_2d.float())
-                .to(grads["g_lin_ba"].dtype)
+            torch.addmm(
+                grads["g_lin_ba"], x_2d_dt.T, d_ba_2d.to(x_2d_dt.dtype),
+                alpha=1.0, beta=1.0, out=grads["g_lin_ba"],
             )
-            del x_2d_f
         # dx via base matmul. Keep in compute_dtype (typically bf16) to
         # avoid materializing a fp32 copy of the (frozen, big) weight
         # matrix on every backward pass — under LoRA that costs ~hidden
