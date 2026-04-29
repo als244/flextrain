@@ -345,6 +345,7 @@ class MoESwiGLUSharedExpertFFN:
         weights: Mapping[str, torch.Tensor],
         slot,
         chunk: ChunkMeta,
+        ctx: LayerContext,
         *,
         layer_id: int,
     ) -> None:
@@ -356,7 +357,7 @@ class MoESwiGLUSharedExpertFFN:
         to the inner routed FFN and also re-derives ``x_shared_pre``.
         """
         self._routed_ffn.fwd_recompute_x_up(
-            ffn_norm_output, weights, slot, chunk, layer_id=layer_id,
+            ffn_norm_output, weights, slot, chunk, ctx, layer_id=layer_id,
         )
         self.fwd_recompute_x_shared_pre(ffn_norm_output, weights, slot)
 

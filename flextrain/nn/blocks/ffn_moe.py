@@ -296,6 +296,7 @@ class MoESwiGLUFFN:
         weights: Mapping[str, torch.Tensor],
         slot,
         chunk: ChunkMeta,
+        ctx: LayerContext,
         *,
         layer_id: int,
     ) -> None:
@@ -309,6 +310,8 @@ class MoESwiGLUFFN:
         scattered_x = routed_swiglu_moe_recompute_x_up(
             ffn_norm_output, weights, slot, chunk.extra, layer_id,
             top_k=self.cfg.top_k,
+            primary_stream=ctx.stream,
+            secondary_stream=ctx.secondary_stream,
         )
         slot.aux["moe_scattered_x"] = scattered_x
 

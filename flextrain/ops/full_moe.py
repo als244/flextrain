@@ -408,14 +408,19 @@ def routed_swiglu_moe_recompute_x_up(
     layer_id: int,
     *,
     top_k: int,
+    primary_stream: torch.cuda.Stream,
+    secondary_stream: torch.cuda.Stream | None,
 ) -> torch.Tensor:
     """Tier-3 recompute. Refills ``slot.x_up`` (per-slot pre-SwiGLU)
     by re-scattering the input and running each expert's up-projection.
     Returns ``scattered_x`` so the caller can stash it for bwd to
     reuse instead of re-scattering.
 
-    Single-stream — one matmul per expert is too small to benefit
-    from secondary-stream overlap.
+    Uses the same primary/secondary stream alternation as
+    :func:`routed_swiglu_moe_fwd` — even-id experts on primary,
+    odd-id on secondary — so per-expert up-projections overlap on
+    workloads where they're large enough to benefit (typical at
+    chunk sizes ≥ a few thousand tokens).
     """
     num_tokens, d_model = ffn_norm_output.shape
     index_mapping = chunk_extra["moe_token_index_mapping"][layer_id]
@@ -431,7 +436,8 @@ def routed_swiglu_moe_recompute_x_up(
         x_preact_buf=slot.x_up,
         w_up=weights["w_up"],
         expert_counts_cpu=expert_counts_cpu,
-        stream_ptr=torch.cuda.current_stream().cuda_stream,
+        primary_stream=primary_stream,
+        secondary_stream=secondary_stream,
     )
     return scattered_x
 
@@ -661,14 +667,27 @@ def swiglu_expert_loop_recompute_x_up(
     w_up: torch.Tensor,                # (E, d_model, 2F)
     expert_counts_cpu: torch.Tensor,   # (E,) int host
     *,
-    stream_ptr: int,
+    primary_stream: torch.cuda.Stream,
+    secondary_stream: torch.cuda.Stream | None,
 ) -> None:
     """Tier-3 recompute: refill ``x_preact_buf`` from saved scattered
-    input by re-running each expert's up-projection. Single-stream;
-    one matmul per expert is too small to benefit from secondary-stream
-    overlap.
+    input by re-running each expert's up-projection.
+
+    Same primary/secondary alternation as :func:`swiglu_expert_loop_fwd`:
+    even-id experts on primary, odd-id on secondary, with
+    :meth:`wait_stream` book-ends so callers see strict
+    primary-stream ordering on entry/exit. The secondary stream is
+    optional — pass ``None`` for single-stream execution.
     """
     num_experts = w_up.shape[0]
+    primary_stream_ptr = primary_stream.cuda_stream
+    use_secondary = secondary_stream is not None
+    if use_secondary:
+        secondary_stream_ptr = secondary_stream.cuda_stream
+        secondary_stream.wait_stream(primary_stream)
+    else:
+        secondary_stream_ptr = primary_stream_ptr
+
     cur_offset = 0
     for eid in range(num_experts):
         n_exp_tokens = int(expert_counts_cpu[eid].item())
@@ -680,7 +699,18 @@ def swiglu_expert_loop_recompute_x_up(
         x_inp = scattered_x[start:end, :]
         w_up_e = w_up[eid, :, :]
         x_preact = x_preact_buf[start:end, :]
-        dispatcher.matmul(stream_ptr, A=x_inp, B=w_up_e, D=x_preact)
+        if use_secondary and (eid % 2 == 1):
+            cur_dispatcher = dispatcher_secondary
+            cur_stream_ptr = secondary_stream_ptr
+        else:
+            cur_dispatcher = dispatcher
+            cur_stream_ptr = primary_stream_ptr
+        cur_dispatcher.matmul(
+            cur_stream_ptr, A=x_inp, B=w_up_e, D=x_preact,
+        )
+
+    if use_secondary:
+        primary_stream.wait_stream(secondary_stream)
 
 
 __all__ = (

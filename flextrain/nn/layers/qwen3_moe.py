@@ -233,7 +233,7 @@ class Qwen3MoEBlock:
                 slot.xo.view(-1, cfg.d_model), weights, slot.ffn_norm_rstd,
             )
             self.ffn.fwd_recompute_x_up(
-                ffn_norm_output, weights, slot, chunk,
+                ffn_norm_output, weights, slot, chunk, ctx,
                 layer_id=self.layer_id,
             )
             slot.aux["recompute_ffn_norm_output"] = ffn_norm_output
