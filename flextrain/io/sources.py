@@ -59,11 +59,13 @@ error messages.
 
 from __future__ import annotations
 
+import atexit
 import json
 import glob
 import os
 import sys
 import threading
+import weakref
 from collections import deque
 from dataclasses import dataclass
 from typing import Any, Callable, Iterator, Protocol, runtime_checkable
@@ -197,6 +199,27 @@ class RawTokenSource:
 # ---------------------------------------------------------------------------
 
 
+# Live JsonSFTTokenSource instances. Used by the atexit handler below
+# to stop background producer threads BEFORE interpreter teardown
+# starts. Without this, a daemon worker mid-call into the HF tokenizer
+# (Rust extension with C++ destructors) gets killed at finalize time
+# and libstdc++ raises ``terminate called without an active exception``
+# from a destructor that runs on a thread the runtime no longer knows
+# about. Stopping the worker cleanly avoids the SIGABRT.
+_LIVE_JSON_SFT_SOURCES: weakref.WeakSet[Any] = weakref.WeakSet()
+
+
+def _shutdown_json_sft_sources() -> None:
+    for source in list(_LIVE_JSON_SFT_SOURCES):
+        try:
+            source.close()
+        except Exception:  # pragma: no cover
+            pass
+
+
+atexit.register(_shutdown_json_sft_sources)
+
+
 class JsonSFTTokenSource:
     """Local JSON / JSONL supervised fine-tuning data.
 
@@ -294,6 +317,8 @@ class JsonSFTTokenSource:
         self._stop = threading.Event()
         self._exhausted = False  # True once producer thread exits.
         self._worker: threading.Thread | None = None
+        # Register for the atexit shutdown sweep (see top of module).
+        _LIVE_JSON_SFT_SOURCES.add(self)
 
     @staticmethod
     def _load_records(path: str) -> list[dict[str, Any]]:
