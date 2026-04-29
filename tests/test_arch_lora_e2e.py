@@ -260,8 +260,8 @@ def _ft_worker_main():
     p.add_argument("--hf-path", required=True)
     p.add_argument("--dataset", required=True)
     p.add_argument("--mode", choices=("lora", "full"), required=True)
-    p.add_argument("--seq-len", type=int, required=True)
-    p.add_argument("--global-batch-tokens", type=int, required=True)
+    p.add_argument("--max-seq-len", type=int, required=True)
+    p.add_argument("--max-global-batch-tokens", type=int, required=True)
     p.add_argument("--steps", type=int, required=True)
     p.add_argument("--gpu-gib", type=float, required=True)
     p.add_argument("--host-gib", type=float, required=True)
@@ -284,8 +284,8 @@ def _ft_worker_main():
     am = from_pretrained(
         args.hf_path,
         optimizer=optimizer,
-        max_seq_len=args.seq_len,
-        max_global_batch_tokens=args.global_batch_tokens,
+        max_seq_len=args.max_seq_len,
+        max_global_batch_tokens=args.max_global_batch_tokens,
         max_gpu_mem_bytes=int(args.gpu_gib * (1 << 30)),
         max_host_mem_bytes=int(args.host_gib * (1 << 30)),
         device=args.device,
@@ -317,13 +317,13 @@ def _ft_worker_main():
 
     source = JsonSFTTokenSource(
         path=args.dataset, tokenizer=args.hf_path,
-        min_seq_len=32, max_seq_len=args.seq_len, loop=True,
+        min_seq_len=32, max_seq_len=args.max_seq_len, loop=True,
     )
 
     losses: list[float] = []
     t0 = time.time()
     for step in range(1, args.steps + 1):
-        seqs = source.get_sequences(max_token_count=args.global_batch_tokens)
+        seqs = source.get_sequences(max_token_count=args.max_global_batch_tokens)
         if not seqs:
             print(f"  [ft] dataset exhausted at step {step}", flush=True)
             break
@@ -375,8 +375,8 @@ def _hf_peft_worker_main():
     p.add_argument("--lora-rank", type=int, required=True)
     p.add_argument("--lora-alpha", type=float, required=True)
     p.add_argument("--lr", type=float, required=True)
-    p.add_argument("--seq-len", type=int, required=True)
-    p.add_argument("--global-batch-tokens", type=int, required=True)
+    p.add_argument("--max-seq-len", type=int, required=True)
+    p.add_argument("--max-global-batch-tokens", type=int, required=True)
     p.add_argument("--steps", type=int, required=True)
     p.add_argument("--device", default="cuda:0")
     args = p.parse_args(sys.argv[1:])
@@ -451,10 +451,10 @@ def _hf_peft_worker_main():
             total = prompt_ids + response_ids
             if len(total) < 32:
                 continue
-            if len(total) > args.seq_len:
-                if len(prompt_ids) >= args.seq_len:
+            if len(total) > args.max_seq_len:
+                if len(prompt_ids) >= args.max_seq_len:
                     continue
-                response_ids = response_ids[: args.seq_len - len(prompt_ids)]
+                response_ids = response_ids[: args.max_seq_len - len(prompt_ids)]
                 total = prompt_ids + response_ids
             yield total, len(prompt_ids)
 
@@ -469,7 +469,7 @@ def _hf_peft_worker_main():
     for step in range(1, args.steps + 1):
         batch: list[tuple[list[int], int]] = []
         total = 0
-        while total < args.global_batch_tokens:
+        while total < args.max_global_batch_tokens:
             try:
                 toks, plen = next(seq_iter)
             except StopIteration:
@@ -528,8 +528,8 @@ def _hf_full_worker_main():
     p.add_argument("--dataset", required=True)
     p.add_argument("--losses-out-pkl", required=True)
     p.add_argument("--lr", type=float, required=True)
-    p.add_argument("--seq-len", type=int, required=True)
-    p.add_argument("--global-batch-tokens", type=int, required=True)
+    p.add_argument("--max-seq-len", type=int, required=True)
+    p.add_argument("--max-global-batch-tokens", type=int, required=True)
     p.add_argument("--steps", type=int, required=True)
     p.add_argument("--device", default="cuda:0")
     args = p.parse_args(sys.argv[1:])
@@ -563,10 +563,10 @@ def _hf_full_worker_main():
             total = prompt_ids + response_ids
             if len(total) < 32:
                 continue
-            if len(total) > args.seq_len:
-                if len(prompt_ids) >= args.seq_len:
+            if len(total) > args.max_seq_len:
+                if len(prompt_ids) >= args.max_seq_len:
                     continue
-                response_ids = response_ids[: args.seq_len - len(prompt_ids)]
+                response_ids = response_ids[: args.max_seq_len - len(prompt_ids)]
                 total = prompt_ids + response_ids
             yield total, len(prompt_ids)
 
@@ -581,7 +581,7 @@ def _hf_full_worker_main():
     for step in range(1, args.steps + 1):
         batch: list[tuple[list[int], int]] = []
         total = 0
-        while total < args.global_batch_tokens:
+        while total < args.max_global_batch_tokens:
             try:
                 toks, plen = next(seq_iter)
             except StopIteration:
@@ -657,8 +657,8 @@ def _run_one_arch(
             "--hf-path", model_dir,
             "--dataset", dataset,
             "--mode", mode,
-            "--seq-len", str(spec.seq_len),
-            "--global-batch-tokens", str(spec.global_batch_tokens),
+            "--max-seq-len", str(spec.seq_len),
+            "--max-global-batch-tokens", str(spec.global_batch_tokens),
             "--steps", str(steps),
             "--gpu-gib", str(gpu_gib),
             "--host-gib", str(host_gib),
@@ -699,8 +699,8 @@ def _run_one_arch(
                 "--dataset", dataset,
                 "--losses-out-pkl", hf_losses_pkl,
                 "--lr", str(ft_lr),
-                "--seq-len", str(spec.seq_len),
-                "--global-batch-tokens", str(spec.global_batch_tokens),
+                "--max-seq-len", str(spec.seq_len),
+                "--max-global-batch-tokens", str(spec.global_batch_tokens),
                 "--steps", str(steps),
             ]
             rc, _ = _stream(hf_cmd, log_path=hf_log)
@@ -766,8 +766,8 @@ def _run_one_arch(
             "--lora-rank", str(spec.lora_rank),
             "--lora-alpha", str(spec.lora_alpha),
             "--lr", str(ft_lr),
-            "--seq-len", str(spec.seq_len),
-            "--global-batch-tokens", str(spec.global_batch_tokens),
+            "--max-seq-len", str(spec.seq_len),
+            "--max-global-batch-tokens", str(spec.global_batch_tokens),
             "--steps", str(steps),
         ]
         rc, _ = _stream(hf_cmd, log_path=hf_log)

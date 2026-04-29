@@ -72,7 +72,7 @@ def main() -> int:
                     help="LoRA alpha. Defaults to rank.")
     ap.add_argument("--max-gpu-gib", type=float, default=22.0)
     ap.add_argument("--max-host-gib", type=float, default=80.0)
-    ap.add_argument("--seq-len", type=int, default=512)
+    ap.add_argument("--max-seq-len", type=int, default=512)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--skip-lora-adapter", action="store_true",
                     help="Skip ``save_lora_adapter`` (use this for archs "
@@ -93,8 +93,8 @@ def main() -> int:
     am = from_pretrained(
         args.model,
         optimizer=AdamW(AdamWHyperparams(lr=args.lr)),
-        max_seq_len=args.seq_len,
-        max_global_batch_tokens=args.seq_len,
+        max_seq_len=args.max_seq_len,
+        max_global_batch_tokens=args.max_seq_len,
         max_gpu_mem_bytes=int(args.max_gpu_gib * (1 << 30)),
         max_host_mem_bytes=int(args.max_host_gib * (1 << 30)),
         device="cuda:0",
@@ -141,7 +141,7 @@ def main() -> int:
     print("\n[4/4] Done.")
     print("Next steps:")
     print(f"  vLLM:   vllm serve {os.path.join(args.out_dir, 'merged')} "
-          f"--max-model-len {args.seq_len}")
+          f"--max-model-len {args.max_seq_len}")
     if not args.skip_lora_adapter:
         print(f"  vLLM+LoRA:  vllm serve {args.model} --enable-lora "
               f"--lora-modules my={os.path.join(args.out_dir, 'adapter')}")

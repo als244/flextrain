@@ -110,8 +110,8 @@ local JSONL file and then trains from that file:
 python train.py \
   --model models/Llama-3.1-8B \
   --mode lora \
-  --seq-len 1024 \
-  --global-batch-tokens 1024 \
+  --max-seq-len 1024 \
+  --max-global-batch-tokens 1024 \
   --dataset open-r1/OpenR1-Math-220k
 ```
 

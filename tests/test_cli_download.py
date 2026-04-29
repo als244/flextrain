@@ -121,8 +121,8 @@ def test_parse_args_dataset_flag_kept_simple() -> None:
         [
             "--model", "models/Llama-3.1-8B",
             "--mode", "lora",
-            "--seq-len", "1024",
-            "--global-batch-tokens", "2048",
+            "--max-seq-len", "1024",
+            "--max-global-batch-tokens", "2048",
             "--dataset", "my-org/my-sft-dataset",
         ]
     )
@@ -254,8 +254,8 @@ def test_main_uses_materialized_json_dataset() -> None:
                 [
                     "--model", model_dir,
                     "--mode", "lora",
-                    "--seq-len", "512",
-                    "--global-batch-tokens", "1024",
+                    "--max-seq-len", "512",
+                    "--max-global-batch-tokens", "1024",
                     "--dataset", "my-org/my-sft-dataset",
                 ]
             )

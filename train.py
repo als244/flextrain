@@ -355,7 +355,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--synthetic-seq-len",
         type=int,
         default=None,
-        help="Sequence length for synthetic-token training. Defaults to --seq-len.",
+        help="Sequence length for synthetic-token training. Defaults to --max-seq-len.",
     )
     p.add_argument(
         "--output-dir",
