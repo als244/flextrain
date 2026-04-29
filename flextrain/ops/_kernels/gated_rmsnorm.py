@@ -58,6 +58,165 @@ import triton.language as tl
 
 
 # ===================================================================
+# Forward kernel: BLOCK_M (t, h) rows per program.
+# ===================================================================
+
+
+@triton.jit
+def gated_rmsnorm_fwd_kernel(
+    O_ptr,           # (T, H, D) bf16  -- core_out
+    Z_ptr,           # (T, H, D) bf16  -- gate
+    W_ptr,           # (D,)      bf16  -- weight, broadcast over (T, H)
+    Y_ptr,           # (T, H, D) bf16  -- output: o_normed
+    Rstd_ptr,        # (T, H)    fp32  -- output: per-row 1/sqrt(var+eps)
+    stride_o_t, stride_o_h,
+    stride_z_t, stride_z_h,
+    stride_y_t, stride_y_h,
+    stride_rstd_t,
+    H,                            # num heads (n_v_heads)
+    TOTAL_ROWS,                   # T * H
+    D,                            # head_v_dim
+    EPSILON: tl.float32,
+    BLOCK_SIZE_D: tl.constexpr,   # next-pow2(D)
+    BLOCK_M: tl.constexpr,        # rows per program
+):
+    """Fused gated-RMSNorm forward: ``y = silu(z) * (o * rstd) * w``.
+
+    Per row (= one (t, h) position):
+        var      = mean(o^2, dim=-1)
+        rstd     = 1 / sqrt(var + eps)
+        normed   = o * rstd
+        y        = silu(z) * normed * w     # silu(z) = z * sigmoid(z)
+
+    Stored: ``y`` and ``rstd``. Saving ``rstd`` (small, fp32) lets the
+    bwd skip the per-row variance recompute.
+
+    Layout: row r corresponds to (t=r//H, h=r%H). For BLOCK_M rows per
+    program, the inner reductions are per-row (axis=1).
+    """
+    pid = tl.program_id(axis=0)
+    row_start = pid * BLOCK_M
+    rows = row_start + tl.arange(0, BLOCK_M)
+    row_mask = rows < TOTAL_ROWS
+
+    # Decompose flat row -> (t, h).
+    t = rows // H
+    h = rows % H
+
+    offs = tl.arange(0, BLOCK_SIZE_D)
+    mask_d = offs < D
+    full_mask = row_mask[:, None] & mask_d[None, :]
+
+    # Per-row pointers. O / Z / Y are (T, H, D) contiguous in (T, H, D)
+    # order, so the flat row stride to advance one (t, h) row by 1 is
+    # the H stride; t-stride moves H rows.
+    o_ptrs = (
+        O_ptr + t[:, None] * stride_o_t + h[:, None] * stride_o_h + offs[None, :]
+    )
+    z_ptrs = (
+        Z_ptr + t[:, None] * stride_z_t + h[:, None] * stride_z_h + offs[None, :]
+    )
+
+    o = tl.load(o_ptrs, mask=full_mask, other=0.0).to(tl.float32)
+    z = tl.load(z_ptrs, mask=full_mask, other=0.0).to(tl.float32)
+    w = tl.load(W_ptr + offs, mask=mask_d, other=0.0).to(tl.float32)
+
+    # Per-row variance + rstd.
+    var = tl.sum(o * o, axis=1) / D
+    rstd = tl.rsqrt(var + EPSILON)
+
+    # silu(z) * (o * rstd) * w
+    normed = o * rstd[:, None]
+    sig_z = tl.sigmoid(z)
+    silu_z = z * sig_z
+    y = silu_z * normed * w[None, :]
+
+    # Stores.
+    y_ptrs = (
+        Y_ptr + t[:, None] * stride_y_t + h[:, None] * stride_y_h + offs[None, :]
+    )
+    tl.store(y_ptrs, y.to(Y_ptr.dtype.element_ty), mask=full_mask)
+    rstd_ptrs = Rstd_ptr + rows * stride_rstd_t
+    tl.store(rstd_ptrs, rstd, mask=row_mask)
+
+
+def flextrain_gated_rmsnorm_fwd(
+    o: torch.Tensor,            # (T, H, D)
+    z: torch.Tensor,            # (T, H, D)
+    weight: torch.Tensor,       # (D,)
+    eps: float,
+    *,
+    y_out: torch.Tensor | None = None,
+    rstd_out: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused forward of ``y = silu(z) * rmsnorm(o, weight)``.
+
+    Single-kernel replacement for ~12 unfused python ops in
+    ``GatedDeltaNetBlock._gated_rmsnorm_fwd``. Both inputs and output
+    stay in ``o``'s dtype (typically bf16); intermediates run in fp32
+    inside SRAM.
+
+    Returns ``(y, rstd)`` where ``rstd`` is shape ``(T, H)`` fp32 —
+    callers can hand it to ``flextrain_gated_rmsnorm_bwd`` to skip
+    the per-row variance recompute (currently the bwd recomputes
+    rstd; passing the saved one is a future optimization).
+    """
+    assert o.shape == z.shape, f"o={o.shape}, z={z.shape}"
+    assert o.is_cuda and z.is_cuda and weight.is_cuda
+    assert weight.shape == (o.shape[-1],), (
+        f"weight must be ({o.shape[-1]},); got {tuple(weight.shape)}"
+    )
+    if not o.is_contiguous():
+        o = o.contiguous()
+    if not z.is_contiguous():
+        z = z.contiguous()
+    if not weight.is_contiguous():
+        weight = weight.contiguous()
+
+    T, H, D = o.shape
+
+    if y_out is None:
+        y_out = torch.empty_like(o)
+    if rstd_out is None:
+        rstd_out = torch.empty(T * H, dtype=torch.float32, device=o.device)
+    else:
+        # Accept (T, H) shape too.
+        rstd_out = rstd_out.reshape(T * H)
+
+    BLOCK_SIZE_D = triton.next_power_of_2(D)
+    total_rows = T * H
+
+    n_sms = torch.cuda.get_device_properties(o.device).multi_processor_count
+    if D >= 256:
+        BLOCK_M = 4
+    else:
+        BLOCK_M = 8
+    while BLOCK_M > 1 and total_rows // BLOCK_M < 4 * n_sms:
+        BLOCK_M //= 2
+
+    payload = BLOCK_M * BLOCK_SIZE_D
+    if payload >= 4096:
+        num_warps = 4
+    else:
+        num_warps = 2
+
+    grid = (triton.cdiv(total_rows, BLOCK_M),)
+    gated_rmsnorm_fwd_kernel[grid](
+        o, z, weight, y_out, rstd_out,
+        o.stride(0), o.stride(1),
+        z.stride(0), z.stride(1),
+        y_out.stride(0), y_out.stride(1),
+        1,  # rstd_out stride along its single (T*H) dim
+        H, total_rows, D, eps,
+        BLOCK_SIZE_D=BLOCK_SIZE_D,
+        BLOCK_M=BLOCK_M,
+        num_warps=num_warps,
+    )
+
+    return y_out, rstd_out.view(T, H)
+
+
+# ===================================================================
 # Backward dX/dZ kernel: one program per (t, h) row.
 # ===================================================================
 
