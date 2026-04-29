@@ -158,8 +158,8 @@ def _run_training_loop(am, source, *, model_cfg, args, output_dir: str, save_arc
     os.makedirs(output_dir, exist_ok=True)
     print(
         f"Starting training loop: steps={args.steps} "
-        f"max_seq_len={args.seq_len} "
-        f"global_batch_tokens={args.global_batch_tokens}",
+        f"max_seq_len={args.max_seq_len} "
+        f"global_batch_tokens={args.max_global_batch_tokens}",
         flush=True,
     )
     print(
@@ -200,7 +200,7 @@ def _run_training_loop(am, source, *, model_cfg, args, output_dir: str, save_arc
             **{**am.optimizer.hp.__dict__, "lr": lr}
         )
 
-        seqs = source.get_sequences(max_token_count=args.global_batch_tokens)
+        seqs = source.get_sequences(max_token_count=args.max_global_batch_tokens)
         if not seqs:
             print(f"[step {step}] data source exhausted")
             break
@@ -315,8 +315,27 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         required=True,
         help="Full fine-tuning or LoRA fine-tuning.",
     )
-    p.add_argument("--seq-len", type=int, required=True, help="Maximum training sequence length.")
-    p.add_argument("--global-batch-tokens", type=int, required=True, help="Tokens per optimizer step.")
+    p.add_argument(
+        "--max-seq-len",
+        type=int,
+        required=True,
+        help="Maximum training sequence length. Records exceeding this "
+             "are dropped by the data source (or truncated, with "
+             "--truncate-long).",
+    )
+    p.add_argument(
+        "--max-global-batch-tokens",
+        type=int,
+        required=True,
+        help="Maximum tokens per optimizer step.",
+    )
+    p.add_argument(
+        "--truncate-long",
+        action="store_true",
+        help="Truncate the response of records that exceed --max-seq-len "
+             "instead of dropping them. Default: drop. (Truncation can "
+             "silently corrupt the loss target at the boundary.)",
+    )
     p.add_argument("--steps", type=int, default=20, help="Number of training steps to run. Default: 20.")
     p.add_argument(
         "--data-source",
@@ -530,7 +549,7 @@ def main(argv: list[str] | None = None) -> int:
 
     local_model_dir, hf_repo_id = _resolve_model(args.model)
     output_dir = args.output_dir or (
-        f"runs/{Path(local_model_dir).name}_{args.mode}_sl{args.seq_len}"
+        f"runs/{Path(local_model_dir).name}_{args.mode}_sl{args.max_seq_len}"
     )
     io_cfg = IOConfig(
         hf_checkpoint=local_model_dir,
@@ -620,8 +639,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     print(
         f"Train config: model={local_model_dir} mode={args.mode} "
-        f"seq_len={args.seq_len} steps={args.steps} "
-        f"batch_tokens={args.global_batch_tokens}",
+        f"seq_len={args.max_seq_len} steps={args.steps} "
+        f"batch_tokens={args.max_global_batch_tokens}",
         flush=True,
     )
     device_str = f"cuda:{args.device_id}"
@@ -659,8 +678,8 @@ def main(argv: list[str] | None = None) -> int:
     am = from_pretrained(
         local_model_dir,
         optimizer=optimizer,
-        max_seq_len=args.seq_len,
-        max_global_batch_tokens=args.global_batch_tokens,
+        max_seq_len=args.max_seq_len,
+        max_global_batch_tokens=args.max_global_batch_tokens,
         max_gpu_mem_bytes=max_gpu_mem_bytes,
         max_host_mem_bytes=max_host_mem_bytes,
         device=device_str,
@@ -680,7 +699,7 @@ def main(argv: list[str] | None = None) -> int:
         verbose=True,
     )
     if args.data_source == "synthetic":
-        synthetic_seq_len = args.synthetic_seq_len or args.seq_len
+        synthetic_seq_len = args.synthetic_seq_len or args.max_seq_len
         print(
             f"Model is ready. Building synthetic token source "
             f"(seq_len={synthetic_seq_len})...",
@@ -701,8 +720,9 @@ def main(argv: list[str] | None = None) -> int:
             path=dataset_path,
             tokenizer=local_model_dir,
             min_seq_len=32,
-            max_seq_len=args.seq_len,
+            max_seq_len=args.max_seq_len,
             loop=True,
+            truncate_long=args.truncate_long,
         )
         print(
             f"Dataset ready from {dataset_path}. Output dir: {output_dir}",

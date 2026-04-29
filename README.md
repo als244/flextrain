@@ -52,8 +52,8 @@ when iterating on Python-only code. Optional extras:
 python train.py \
   --model meta-llama/Llama-3.1-8B \
   --mode lora \
-  --seq-len 1024 \
-  --global-batch-tokens 1024
+  --max-seq-len 1024 \
+  --max-global-batch-tokens 1024
 ```
 
 Auto-discovers your GPU + host memory budgets, probes hardware
@@ -69,6 +69,7 @@ Common flags:
 | `--use-muon` | use HybridMuonAdamW for `--mode full` (Muon on dense projections, AdamW elsewhere) |
 | `--data-source {synthetic,json_sft}` | synthetic tokens or SFT JSONL |
 | `--dataset path/or/repo` | local JSONL, HF repo, or http(s) URL |
+| `--truncate-long` | truncate response of records longer than `--max-seq-len` instead of dropping them (default: drop) |
 | `--max-gpu-mem-gib N` / `--max-host-mem-gib N` | override auto-discovered budgets |
 | `--force-save-level {0,1,2,3}` | force activation save-tier (debug) |
 | `--save` | export `final.safetensors` after training |
@@ -90,7 +91,7 @@ Example with a tighter warmup and a deeper cooldown:
 
 ```bash
 python train.py --model models/Llama-3.1-8B --mode full \
-  --seq-len 1024 --global-batch-tokens 524288 \
+  --max-seq-len 1024 --max-global-batch-tokens 524288 \
   --lr 5e-5 --lr-warmup-pct 0.03 --lr-final-pct 0.01
 ```
 
@@ -101,7 +102,7 @@ Wrap a window of steady-state steps for `nsys profile`:
 ```bash
 nsys profile --capture-range=cudaProfilerApi --capture-range-end=stop \
   python train.py --model models/Llama-3.1-8B --mode full \
-                  --seq-len 1024 --global-batch-tokens 524288 \
+                  --max-seq-len 1024 --max-global-batch-tokens 524288 \
                   --steps 10 --profile-start-step 5 --profile-stop-step 7
 ```
 
@@ -127,7 +128,7 @@ python download.py dataset HuggingFaceH4/no_robots --target datasets/no_robots.j
 python train.py --model models/Llama-3.1-8B \
                 --data-source json_sft \
                 --dataset datasets/no_robots.jsonl \
-                --seq-len 1024 --global-batch-tokens 1024
+                --max-seq-len 1024 --max-global-batch-tokens 1024
 ```
 
 The dataset path normalizes common SFT schemas (`instruction/output`,

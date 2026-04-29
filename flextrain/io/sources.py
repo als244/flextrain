@@ -203,9 +203,17 @@ class JsonSFTTokenSource:
     bounded FIFO queue of ready :class:`Sequence` objects. The
     consumer's :meth:`get_sequences` only pops from the queue — it
     never blocks on tokenizer work as long as the producer can keep
-    up. Records that fail filtering (missing prompt/response, prompt
-    longer than ``max_seq_len``, all-prompt loss mask, ...) are
+    up. Records that fail filtering (missing prompt/response, total
+    tokens > ``max_seq_len`` (in default ``truncate_long=False``
+    mode), total tokens < ``min_seq_len``, all-prompt loss mask) are
     dropped at the producer; the consumer never sees them.
+
+    Default for over-long records is **drop**, not truncate, because
+    silent truncation can corrupt the loss target (the kept prefix
+    has the wrong target at the boundary). Pass ``truncate_long=True``
+    to opt into truncating the response down to fit ``max_seq_len``
+    instead — useful for datasets where most records are within
+    range but a long tail would otherwise be wasted.
 
     Loading window
     --------------
@@ -247,6 +255,7 @@ class JsonSFTTokenSource:
         loop: bool = False,
         trust_remote_code: bool = False,
         prefetch_max_tokens: int = 1_000_000_000,
+        truncate_long: bool = False,
     ) -> None:
         self.path = path
         self.prompt_field = prompt_field
@@ -256,6 +265,7 @@ class JsonSFTTokenSource:
         self.max_seq_len = max_seq_len
         self.loop = loop
         self.prefetch_max_tokens = int(prefetch_max_tokens)
+        self.truncate_long = bool(truncate_long)
 
         if isinstance(tokenizer, str):
             try:
@@ -347,6 +357,18 @@ class JsonSFTTokenSource:
         """Run all the per-record filtering + tokenization. Returns
         the resulting :class:`Sequence` or ``None`` if the record is
         rejected by any filter.
+
+        Filters (any one of these drops the record):
+
+        * Missing/empty prompt or response field.
+        * Tokenizer returns no response tokens.
+        * ``len(prompt) + len(response) + EOS > max_seq_len`` —
+          dropped, not truncated. Truncation would silently corrupt
+          long-context training data; the consumer wants visibility
+          into how many records are unusable at a given seq_len.
+        * Total tokens < ``min_seq_len``.
+        * Loss mask is all-False (entire sequence is prompt with no
+          training signal).
         """
         prompt_and_response = self._build_prompt(rec)
         if prompt_and_response is None:
@@ -359,13 +381,26 @@ class JsonSFTTokenSource:
             response_ids = response_ids + [int(eos_id)]
         if not response_ids:
             return None
-        if len(prompt_ids) >= self.max_seq_len:
-            return None
-        room = self.max_seq_len - len(prompt_ids)
-        if room <= 1:
-            return None
-        response_ids = response_ids[:room]
         token_ids = prompt_ids + response_ids
+        if len(token_ids) > self.max_seq_len:
+            if not self.truncate_long:
+                # Default: drop. Truncation would silently corrupt the
+                # response (the kept prefix has the wrong loss target
+                # at the boundary, and the rest is gone). Set
+                # ``truncate_long=True`` if you'd rather keep the
+                # prefix.
+                return None
+            # Truncate: keep prompt_ids verbatim, fit response into the
+            # remaining room. If the prompt alone is too long, drop
+            # (we won't truncate the prompt — that would change
+            # the meaning of what the model is conditioning on).
+            if len(prompt_ids) >= self.max_seq_len:
+                return None
+            room = self.max_seq_len - len(prompt_ids)
+            response_ids = response_ids[:room]
+            if not response_ids:
+                return None
+            token_ids = prompt_ids + response_ids
         if len(token_ids) < self.min_seq_len:
             return None
         tokens = torch.tensor(token_ids, dtype=torch.int64)
