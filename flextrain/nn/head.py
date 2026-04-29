@@ -282,19 +282,23 @@ class LMHead:
                 aux_chunks.append(aux)
 
             # ---- bwd: accumulate w_head_proj grad ----
-            #   g_head_proj += head_proj_in.T @ dZ   (loss_scale already
-            #   folded into dZ by the loss fn, so alpha=1.0 here)
+            #   g_head_proj += loss_scale · head_proj_in.T @ dZ
+            # loss_scale folds into the cuBLAS alpha (free) instead of
+            # a separate dZ.mul_(loss_scale) before the addmm — that
+            # elementwise pass over (T', V) is the
+            # "vectorized_elementwise_kernel" tail visible after softmax
+            # in nsys traces. dZ comes back from LossFn unscaled.
             if g_head_proj is not None:
                 torch.addmm(
                     g_head_proj,
                     head_proj_in.T,
                     dZ,
-                    alpha=1.0,
+                    alpha=loss_scale,
                     beta=1.0,
                     out=g_head_proj,
                 )
 
-            # ---- bwd: dX_head_in = dZ @ w_head_proj.T ----
+            # ---- bwd: dX_head_in = loss_scale · dZ @ w_head_proj.T ----
             dX_head_in = torch.empty(
                 head_proj_in.shape, dtype=dtype, device=device
             )
@@ -303,7 +307,7 @@ class LMHead:
                 dX_head_in,
                 dZ,
                 w_head_proj.T,
-                alpha=1.0,
+                alpha=loss_scale,
                 beta=0.0,
                 out=dX_head_in,
             )

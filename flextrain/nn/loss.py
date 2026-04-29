@@ -26,14 +26,16 @@ receives:
                       the training chunk we're on and what per-token
                       context to apply (labels, advantages, ref
                       log-probs, ...).
-* ``loss_scale``    : scalar to fold into the returned ``dZ`` (so the
-                      head's weight-grad accumulator doesn't have to
-                      know about sample counts).
+* ``loss_scale``    : scalar the head applies to ``dZ`` via the
+                      cuBLAS addmm ``alpha`` (free); loss fns MUST
+                      NOT pre-multiply ``dZ`` themselves. Passed in
+                      so loss fns that report scaled per-token loss
+                      values for logging can apply it where needed.
 
 It returns:
 
 * ``dZ``            : ``(T', V)`` grad in the same dtype as ``logits``,
-                      already multiplied by ``loss_scale``.
+                      UNSCALED (the head folds ``loss_scale`` in).
 * ``per_token_loss``: ``(T',)`` fp32 per-token scalar (for logging).
 * ``aux``           : optional dict of extra diagnostics (KL value,
                       entropy, etc.) -- concatenated across
@@ -171,10 +173,16 @@ class LossFn(Protocol):
       expects. If your loss can't reuse the logits buffer in place,
       return a fresh tensor of the same shape/dtype; the caller will
       use whichever buffer is returned.
-    * Multiply ``dZ`` by ``loss_scale`` so the head's grad
-      accumulator can use it directly.
     * Write per-token loss scalars into ``per_token_loss_out`` (a
       pre-allocated fp32 tensor the head owns).
+
+    Implementations MUST NOT pre-multiply ``dZ`` by ``loss_scale``.
+    The head folds ``loss_scale`` into the cuBLAS ``alpha`` of the
+    backward addmm (free); a separate ``dZ.mul_(loss_scale)`` would be
+    a redundant full-size pointwise pass over ``(T', V)``, visible as
+    a ``vectorized_elementwise_kernel`` after softmax in nsys traces.
+    ``loss_scale`` is still passed in so loss fns that report scaled
+    per-token loss values for logging can apply it where appropriate.
     """
 
     def compute(
@@ -186,8 +194,8 @@ class LossFn(Protocol):
         per_token_loss_out: torch.Tensor,  # (T',) fp32, pre-allocated
     ) -> tuple[torch.Tensor, dict]:
         """Return ``(dZ, aux)`` where ``dZ`` is the grad w.r.t. ``logits``
-        (with ``loss_scale`` already folded in) and ``aux`` is an
-        optional per-chunk diagnostics dict.
+        (UNSCALED — the head folds ``loss_scale`` into its bwd addmm)
+        and ``aux`` is an optional per-chunk diagnostics dict.
         """
         ...
 
@@ -209,11 +217,12 @@ class CrossEntropyLoss:
     * ``flextrain_cross_entropy_loss`` overwrites ``probs`` in place with
       ``probs - one_hot(label)`` (i.e. dZ), writes per-token loss into
       ``L``, and returns ``(dZ, loss_unused)``.
-    * Multiply by ``loss_scale`` in-place before returning so the head
-      grad matmul can use alpha=loss_scale directly with no double
-      scaling.
+    * ``loss_scale`` is NOT applied to ``dZ`` here — the head folds it
+      into the cuBLAS ``alpha`` of the bwd addmm, avoiding a redundant
+      full-size pointwise pass over ``(T', V)``.
 
-    Matches the math at ``orig/awsm_transformer/head.py:208-227``.
+    Matches the math at ``orig/awsm_transformer/head.py:208-227``,
+    where loss_scale was likewise folded into the bwd matmul alpha.
 
     Masking
     -------
@@ -296,8 +305,9 @@ class CrossEntropyLoss:
             dZ.mul_(keep)
             per_token_loss_out.masked_fill_(~mask_include, 0.0)
 
-        if loss_scale != 1.0:
-            dZ.mul_(loss_scale)
+        # No dZ.mul_(loss_scale) here — the head folds loss_scale into
+        # the alpha of its bwd addmms, eliminating a full-size pointwise
+        # pass over (T', V). See LossFn docstring.
 
         aux = {
             "next_prediction": aux_next_pred,
@@ -313,8 +323,9 @@ class MSELoss:
     (or whatever vector space -- this is a distillation-style use
     case). Per-token loss is ``0.5 * ||logits - labels||^2 / V``.
 
-    ``dZ = (logits - labels) * loss_scale / V``, in-place in a fresh
-    buffer.
+    ``dZ = (logits - labels) / V``, in-place in a fresh buffer.
+    ``loss_scale`` is folded into the head's bwd addmm alpha — see
+    LossFn docstring.
 
     Not optimized; straightforward reference for when someone needs
     MSE distillation without pulling in CE.
@@ -343,7 +354,9 @@ class MSELoss:
         per_token_loss_out.copy_(
             (diff.float().pow(2).sum(dim=-1) * 0.5 / V)
         )
-        dZ = diff * (loss_scale / V)
+        # loss_scale is applied by the head's bwd addmm alpha.
+        del loss_scale
+        dZ = diff * (1.0 / V)
         return dZ, {}
 
 
@@ -423,5 +436,7 @@ class GRPOLoss:
             # approximation: skip here -- callers who need that should
             # assemble it in `extra["ref_probs"]` or subclass this loss.
 
-        dZ = dZ.mul_(loss_scale).to(logits.dtype)
+        # loss_scale is folded into the head's bwd addmm alpha.
+        del loss_scale
+        dZ = dZ.to(logits.dtype)
         return dZ, {}
