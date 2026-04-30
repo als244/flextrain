@@ -161,6 +161,11 @@ def _ft_only(args, prompt_ids, eos_id, out_path):
     from flextrain import from_pretrained
     from flextrain.optim.adamw import AdamW, AdamWHyperparams
     import json
+    extra_kwargs = {}
+    if getattr(args, "lora", False):
+        extra_kwargs.update(dict(
+            lora_targets="all", lora_rank=8, lora_alpha=8.0,
+        ))
     am = from_pretrained(
         args.model,
         optimizer=AdamW(
@@ -177,6 +182,7 @@ def _ft_only(args, prompt_ids, eos_id, out_path):
         strict=False, verbose=False,
         # Allow small chunk sizes (greedy inference uses tiny prompts).
         min_chunk_size=1,
+        **extra_kwargs,
     )
     ft_ids = _ft_greedy_generate(
         am, prompt_ids,
@@ -194,6 +200,10 @@ def main() -> int:
     ap.add_argument("--model", default="models/Qwen3.5-2B")
     ap.add_argument("--prompt", default="Four score and")
     ap.add_argument("--max-new-tokens", type=int, default=64)
+    ap.add_argument("--lora", action="store_true",
+                    help="Build engine in LoRA mode (frozen base + zero "
+                         "adapters = same fwd as base; reduces baseline "
+                         "GPU footprint so big models fit).")
     ap.add_argument("--gpu-gib", type=float, default=20.0)
     ap.add_argument("--host-gib", type=float, default=80.0)
     ap.add_argument("--max-seq-len", type=int, default=512)

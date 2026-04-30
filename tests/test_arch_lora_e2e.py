@@ -327,15 +327,28 @@ def _ft_worker_main():
         if not seqs:
             print(f"  [ft] dataset exhausted at step {step}", flush=True)
             break
+        # ``loss_scale_factor`` denominator = active-token count
+        # across the whole step (mean-over-active-tokens convention).
+        # Cached on each Sequence as ``active_token_count`` (computed
+        # once at construction in ``flextrain.io.sequence.Sequence``),
+        # so this is a free int sum.
         step_tokens = sum(len(s) for s in seqs)
+        active_total = max(1, sum(
+            getattr(s, "active_token_count", len(s)) for s in seqs
+        ))
         stats = am.fwd_bwd(
             seqs,
-            loss_scale_factor=1.0 / step_tokens,
+            loss_scale_factor=1.0 / active_total,
             total_tokens_per_step=step_tokens,
         )
         am.step()
         _t.cuda.synchronize()
-        avg = stats.total_loss / stats.total_tokens
+        # Mean over active (loss-bearing) tokens — matches HF / PyTorch
+        # CrossEntropyLoss(ignore_index=-100) convention.
+        # ``stats.total_tokens`` is raw tokens-processed (engine
+        # convention; includes prompt positions whose per-token-loss
+        # is 0 by the ``targets == -100`` mask).
+        avg = stats.total_loss / active_total
         losses.append(float(avg))
         if step <= 3 or step % 5 == 0 or step == args.steps:
             print(
@@ -439,23 +452,41 @@ def _hf_peft_worker_main():
             records.append(json.loads(line))
     print(f"  [hf-peft] loaded {len(records)} SFT records", flush=True)
 
+    # Match FT's JsonSFTTokenSource prompt template exactly so the
+    # prompt-vs-response boundary lands on the same tokens on both
+    # sides. (FT uses the "Instruction:\n.../Response:\n" template;
+    # any divergence here moves where loss starts and offsets the
+    # whole loss curve.)
+    eos_id = getattr(tok, "eos_token_id", None)
+
     def _make_seqs():
         for rec in records:
-            q = rec.get("instruction", "") or ""
-            a = rec.get("output", "") or ""
+            q = (rec.get("instruction", "") or "").strip()
+            a = (rec.get("output", "") or "").strip()
+            extra = (rec.get("input", "") or "").strip()
             if not q or not a:
                 continue
-            prompt_ids = tok.encode(f"Problem: {q}\nSolution: ",
-                                     add_special_tokens=False)
+            if extra:
+                prompt_text = (
+                    f"Instruction:\n{q}\n\n"
+                    f"Input:\n{extra}\n\n"
+                    f"Response:\n"
+                )
+            else:
+                prompt_text = f"Instruction:\n{q}\n\nResponse:\n"
+            prompt_ids = tok.encode(prompt_text, add_special_tokens=False)
             response_ids = tok.encode(a, add_special_tokens=False)
+            # Match FT: append EOS to response so the model is also
+            # trained to predict end-of-sequence.
+            if eos_id is not None:
+                response_ids = response_ids + [int(eos_id)]
             total = prompt_ids + response_ids
             if len(total) < 32:
                 continue
             if len(total) > args.max_seq_len:
-                if len(prompt_ids) >= args.max_seq_len:
-                    continue
-                response_ids = response_ids[: args.max_seq_len - len(prompt_ids)]
-                total = prompt_ids + response_ids
+                # Match FT default: drop, don't truncate (truncation
+                # silently corrupts the response boundary).
+                continue
             yield total, len(prompt_ids)
 
     seq_iter = _make_seqs()
@@ -466,27 +497,56 @@ def _hf_peft_worker_main():
 
     losses: list[float] = []
     t0 = time.time()
+    # Strict-fits-under-cap FIFO pack — matches FT's
+    # ``JsonSFTTokenSource.get_sequences(max_token_count=...)``. The
+    # previous "overshoot then break" loop appended one seq past the
+    # cap and produced different per-step batches than FT; over many
+    # steps the random walks diverged and per-step losses varied
+    # wildly even when the model was correct.
+    pending: tuple[list[int], int] | None = None
+    def _next_seq():
+        nonlocal seq_iter
+        try:
+            return next(seq_iter)
+        except StopIteration:
+            seq_iter = _make_seqs()
+            return next(seq_iter)
     for step in range(1, args.steps + 1):
         batch: list[tuple[list[int], int]] = []
         total = 0
-        while total < args.max_global_batch_tokens:
-            try:
-                toks, plen = next(seq_iter)
-            except StopIteration:
-                seq_iter = _make_seqs()
-                continue
-            batch.append((toks, plen))
-            total += len(toks)
+        if pending is not None:
+            batch.append(pending)
+            total += len(pending[0])
+            pending = None
+        while True:
+            cand = _next_seq()
+            if total + len(cand[0]) > args.max_global_batch_tokens:
+                pending = cand
+                break
+            batch.append(cand)
+            total += len(cand[0])
         opt.zero_grad(set_to_none=False)
         batch_loss = 0.0
         active_total = 0
         for toks, plen in batch:
             ids = _t.tensor(toks, dtype=_t.int64, device=args.device).unsqueeze(0)
             T = ids.shape[1]
-            labels = _t.full((T,), -100, dtype=_t.int64, device=args.device)
-            labels[: T - 1] = ids[0, 1:]
-            labels[: plen] = -100
-            active = int((labels != -100).sum().item())
+            # HF's ``ForCausalLMLoss`` shifts labels internally: it
+            # pads + slices so ``logits[i]`` is targeted against
+            # ``labels[i+1]``. Pass UN-shifted labels (= input_ids
+            # with prompt masked) and let HF do the shift. Pre-
+            # shifting here would double-shift, training the model
+            # to predict 2 tokens ahead — produced ~7-9 losses on
+            # pretrained Qwen3.5-27B instead of ~2.
+            labels = ids[0].clone()
+            labels[:plen] = -100
+            # ``labels[T-1]`` would predict position T (doesn't
+            # exist); HF's pad-then-shift puts -100 there
+            # automatically. # active loss tokens = response tokens
+            # that contribute = # indices in ``[plen, T-1)``.
+            active = max(0, T - 1 - plen)
+            if active == 0:
+                continue
             out = model(input_ids=ids, labels=labels.unsqueeze(0))
             (out.loss * active).backward()
             batch_loss += float(out.loss.item()) * active
@@ -578,27 +638,56 @@ def _hf_full_worker_main():
 
     losses: list[float] = []
     t0 = time.time()
+    # Strict-fits-under-cap FIFO pack — matches FT's
+    # ``JsonSFTTokenSource.get_sequences(max_token_count=...)``. The
+    # previous "overshoot then break" loop appended one seq past the
+    # cap and produced different per-step batches than FT; over many
+    # steps the random walks diverged and per-step losses varied
+    # wildly even when the model was correct.
+    pending: tuple[list[int], int] | None = None
+    def _next_seq():
+        nonlocal seq_iter
+        try:
+            return next(seq_iter)
+        except StopIteration:
+            seq_iter = _make_seqs()
+            return next(seq_iter)
     for step in range(1, args.steps + 1):
         batch: list[tuple[list[int], int]] = []
         total = 0
-        while total < args.max_global_batch_tokens:
-            try:
-                toks, plen = next(seq_iter)
-            except StopIteration:
-                seq_iter = _make_seqs()
-                continue
-            batch.append((toks, plen))
-            total += len(toks)
+        if pending is not None:
+            batch.append(pending)
+            total += len(pending[0])
+            pending = None
+        while True:
+            cand = _next_seq()
+            if total + len(cand[0]) > args.max_global_batch_tokens:
+                pending = cand
+                break
+            batch.append(cand)
+            total += len(cand[0])
         opt.zero_grad(set_to_none=False)
         batch_loss = 0.0
         active_total = 0
         for toks, plen in batch:
             ids = _t.tensor(toks, dtype=_t.int64, device=args.device).unsqueeze(0)
             T = ids.shape[1]
-            labels = _t.full((T,), -100, dtype=_t.int64, device=args.device)
-            labels[: T - 1] = ids[0, 1:]
-            labels[: plen] = -100
-            active = int((labels != -100).sum().item())
+            # HF's ``ForCausalLMLoss`` shifts labels internally: it
+            # pads + slices so ``logits[i]`` is targeted against
+            # ``labels[i+1]``. Pass UN-shifted labels (= input_ids
+            # with prompt masked) and let HF do the shift. Pre-
+            # shifting here would double-shift, training the model
+            # to predict 2 tokens ahead — produced ~7-9 losses on
+            # pretrained Qwen3.5-27B instead of ~2.
+            labels = ids[0].clone()
+            labels[:plen] = -100
+            # ``labels[T-1]`` would predict position T (doesn't
+            # exist); HF's pad-then-shift puts -100 there
+            # automatically. # active loss tokens = response tokens
+            # that contribute = # indices in ``[plen, T-1)``.
+            active = max(0, T - 1 - plen)
+            if active == 0:
+                continue
             out = model(input_ids=ids, labels=labels.unsqueeze(0))
             (out.loss * active).backward()
             batch_loss += float(out.loss.item()) * active
