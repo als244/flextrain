@@ -1509,38 +1509,65 @@ class ActiveModel:
         layer_ind: int,
         prepared: PreparedRound,
     ) -> None:
-        """Refresh the forward K/V context with activations from a
-        chunk in the PRIOR seq group (or prior layer, if we're at the
-        first chunk of a group).
+        """Generalized fwd-context refresh dispatcher.
 
-        This is orig's subtle scheduling trick: during backward of the
-        current (seq_group_ind, chunk_in_group_ind), we overwrite the
-        K/V window's tail with the corresponding chunk from the
-        previous seq group (same layer), so that the NEXT iteration of
-        backward (seq_group_ind - 1) has the right K/V to recompute
-        attention against.
+        Called after each chunk's bwd in ``_backward_pass``. Dispatches
+        to the appropriate per-attention-type refresh helper based on
+        which fields the next-reverse-iteration's target layer
+        declares in its activation schema:
 
-        Mirrors ``orig/active_model.py:1040-1160``.
+        * Layers with ``xk``/``xv`` (dense/softmax attention) refresh
+          via ``_refresh_kv_window``.
+        * Layers with ``lin_final_state`` (linear attention, e.g.
+          Gated DeltaNet) refresh via ``_refresh_lin_state_window``.
+          (Wired up in a later commit; currently a no-op.)
+
+        Both branches use the same ``inbound_fwd_context`` stream, so
+        they're sequential per-layer (a layer is one type or the
+        other, never both currently).
+
+        See ``docs/multi_chunk_seq_handling.md`` for the per-type
+        source-slot rules and event-ordering analysis.
         """
         if layer_ind == 0 and seq_group_ind == 0:
             return
 
-        # Find the source chunk whose saved K/V we'll copy into the
-        # global ``kv_fwd`` window. Two paths:
-        #
-        # (A) Same layer, prior seq group at this ``chunk_in_group_ind``.
-        #     Always preferred when available; same W_K/W_V on different
-        #     tokens means K/V values differ but the source IS the right
-        #     layer.
-        #
-        # (B) Fallback to the IMMEDIATE prior layer's last-seq-group
-        #     same-chunk position. Used at seq_group=0 boundaries.
-        #     For HETEROGENEOUS backbones the prior layer may be
-        #     linear-attn (no ``xk``/``xv`` in its slot). That's fine:
-        #     the next softmax-attn bwd doesn't run until we reach a
-        #     softmax-attn layer, by which point Path A re-fires from
-        #     the prior seq group. We just bail out cleanly via the
-        #     ``not src_slot.has("xk")`` guard below.
+        # Dense KV branch: dispatched whenever the relevant target
+        # layer's slot carries ``xk``/``xv``. The helper itself does
+        # the Path-A/Path-B source-slot resolution and the
+        # device-vs-host event waits.
+        self._refresh_kv_window(
+            seq_group_ind=seq_group_ind,
+            chunk_in_group_ind=chunk_in_group_ind,
+            layer_ind=layer_ind,
+            prepared=prepared,
+        )
+
+    def _refresh_kv_window(
+        self,
+        *,
+        seq_group_ind: int,
+        chunk_in_group_ind: int,
+        layer_ind: int,
+        prepared: PreparedRound,
+    ) -> None:
+        """Copy K/V from a saved activation slot into the global
+        ``kv_fwd`` window in preparation for the next-reverse-iteration's
+        bwd. Source-slot resolution:
+
+        * Path A (preferred): same layer, prior seq_group, same
+          ``chunk_in_group_ind`` (skipping prior groups too short to
+          have a chunk at this index).
+        * Path B (fallback): prior layer, last seq_group, same
+          ``chunk_in_group_ind``. Used at seq_group_ind == 0
+          boundaries; on heterogeneous backbones the prior layer may
+          be linear-attn (no ``xk``/``xv``), in which case the helper
+          bails out cleanly.
+
+        Behavior is identical to the pre-refactor ``_update_fwd_context``;
+        this is a pure code reorg with the dispatcher as the entry
+        point. Mirrors ``orig/active_model.py:1040-1160``.
+        """
         next_chunk: TrainingChunk | None = None
         next_layer_id: int = -1
 
@@ -1566,7 +1593,6 @@ class ActiveModel:
             return
 
         key = (next_layer_id, next_chunk.id)
-        # Source depends on whether it's on device or home.
         meta = next_chunk.meta
         # Position in the KV window where this chunk's K/V lives.
         start_idx = (
