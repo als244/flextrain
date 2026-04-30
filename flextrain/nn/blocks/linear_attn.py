@@ -1134,7 +1134,10 @@ class GatedDeltaNetBlock:
         q_b = q_n.unsqueeze(0)
         k_b = k_n.unsqueeze(0)
         v_b = v_h.unsqueeze(0).contiguous()
-        beta = b.float().sigmoid().to(dtype)
+        # Cache sig_b in fp32 — needed twice: once cast-to-dtype as
+        # beta for FLA bwd, once for sigmoid bwd (db_via_beta below).
+        sig_b = b.float().sigmoid()
+        beta = sig_b.to(dtype)
         beta_b = beta.unsqueeze(0)
         do_b = do.unsqueeze(0)
         scale = cfg.head_k_dim ** -0.5
@@ -1165,19 +1168,32 @@ class GatedDeltaNetBlock:
         dbeta = dbeta.squeeze(0)                             # (T, n_v_heads)
         dg = dg.squeeze(0)                                   # (T, n_v_heads) — in raw-a space
         # 3b. Back-propagate through the l2 norm. Our strided-input
-        # bwd kernel takes (T, H, D) views directly so the saved q_n /
-        # k_n / q_rstd / k_rstd (slot tensors, contiguous) and the
-        # dq_n / dk_n FLA outputs (squeezed views, last-axis-contig)
-        # all feed in zero-copy.
+        # bwd kernel takes (T, H, D) views directly. dq_n / dk_n come
+        # from FLA's bwd via q.new_empty(B, T, H, K) (chunk_o.py:737)
+        # so they're contiguous after .squeeze(0); no .contiguous()
+        # needed. We allocate dq_h/dk_h as views of d_post_conv's Q/K
+        # slices so the bwd output lands directly in the conv-bwd input
+        # layout — no separate cat-and-copy step downstream.
         from flextrain.ops import flextrain_l2norm_bwd_into
-        dq_h = torch.empty_like(q_n)
-        dk_h = torch.empty_like(k_n)
-        flextrain_l2norm_bwd_into(q_n, q_rstd, dq_n.contiguous(), dq_h)
-        flextrain_l2norm_bwd_into(k_n, k_rstd, dk_n.contiguous(), dk_h)
+        d_post_conv = ctx.scratch((T, cfg.conv_dim), dtype)
+        d_post_conv_q = d_post_conv[:, :cfg.key_dim].view(
+            T, cfg.num_k_heads, cfg.head_k_dim,
+        )
+        d_post_conv_k = d_post_conv[:, cfg.key_dim:2 * cfg.key_dim].view(
+            T, cfg.num_k_heads, cfg.head_k_dim,
+        )
+        flextrain_l2norm_bwd_into(q_n, q_rstd, dq_n, d_post_conv_q)
+        flextrain_l2norm_bwd_into(k_n, k_rstd, dk_n, d_post_conv_k)
+        # V slice: dv_h is contig (T, HV, hv) from FLA; copy into
+        # d_post_conv's V slice via a strided view. One D2D pass over
+        # T*value_dim bytes, vs the cat which copied all 3 of Q+K+V.
+        d_post_conv[:, 2 * cfg.key_dim:].view(
+            T, cfg.num_v_heads, cfg.head_v_dim,
+        ).copy_(dv_h)
 
         # 4. Gate bwd.
-        # beta = sigmoid(b) — sigmoid bwd. dbeta -> db_via_beta.
-        sig_b = b.float().sigmoid()
+        # beta = sigmoid(b) — sigmoid bwd: db = dbeta * sig_b * (1 - sig_b).
+        # sig_b reused from beta computation above; no redundant pass.
         db_via_beta = (dbeta.float() * sig_b * (1.0 - sig_b)).to(dtype)
         # da_via_g comes directly from FLA's gdn_gate_bwd (called inside
         # chunk_gated_delta_rule_bwd because use_gate_in_kernel=True).
@@ -1193,14 +1209,12 @@ class GatedDeltaNetBlock:
                 ddt_bias_fla.to(grads["g_lin_dt_bias"].dtype)
             )
 
-        # 5. dq_h / dk_h are already per-K-head (no reverse expand
-        # needed — FLA's GVA-aware bwd returned them already-collapsed).
-        # Flatten to (T, key_dim) / (T, key_dim) / (T, value_dim).
-        d_q_p = dq_h.reshape(T, cfg.key_dim)
-        d_k_p = dk_h.reshape(T, cfg.key_dim)
-        d_v_p = dv_h.reshape(T, cfg.value_dim)
-        # cat reverse → d_post_conv (T, conv_dim).
-        d_post_conv = torch.cat([d_q_p, d_k_p, d_v_p], dim=-1)
+        # 5. d_post_conv is already assembled in step 3b — l2norm_bwd
+        # writes Q/K grads into views of d_post_conv directly, and we
+        # copy dv_h into the V slice. The torch.cat the previous
+        # implementation did (allocate (T, conv_dim) bf16 + copy 3
+        # tensors into it) is gone; we paid one D2D pass over the
+        # V slice instead of three over Q+K+V.
 
         # 6. silu bwd applied to post_conv_pre_silu via fused Triton
         # kernel. Computes d_post_conv_pre_silu = d_post_conv *
