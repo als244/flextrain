@@ -911,14 +911,18 @@ class GatedDeltaNetBlock:
         z: torch.Tensor,           # (T, n_v_heads, head_v_dim) — saved
         weight: torch.Tensor,      # (head_v_dim,)
         eps: float,
+        *,
+        dz_out: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Backward of ``o_normed = silu(z) * rmsnorm(o, w) * w``.
 
-        Returns ``(do, dz, dw)``. Delegates to the fused
-        :func:`flextrain_gated_rmsnorm_bwd` Triton kernel — keeps all
-        per-(T, H, D) intermediates inside SRAM and only writes the
-        three outputs back to HBM, avoiding the ~10 fp32 (T, H, D)
-        intermediates the python path materialized.
+        Returns ``(do, dz, dw)``. ``dz_out`` (optional) lets the caller
+        supply a pre-allocated buffer for dz so its writes can land
+        directly in (e.g.) the Z slice of d_qkvz, avoiding a copy.
+
+        Delegates to the fused :func:`flextrain_gated_rmsnorm_bwd`
+        Triton kernel — keeps all per-(T, H, D) intermediates inside
+        SRAM and only writes the three outputs back to HBM.
 
         Math (verified by ``tests/test_gated_rmsnorm_bwd.py`` against
         ``torch.autograd.grad`` on a pure-pytorch reference):
@@ -931,7 +935,7 @@ class GatedDeltaNetBlock:
         """
         from flextrain.ops import flextrain_gated_rmsnorm_bwd
         return flextrain_gated_rmsnorm_bwd(
-            do_normed, o, z, weight, eps,
+            do_normed, o, z, weight, eps, dz_out=dz_out,
         )
 
     def _fla_autograd_fn(self, cu_seqlens: torch.Tensor | None = None):
@@ -1102,9 +1106,19 @@ class GatedDeltaNetBlock:
         )
 
         # 2. Gated-RMSNorm bwd: o_normed = silu(z) * rmsnorm(core_out, W_norm) * W_norm.
+        # Pre-allocate d_qkvz_2d here so dz_out can write directly into
+        # its Z slice — avoids the dz portion of the final cat (~T*value_dim
+        # bf16 = ~134 MiB at T=16k saved). Q/K/V slices are populated
+        # later from FLA's conv_bwd output (still needs one D2D copy).
+        d_qkvz_2d = ctx.scratch((T, cfg.proj_qkvz_dim), dtype)
+        d_z_view = d_qkvz_2d[:, cfg.conv_dim:].view(
+            T, cfg.num_v_heads, cfg.head_v_dim,
+        )
         do, dz, dw_norm = self._gated_rmsnorm_bwd(
             do_normed, core_out, z, W_norm, cfg.rms_norm_eps,
+            dz_out=d_z_view,
         )
+        # dz IS d_z_view (same buffer); no need to use it again.
         g_w_norm = grads.get("g_lin_norm")
         if g_w_norm is not None:
             g_w_norm.add_(dw_norm.to(g_w_norm.dtype))
@@ -1246,7 +1260,13 @@ class GatedDeltaNetBlock:
             weight=W_fla, bias=None, residual=None,
             initial_state=None, activation=None,
         )
-        d_conv_in = dx_fla.squeeze(0).contiguous()           # (T, conv_dim)
+        # FLA's conv_bwd allocates dx via torch.empty_like; .squeeze(0)
+        # is a contiguous view (no copy). Copy [Q|K|V] into d_qkvz_2d's
+        # first conv_dim columns; Z slice was already written above by
+        # _gated_rmsnorm_bwd. One D2D pass over (T, conv_dim) bf16 vs
+        # the previous torch.cat which paid (T, proj_qkvz_dim) bf16
+        # write — saves the dz portion (~T*value_dim bf16).
+        d_qkvz_2d[:, :cfg.conv_dim].copy_(dx_fla.squeeze(0))
 
         if grads.get("g_lin_conv") is not None:
             # FLA returns dW with shape (D, W); reshape back to our
@@ -1254,26 +1274,6 @@ class GatedDeltaNetBlock:
             grads["g_lin_conv"].add_(
                 dw_fla.unsqueeze(1).to(grads["g_lin_conv"].dtype)
             )
-
-        # 8. Split d_conv_in into d_q_flat / d_k_flat / d_v_flat. Under
-        # the FT layout these are contiguous slices that match the
-        # ``[Q | K | V]`` blocks of qkvz at the front of the column axis;
-        # no reshape-copies needed.
-        d_q_flat, d_k_flat, d_v_flat = torch.split(
-            d_conv_in,
-            [cfg.key_dim, cfg.key_dim, cfg.value_dim], dim=-1,
-        )
-
-        # 9. Assemble d_qkvz in the FT block-major column layout
-        # ``[Q | K | V | Z]``. d_z (gated-rmsnorm bwd output) becomes
-        # the Z block. All four pieces are already in the right
-        # head-major layout per FT convention.
-        # NB: dz comes from ``_gated_rmsnorm_bwd`` with shape
-        # (T, num_v_heads, head_v_dim); reshape to (T, value_dim).
-        d_z_flat = dz.reshape(T, cfg.value_dim).to(dtype)
-        d_qkvz_2d = torch.cat(
-            [d_q_flat, d_k_flat, d_v_flat, d_z_flat], dim=-1,
-        )                                                          # (T, proj_qkvz_dim)
 
         # 10. Assemble d_ba in the FT block-major layout ``[B | A]``.
         # db = db_via_beta (sigmoid bwd of b), da = da_via_g (gate bwd).
