@@ -25,8 +25,8 @@ Architecture (per Qwen3-Next, also Qwen 3.5 / 3.6 hybrid layers):
 Activation schema (max_tier=3):
 
 * Tier 0 — always saved (small):
-    ``lin_ba`` (T, 2*n_v_heads) bf16   -- raw b|a (post-projection)
-    ``lin_g`` / ``lin_g_post`` (T, n_v_heads) fp32   -- gate scalars
+    ``lin_ba`` (T, 2*n_v_heads) bf16          -- raw b|a (post-projection)
+    ``lin_g_post`` (T, n_v_heads) fp32        -- post-cumsum gate
 * Tier 2 — FLA-output fields, expensive to recompute:
     ``lin_A_int``     (T, n_v_heads, 64)              -- FLA intra-chunk scratch
     ``lin_core_out``  (T, n_v_heads, head_v_dim)      -- FLA output
@@ -474,11 +474,13 @@ class GatedDeltaNetBlock:
                 lambda n, d: (n, 2 * cfg.num_v_heads),
                 bf, tier=0,
             ),
-            ActivationField(
-                "lin_g",
-                lambda n, d: (n, cfg.num_v_heads),
-                torch.float32, tier=0,
-            ),
+            # lin_g_post: post-cumsum gate (FLA's gdn_gate_chunk_cumsum
+            # output). Stage D5 dropped lin_g (pre-cumsum gate) since
+            # FLA's use_gate_in_kernel path fuses softplus + dt_bias +
+            # (-exp A_log) + chunk_local_cumsum into one kernel; the
+            # only persisted gate state is the post-cumsum output, used
+            # by the bwd's ``g`` argument and by gdn_gate_bwd to
+            # backprop into raw a / A_log / dt_bias.
             ActivationField(
                 "lin_g_post",
                 lambda n, d: (n, cfg.num_v_heads),
@@ -723,79 +725,53 @@ class GatedDeltaNetBlock:
         flextrain_l2norm_fwd_into(k_h, k_n, k_rstd)
         return q_n, k_n, v_h, q_rstd, k_rstd
 
-    def _fwd_gate_and_beta(
-        self,
-        a: torch.Tensor,                       # (T, n_v_heads) bf16
-        b: torch.Tensor,                       # (T, n_v_heads) bf16
-        weights: Mapping[str, torch.Tensor],
-        slot,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Stage 4: produce ``g`` (fp32) and ``beta`` (bf16) for FLA.
+    def _fwd_beta(self, b: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        """Compute beta = sigmoid(b) in compute_dtype.
 
-        Math:
-            g[t, h]    = -exp(A_log[h]) * softplus(a[t, h] + dt_bias[h])
-            beta[t, h] = sigmoid(b[t, h])
-
-        Single fused Triton kernel replaces ~9 elementwise launches in
-        the python pipeline. Saves ``lin_g`` to the slot.
+        After Stage D5 the gate ``g = -exp(A_log) * softplus(a+dt_bias)``
+        + chunk_local_cumsum is fused inside FLA via
+        ``use_gate_in_kernel=True``; we no longer compute g separately.
+        Only beta still needs a one-line sigmoid pass.
         """
-        from flextrain.ops import flextrain_gate_prep_fwd
-        # Write g directly into slot.lin_g; beta is a transient (not
-        # saved separately — bwd recomputes via gate_prep on saved b).
-        g, beta = flextrain_gate_prep_fwd(
-            a, b, weights["w_lin_A_log"], weights["w_lin_dt_bias"],
-            g_out=slot.lin_g,
-        )
-        return g, beta
+        return b.float().sigmoid().to(dtype)
 
     def _fwd_fla(
-        self, q_n, k_n, v_h, g, beta, slot,
+        self, q_n, k_n, v_h, a, beta, A_log, dt_bias, slot,
         cu_seqlens: torch.Tensor | None = None,
         chunk_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Stage 5: FLA chunk-gated-delta-rule. Saves ``lin_core_out``,
-        ``lin_A_int``, ``lin_g_post``. Returns ``core_out`` for the
-        gated norm + out projection downstream.
+        """Stage 5: FLA chunk-gated-delta-rule with fused gate (Stage D5).
 
-        ``q_n``/``k_n`` are already l2-normalized (done in
-        ``_fwd_qkv_heads``); ``beta`` is precomputed by
-        ``_fwd_gate_and_beta``. The l2norm rstds are saved into the
-        slot during ``_fwd_qkv_heads`` for the bwd's ``l2norm_bwd``.
+        Passes ``use_gate_in_kernel=True`` so FLA fuses
+        ``softplus(a + dt_bias) * (-exp(A_log))`` plus chunk_local_cumsum
+        into one kernel (gdn_gate_chunk_cumsum_scalar_kernel). ``a`` is
+        the raw projection output ``slot.lin_ba[:, HV:]``; FLA reads
+        A_log / dt_bias and applies them inside the kernel. Replaces the
+        previous python pipeline that called our flextrain_gate_prep_fwd
+        kernel + FLA's standalone chunk_local_cumsum.
 
-        ``cu_seqlens`` (shape ``[N+1]``, int64) tells FLA where each
-        packed sequence ends inside this chunk's flattened token axis;
-        without it, FLA would let the recurrent state leak across
-        sequence boundaries (treats the whole chunk as one sequence).
+        Saves ``lin_core_out``, ``lin_A_int``, ``lin_g_post`` to slot.
+        Returns ``core_out`` for the gated norm + out projection
+        downstream.
 
-        ``chunk_indices`` (shape ``(num_64_chunks, 2)``, int64) is FLA's
-        per-(seq, intra-seq-chunk) lookup table at chunk_size=64. When
-        passed, FLA skips its internal ``prepare_chunk_indices`` call
-        whose ``.tolist()`` is a D->H sync; we precompute host-side in
-        ``ChunkMeta.build``.
+        FLA's kernels read via hardcoded ``stride=(H*K, 1)`` block-ptr
+        math; only v_h needs an explicit ``.contiguous()`` because its
+        token stride is conv_dim (from post_conv slice), not HV*hv.
         """
         cfg = self.cfg
         bf = cfg.compute_dtype
         scale = cfg.head_k_dim ** -0.5
 
-        # FLA's kernels read via hardcoded ``stride=(H*K, 1)`` block-ptr
-        # math (e.g. fla/ops/common/chunk_o.py line 86), so token stride
-        # MUST equal ``H*K`` — they don't accept runtime strides. q_n /
-        # k_n are scratch-allocated contiguous in _fwd_qkv_heads (stride
-        # H*K), g / beta are contiguous from gate_prep, so those need
-        # no .contiguous(). v_h is a (T, HV, hv) reshape of a strided
-        # post_conv slice (token stride = conv_dim, not HV*hv) so it
-        # MUST be made contiguous before FLA. The stride[0]=0 from a
-        # bare ``.unsqueeze(0)`` is benign because FLA's kernels compute
-        # ``bos = i_b*T = 0`` for B=1.
         g_post, o, A_int, _, _, _ = chunk_gated_delta_rule_fwd(
             q_n.unsqueeze(0),
             k_n.unsqueeze(0),
             v_h.unsqueeze(0).contiguous(),
-            g.unsqueeze(0),
+            a.unsqueeze(0),
             beta.unsqueeze(0),
             scale=scale, initial_state=None,
             output_final_state=False, cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
+            use_gate_in_kernel=True, A_log=A_log, dt_bias=dt_bias,
         )
         o = o.squeeze(0)
         slot.lin_g_post.copy_(g_post.squeeze(0))
@@ -847,9 +823,10 @@ class GatedDeltaNetBlock:
         post_conv = self._fwd_conv(conv_in, weights, ctx)
         q_n, k_n, v_h, _q_rstd, _k_rstd = self._fwd_qkv_heads(post_conv, ctx)
         b, a = _split_ba_ft(slot.lin_ba, self.cfg)
-        g, beta = self._fwd_gate_and_beta(a, b, weights, slot)
+        beta = self._fwd_beta(b, self.cfg.compute_dtype)
         core_out = self._fwd_fla(
-            q_n, k_n, v_h, g, beta, slot,
+            q_n, k_n, v_h, a, beta,
+            weights["w_lin_A_log"], weights["w_lin_dt_bias"], slot,
             cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
         )
         return self._fwd_norm_out(core_out, z, weights)
@@ -906,31 +883,24 @@ class GatedDeltaNetBlock:
     ) -> torch.Tensor:
         """Tier-2 recompute (FLA half): re-run FLA fwd from supplied
         Q/K/V (typically scratch-allocated via _fwd_qkv_heads on a
-        recomputed post_conv) and saved ``lin_g`` / ``lin_ba`` to
-        repopulate ``lin_core_out`` / ``lin_A_int`` / ``lin_g_post``
-        in slot.
+        recomputed post_conv) plus saved raw ``a`` (= slot.lin_ba[:, HV:])
+        and weights ``w_lin_A_log`` / ``w_lin_dt_bias`` for FLA's fused
+        gate path. Repopulates ``lin_core_out`` / ``lin_A_int`` /
+        ``lin_g_post`` in slot.
 
-        Beta is recomputed from saved ``b`` (= ``slot.lin_ba[:, :HV]``)
-        via the fused gate-prep kernel (which also recomputes g; we
-        discard the recomputed g since slot.lin_g is already valid).
-
-        ``chunk`` is forwarded to ``_fwd_fla`` so the recompute uses
-        the same ``cu_seqlens`` as the original fwd — otherwise saved
-        and recomputed ``core_out`` would diverge across packed-seq
+        ``chunk`` is forwarded so the recompute uses the same
+        ``cu_seqlens`` as the original fwd — otherwise saved and
+        recomputed ``core_out`` would diverge across packed-seq
         boundaries inside the chunk."""
-        from flextrain.ops import flextrain_gate_prep_fwd
         b, a = _split_ba_ft(slot.lin_ba, self.cfg)
-        _g, beta = flextrain_gate_prep_fwd(
-            a, b,
-            weights["w_lin_A_log"], weights["w_lin_dt_bias"],
-        )
+        beta = self._fwd_beta(b, self.cfg.compute_dtype)
         cu_seqlens = chunk.q_seq_offsets_i64 if chunk is not None else None
         chunk_indices = (
             chunk.fla_chunk_indices_64 if chunk is not None else None
         )
         return self._fwd_fla(
-            q_n, k_n, v_h,
-            slot.lin_g, beta, slot,
+            q_n, k_n, v_h, a, beta,
+            weights["w_lin_A_log"], weights["w_lin_dt_bias"], slot,
             cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
         )
 
@@ -1032,7 +1002,8 @@ class GatedDeltaNetBlock:
         * (lin_q / lin_k / lin_v are NOT saved; recomputed from saved
           lin_qkvz via conv → silu → split → l2norm into scratch at
           the top of bwd. Stage D2.5.)
-        * ``slot.lin_g`` — pre-cumsum gate.
+        * (lin_g is no longer in the schema — Stage D5; FLA's
+          gdn_gate_bwd recomputes it from raw a + A_log + dt_bias.)
         * ``slot.lin_core_out`` — FLA output before the gated norm.
         * ``slot.aux["lin_A_int"]`` — FLA's intra-chunk attention scratch.
 
@@ -1062,7 +1033,7 @@ class GatedDeltaNetBlock:
         b, a = _split_ba_ft(slot.lin_ba, cfg)                # both (T, num_v_heads)
         _q_pre, _k_pre, _v_pre, z = _split_qkvz_ft(slot.lin_qkvz, cfg)
         # z: (T, num_v_heads, head_v_dim) view of slot.lin_qkvz
-        g = slot.lin_g                                       # (T, n_v_heads) fp32
+        # Stage D5 dropped lin_g (pre-cumsum); raw a is in slot.lin_ba.
         core_out = slot.lin_core_out                         # (T, n_v_heads, head_v_dim)
         conv_in = slot.lin_qkvz[:, :cfg.conv_dim]            # (T, conv_dim) view
         # Q/K/V post-l2norm + rstds are no longer saved (Stage D2.5).
@@ -1171,16 +1142,28 @@ class GatedDeltaNetBlock:
         chunk_indices = (
             chunk.fla_chunk_indices_64 if chunk is not None else None
         )
-        dq_n, dk_n, dv_h, dbeta, dg, _, _, _ = chunk_gated_delta_rule_bwd(
-            q=q_b, k=k_b, v=v_b, g=g_post, beta=beta_b, A=A_int,
-            scale=scale, initial_state=None, do=do_b, dht=None,
-            cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
+        # Stage D5: use_gate_in_kernel=True — FLA fuses the gate fwd
+        # (softplus + dt_bias + (-exp A_log)) and its bwd (gdn_gate_bwd)
+        # inside the chunk-gated-delta-rule kernels. Pass g_input = raw a
+        # (= slot.lin_ba[:, HV:]) and the gate weights; FLA returns dg
+        # already in raw-a space plus dA_log / ddt_bias. Replaces ~10
+        # python elementwise ops on (T, HV) tensors with one fused
+        # kernel pair.
+        a_b = a.unsqueeze(0)
+        dq_n, dk_n, dv_h, dbeta, dg, _, dA_log_fla, ddt_bias_fla = (
+            chunk_gated_delta_rule_bwd(
+                q=q_b, k=k_b, v=v_b, g=g_post, beta=beta_b, A=A_int,
+                scale=scale, initial_state=None, do=do_b, dht=None,
+                cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
+                use_gate_in_kernel=True, g_input=a_b,
+                A_log=W_A_log, dt_bias=W_dt_bias,
+            )
         )
         dq_n = dq_n.squeeze(0)                               # (T, n_k_heads, head_k_dim)
         dk_n = dk_n.squeeze(0)
         dv_h = dv_h.squeeze(0)                               # (T, n_v_heads, head_v_dim)
         dbeta = dbeta.squeeze(0)                             # (T, n_v_heads)
-        dg = dg.squeeze(0)                                   # (T, n_v_heads)
+        dg = dg.squeeze(0)                                   # (T, n_v_heads) — in raw-a space
         # 3b. Back-propagate through the l2 norm. Our strided-input
         # bwd kernel takes (T, H, D) views directly so the saved q_n /
         # k_n / q_rstd / k_rstd (slot tensors, contiguous) and the
@@ -1193,33 +1176,22 @@ class GatedDeltaNetBlock:
         flextrain_l2norm_bwd_into(k_n, k_rstd, dk_n.contiguous(), dk_h)
 
         # 4. Gate bwd.
-        # beta = sigmoid(b). dbeta -> db_via_beta.
+        # beta = sigmoid(b) — sigmoid bwd. dbeta -> db_via_beta.
         sig_b = b.float().sigmoid()
         db_via_beta = (dbeta.float() * sig_b * (1.0 - sig_b)).to(dtype)
-        # Add dz contribution to slot positions corresponding to the gated z
-        # (handled in step 7 below — z came from qkvz split).
-        # g = -exp(A_log) * softplus(a + dt_bias).
-        # dg/d(A_log)  = -exp(A_log) * softplus(...) = g (per-head, summed over T).
-        # dg/d(a + dt_bias) = -exp(A_log) * sigmoid(a + dt_bias).
-        a_f32 = a.float()
-        A_log_f32 = W_A_log.float()
-        dt_bias_f32 = W_dt_bias.float()
-        sig_apdt = (a_f32 + dt_bias_f32).sigmoid()
-        neg_exp_A = -A_log_f32.exp()                         # (n_v_heads,)
-        # da via g: dg * (-exp(A_log)) * sigmoid(a + dt_bias)
-        da_via_g = (dg.float() * neg_exp_A.unsqueeze(0) * sig_apdt).to(dtype)
-        # dA_log = sum_t (g * dg)  (since g_t = -exp(A_log) * softplus(...) = g)
-        # Actually: dg/d A_log = g  (chain rule with g as the per-t value).
-        # So dA_log = sum_t (dg * g).
-        d_A_log = (dg.float() * g.float()).sum(dim=0)         # (n_v_heads,)
-        # ddt_bias = sum_t (-exp(A_log)) * sigmoid(a+dt_bias) * dg
-        d_dt_bias = (
-            dg.float() * neg_exp_A.unsqueeze(0) * sig_apdt
-        ).sum(dim=0)                                          # (n_v_heads,)
-        if grads.get("g_lin_A_log") is not None:
-            grads["g_lin_A_log"].add_(d_A_log.to(grads["g_lin_A_log"].dtype))
-        if grads.get("g_lin_dt_bias") is not None:
-            grads["g_lin_dt_bias"].add_(d_dt_bias.to(grads["g_lin_dt_bias"].dtype))
+        # da_via_g comes directly from FLA's gdn_gate_bwd (called inside
+        # chunk_gated_delta_rule_bwd because use_gate_in_kernel=True).
+        # FLA returns dg already in raw-a space; just cast to dtype.
+        da_via_g = dg.to(dtype)
+        # dA_log / ddt_bias also come from FLA's gdn_gate_bwd.
+        if grads.get("g_lin_A_log") is not None and dA_log_fla is not None:
+            grads["g_lin_A_log"].add_(
+                dA_log_fla.to(grads["g_lin_A_log"].dtype)
+            )
+        if grads.get("g_lin_dt_bias") is not None and ddt_bias_fla is not None:
+            grads["g_lin_dt_bias"].add_(
+                ddt_bias_fla.to(grads["g_lin_dt_bias"].dtype)
+            )
 
         # 5. dq_h / dk_h are already per-K-head (no reverse expand
         # needed — FLA's GVA-aware bwd returned them already-collapsed).
