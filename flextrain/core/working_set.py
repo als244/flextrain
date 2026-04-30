@@ -1239,7 +1239,21 @@ def _pick_chunk_size(
         # which the tail-round filter then rejects, leaving us with
         # only chunk=262144 nc=1 (the lone zero-tail option in the
         # divisor list of target=478800).
-        default_nc = target_tokens_per_round // chunk_size
+        # ``target_tokens_per_round`` is the AI-bound minimum below
+        # which per-round PCIe overhead isn't amortized. Prefer the
+        # smallest ``nc`` that *meets-or-exceeds* it (memory permitting),
+        # not the largest nc that *stays under* it. Floor-rounding can
+        # leave the planner with a tail-heavy round whose per-round
+        # overhead dominates (user-observed pathology: 9B Hopper run
+        # with target=15120 picked chunk=8192 nc=1 → round=8192,
+        # under-amortized; should pick nc=2 → round=16384, zero tail
+        # against batch=65536).
+        floor_nc = target_tokens_per_round // chunk_size
+        ceil_nc = -(-target_tokens_per_round // chunk_size)  # math.ceil
+        if floor_nc * chunk_size < target_tokens_per_round and ceil_nc > 0:
+            default_nc = ceil_nc
+        else:
+            default_nc = max(1, floor_nc)
         target_num_chunks = default_nc
         if (
             chunk_size > 0
@@ -1247,7 +1261,8 @@ def _pick_chunk_size(
             and default_nc > 0
         ):
             # Largest nc <= default_nc such that nc divides
-            # (max_global_batch_tokens // chunk_size).
+            # (max_global_batch_tokens // chunk_size). This eliminates
+            # the round-tail when chunk_size already divides the batch.
             max_nc_in_batch = max_global_batch_tokens // chunk_size
             for nc_candidate in range(default_nc, 0, -1):
                 if max_nc_in_batch % nc_candidate == 0:
@@ -1383,8 +1398,15 @@ def _pick_chunk_size(
             backbone.weight_bytes + backbone.grad_bytes
             + multi_chunk_slot_bytes
         )
+        # Cap addl_complete so n_gpu_layers / n_gpu_grad_layers never
+        # exceed num_local_layers. The earlier cap of
+        # ``num_local_layers - 1`` was off-by-one in the heterogeneous
+        # case: starting from n_gpu_layers=2 it could grow to
+        # num_local_layers + 1 → a wasted ring slot that holds no
+        # real layer's weights.
+        addl_cap = max(0, num_local_layers - max(n_gpu_layers, n_gpu_grad_layers))
         addl_complete = int(min(
-            num_local_layers - 1,
+            addl_cap,
             cur_gpu // addl_full_layer_bytes if addl_full_layer_bytes > 0 else 0,
         ))
         n_gpu_layers += addl_complete
@@ -1430,6 +1452,12 @@ def _pick_chunk_size(
         if remaining_host_mem_bytes < min_act_slot * (total_act_slots - gpu_act_slots):
             continue
 
+        # Clamp at the picker output so the "Selected Best Option" log
+        # line shows honest values. The downstream WorkingSetConfig
+        # also clamps these — this is purely a log-correctness fix.
+        n_gpu_layers = min(n_gpu_layers, num_local_layers)
+        n_gpu_grad_layers = min(n_gpu_grad_layers, num_local_layers)
+        n_gpu_opt_layers = min(n_gpu_opt_layers, num_local_layers)
         option = {
             "target_chunk_size": chunk_size,
             "target_num_chunks": target_num_chunks,
