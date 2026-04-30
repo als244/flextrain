@@ -1,9 +1,20 @@
 """FT replay + compare against an HF logit capture.
 
 Loads the bundle saved by ``tests/hf_capture_logits.py`` (token ids +
-HF logits), reconstructs the same FT engine for the named model,
-runs FT forward on those exact tokens, and prints a per-position
-diff vs the HF reference logits.
+HF logits over a prompt + greedy-generated continuation), reconstructs
+the FT engine for the same model, runs ONE FT forward over the full
+sequence, and prints a per-position diff vs the HF reference logits.
+
+Per-region breakdown:
+* ``prompt`` slice (positions 0..prompt_T-1): logits over the user
+  prompt — identical to a non-generation parity test.
+* ``generated`` slice (positions prompt_T..T-1): logits over the
+  greedy-generated continuation. Cumulative numerical drift after
+  many autoregressive steps shows up here.
+
+Also reports next-token argmax agreement HF vs FT, the position
+where they first diverge, and CE loss against the next-token targets
+implied by ``input_ids``.
 
 Usage:
 
@@ -11,19 +22,6 @@ Usage:
         --capture hf_capture_27b.pt \\
         --model models/Qwen3.5-27B \\
         --gpu-gib 22.5 --host-gib 110
-
-If ``--model`` is omitted, falls back to ``bundle["model_path_arg"]``
-which records the HF-side model dir (handy when paths are identical
-across machines).
-
-Notes
------
-* Uses LoRA-mode FT engine to keep the GPU footprint small (frozen
-  base = same fwd as the un-adapted model; adapters init to zero).
-  The forward we compare is the pretrained-base forward.
-* If the engine refuses to fit at the requested GPU budget, retry
-  with smaller ``--max-chunk-size`` or larger ``--gpu-gib``.
-* Compares logits in bf16 → float for the diff math.
 """
 from __future__ import annotations
 
@@ -159,8 +157,17 @@ def main() -> int:
     print(f"  capture: {args.capture}")
     print(f"  model:   {bundle.get('model', '<missing>')}  (dir: {model_path})")
     print(f"  prompt:  {bundle.get('prompt', '<missing>')!r}")
-    print(f"  T={bundle['input_ids'].numel()}  V={bundle['vocab_size']}")
+    T = int(bundle["input_ids"].numel())
+    prompt_T = int(bundle.get("prompt_T", T))
+    n_gen = int(bundle.get("n_generated", T - prompt_T))
+    V = int(bundle["vocab_size"])
+    print(f"  T={T}  prompt_T={prompt_T}  generated={n_gen}  V={V}")
     print(f"  HF dtype-used-for-fwd: {bundle.get('dtype_used_for_fwd', 'unknown')}")
+    if "full_decoded" in bundle:
+        print()
+        print("  === HF prompt + generated (decoded) ===")
+        print(bundle["full_decoded"])
+        print("  === END ===")
     print()
 
     ids = bundle["input_ids"].tolist()
@@ -176,29 +183,72 @@ def main() -> int:
     ft_logits_cpu = ft_logits.detach().to("cpu").contiguous()
 
     print()
-    print("=== Diff ===")
-    _stats("logits", hf_logits, ft_logits_cpu)
+    print("=== Diff (full sequence) ===")
+    _stats("logits[full]", hf_logits, ft_logits_cpu)
 
-    # Per-position max|Δ| histogram.
-    diff = (hf_logits.float() - ft_logits_cpu.float()).abs()
-    per_pos_max = diff.max(dim=-1).values  # (T,)
-    print(f"  per-position max|Δ|: min={per_pos_max.min().item():.4f}  "
-          f"median={per_pos_max.median().item():.4f}  "
-          f"max={per_pos_max.max().item():.4f}")
+    if prompt_T > 0:
+        print()
+        print("=== Diff (prompt slice [0, prompt_T)) ===")
+        _stats(
+            "logits[prompt]",
+            hf_logits[:prompt_T], ft_logits_cpu[:prompt_T],
+        )
 
-    # Argmax agreement.
+    if n_gen > 0:
+        print()
+        print("=== Diff (generated slice [prompt_T, T)) ===")
+        gen_hf = hf_logits[prompt_T:]
+        gen_ft = ft_logits_cpu[prompt_T:]
+        _stats("logits[generated]", gen_hf, gen_ft)
+
+        # Per-position drift across the generated region — useful for
+        # spotting cumulative drift over autoregressive steps.
+        diff = (gen_hf.float() - gen_ft.float()).abs()
+        per_pos_max = diff.max(dim=-1).values  # (n_gen,)
+        if n_gen >= 4:
+            buckets = 4
+            print(f"  per-position max|Δ| across generated region "
+                  f"({n_gen} positions, {buckets} bins):")
+            seg = max(1, n_gen // buckets)
+            for b in range(buckets):
+                s = b * seg
+                e = (b + 1) * seg if b < buckets - 1 else n_gen
+                if s >= n_gen:
+                    break
+                bucket_max = per_pos_max[s:e].max().item()
+                bucket_med = per_pos_max[s:e].median().item()
+                print(
+                    f"    [{s:4d}, {e:4d})  max|Δ|={bucket_max:7.4f}  "
+                    f"median|Δ|={bucket_med:7.4f}",
+                    flush=True,
+                )
+
+    # Argmax agreement (full).
     hf_arg = hf_logits.argmax(dim=-1)
     ft_arg = ft_logits_cpu.argmax(dim=-1)
-    agree = (hf_arg == ft_arg).float().mean().item()
-    print(f"  argmax agreement: {agree*100:.2f}% ({(hf_arg == ft_arg).sum().item()}/{len(ids)})")
+    agree_full = (hf_arg == ft_arg).float().mean().item()
+    print()
+    print(f"  argmax agreement [full]:      "
+          f"{agree_full*100:.2f}% ({(hf_arg == ft_arg).sum().item()}/{T})")
+    if prompt_T > 0:
+        agree_p = (hf_arg[:prompt_T] == ft_arg[:prompt_T]).float().mean().item()
+        print(f"  argmax agreement [prompt]:    "
+              f"{agree_p*100:.2f}% ({(hf_arg[:prompt_T] == ft_arg[:prompt_T]).sum().item()}/{prompt_T})")
+    if n_gen > 0:
+        agree_g = (hf_arg[prompt_T:] == ft_arg[prompt_T:]).float().mean().item()
+        print(f"  argmax agreement [generated]: "
+              f"{agree_g*100:.2f}% ({(hf_arg[prompt_T:] == ft_arg[prompt_T:]).sum().item()}/{n_gen})")
+        # First position in the generated region where argmax differs.
+        diff_mask = (hf_arg[prompt_T:] != ft_arg[prompt_T:])
+        first_diff = int(diff_mask.nonzero()[0].item()) if diff_mask.any() else -1
+        if first_diff >= 0:
+            print(f"  first generated-region argmax mismatch at "
+                  f"prompt_T + {first_diff} = {prompt_T + first_diff} "
+                  f"(HF={hf_arg[prompt_T + first_diff].item()} "
+                  f"FT={ft_arg[prompt_T + first_diff].item()})")
 
-    last_hf = int(hf_logits[-1].argmax().item())
-    last_ft = int(ft_logits_cpu[-1].argmax().item())
-    print(f"  last-position argmax — HF={last_hf}  FT={last_ft}  "
-          f"{'MATCH' if last_hf == last_ft else 'DIFFER'}")
-
-    # Cross-entropy loss vs prompt tokens (next-token CE).
-    if len(ids) > 1:
+    # Next-token CE.
+    if T > 1:
         targets = torch.tensor(ids[1:], dtype=torch.int64)
         ce_hf = torch.nn.functional.cross_entropy(
             hf_logits[:-1].float(), targets, reduction="mean",
@@ -206,7 +256,37 @@ def main() -> int:
         ce_ft = torch.nn.functional.cross_entropy(
             ft_logits_cpu[:-1].float(), targets, reduction="mean",
         )
-        print(f"  next-token CE loss — HF={ce_hf.item():.4f}  FT={ce_ft.item():.4f}")
+        print()
+        print(f"  next-token CE [full]:      HF={ce_hf.item():.4f}  FT={ce_ft.item():.4f}")
+        if prompt_T > 1:
+            tg_p = torch.tensor(ids[1:prompt_T], dtype=torch.int64)
+            ce_hf_p = torch.nn.functional.cross_entropy(
+                hf_logits[:prompt_T-1].float(), tg_p, reduction="mean",
+            )
+            ce_ft_p = torch.nn.functional.cross_entropy(
+                ft_logits_cpu[:prompt_T-1].float(), tg_p, reduction="mean",
+            )
+            print(
+                f"  next-token CE [prompt]:    "
+                f"HF={ce_hf_p.item():.4f}  FT={ce_ft_p.item():.4f}"
+            )
+        if n_gen > 0:
+            # Generated-region CE = how well each side predicts each
+            # actual generated token from the prefix-up-to-that-point.
+            tg_g = torch.tensor(ids[prompt_T:], dtype=torch.int64)
+            # The position predicting ids[prompt_T] is logits[prompt_T - 1];
+            # predicting ids[T-1] is logits[T-2]. So the slice is
+            # logits[prompt_T - 1 : T - 1].
+            ce_hf_g = torch.nn.functional.cross_entropy(
+                hf_logits[prompt_T - 1 : T - 1].float(), tg_g, reduction="mean",
+            )
+            ce_ft_g = torch.nn.functional.cross_entropy(
+                ft_logits_cpu[prompt_T - 1 : T - 1].float(), tg_g, reduction="mean",
+            )
+            print(
+                f"  next-token CE [generated]: "
+                f"HF={ce_hf_g.item():.4f}  FT={ce_ft_g.item():.4f}"
+            )
 
     return 0
 
