@@ -107,15 +107,30 @@ def _ft_forward(
 
     # final-norm + lm_head over ALL positions (concat per-chunk
     # transitions back to (T, d_model)).
+    # ``transitions`` may be a view into the activation ring whose
+    # underlying storage gets recycled — clone immediately so the
+    # post-fwd ops (rmsnorm, mm, .to('cpu')) read a private copy.
     head_w = am.buffers.gpu_head_params
     rms_eps = float(am.head.cfg.rms_norm_eps)
-    parts = [am.buffers.transitions[c.id] for c in prepared.chunks]
-    x = torch.cat(parts, dim=0).contiguous()
+    parts = [
+        am.buffers.transitions[c.id].detach().clone()
+        for c in prepared.chunks
+    ]
+    print(f"  parts[0].shape={tuple(parts[0].shape)} dtype={parts[0].dtype} device={parts[0].device}", flush=True)
+    x = torch.cat(parts, dim=0).contiguous() if len(parts) > 1 else parts[0]
+    print(f"  x.shape={tuple(x.shape)} contig={x.is_contiguous()}", flush=True)
+    torch.cuda.synchronize()
     head_proj_in, _rstd = flextrain_rmsnorm_fwd(
         x, W=head_w["w_final_norm"], rms_norm_eps=rms_eps,
     )
+    print(f"  head_proj_in.shape={tuple(head_proj_in.shape)}", flush=True)
+    torch.cuda.synchronize()
     logits = torch.mm(head_proj_in, head_w["w_head_proj"]).contiguous()
-    return logits.to(torch.bfloat16)
+    print(f"  logits.shape={tuple(logits.shape)} dtype={logits.dtype}", flush=True)
+    torch.cuda.synchronize()
+    out = logits.detach().clone().contiguous()
+    torch.cuda.synchronize()
+    return out
 
 
 def _stats(name: str, ref: torch.Tensor, got: torch.Tensor) -> None:
@@ -180,31 +195,53 @@ def main() -> int:
         max_chunk_size=args.max_chunk_size,
         use_lora=not args.no_lora,
     )
-    ft_logits_cpu = ft_logits.detach().to("cpu").contiguous()
+    # All comparisons on GPU. ``ft_logits`` lives on cuda:0 with FT's
+    # stream ownership; pulling it to CPU triggered cudaErrorInvalidValue
+    # for unclear reasons. Push the (small bf16) HF capture to GPU
+    # instead, do the math on GPU, and only return scalar summaries.
+    torch.cuda.synchronize()
+    hf_dev = hf_logits.to("cuda:0").contiguous()
+
+    def _print_stats_gpu(name: str, ref: torch.Tensor, got: torch.Tensor) -> None:
+        if ref.shape != got.shape:
+            print(f"  {name:24s} SHAPE MISMATCH ref={tuple(ref.shape)} got={tuple(got.shape)}")
+            return
+        diff = (ref.float() - got.float()).abs()
+        max_abs = float(diff.max().item())
+        mean_abs = float(diff.mean().item())
+        ref_norm = float(ref.float().norm().item())
+        rel = max_abs / max(ref_norm, 1e-12)
+        bf16_eps = 5e-3
+        flag = "OK" if rel < bf16_eps else ("DIVERGE" if rel < 0.1 else "BAD")
+        print(
+            f"  {name:24s} max|Δ|={max_abs:9.4f}  mean|Δ|={mean_abs:9.4f}  "
+            f"rel={rel:.3e}  [{flag}]",
+            flush=True,
+        )
 
     print()
     print("=== Diff (full sequence) ===")
-    _stats("logits[full]", hf_logits, ft_logits_cpu)
+    _print_stats_gpu("logits[full]", hf_dev, ft_logits)
 
     if prompt_T > 0:
         print()
         print("=== Diff (prompt slice [0, prompt_T)) ===")
-        _stats(
+        _print_stats_gpu(
             "logits[prompt]",
-            hf_logits[:prompt_T], ft_logits_cpu[:prompt_T],
+            hf_dev[:prompt_T], ft_logits[:prompt_T],
         )
 
     if n_gen > 0:
         print()
         print("=== Diff (generated slice [prompt_T, T)) ===")
-        gen_hf = hf_logits[prompt_T:]
-        gen_ft = ft_logits_cpu[prompt_T:]
-        _stats("logits[generated]", gen_hf, gen_ft)
+        gen_hf = hf_dev[prompt_T:]
+        gen_ft = ft_logits[prompt_T:]
+        _print_stats_gpu("logits[generated]", gen_hf, gen_ft)
 
-        # Per-position drift across the generated region — useful for
-        # spotting cumulative drift over autoregressive steps.
-        diff = (gen_hf.float() - gen_ft.float()).abs()
-        per_pos_max = diff.max(dim=-1).values  # (n_gen,)
+        # Per-position drift across generated region.
+        diff_g = (gen_hf.float() - gen_ft.float()).abs()
+        per_pos_max = diff_g.max(dim=-1).values  # (n_gen,)
+        per_pos_max_cpu = per_pos_max.cpu()
         if n_gen >= 4:
             buckets = 4
             print(f"  per-position max|Δ| across generated region "
@@ -215,17 +252,17 @@ def main() -> int:
                 e = (b + 1) * seg if b < buckets - 1 else n_gen
                 if s >= n_gen:
                     break
-                bucket_max = per_pos_max[s:e].max().item()
-                bucket_med = per_pos_max[s:e].median().item()
+                bucket_max = per_pos_max_cpu[s:e].max().item()
+                bucket_med = per_pos_max_cpu[s:e].median().item()
                 print(
                     f"    [{s:4d}, {e:4d})  max|Δ|={bucket_max:7.4f}  "
                     f"median|Δ|={bucket_med:7.4f}",
                     flush=True,
                 )
 
-    # Argmax agreement (full).
-    hf_arg = hf_logits.argmax(dim=-1)
-    ft_arg = ft_logits_cpu.argmax(dim=-1)
+    # Argmax agreement.
+    hf_arg = hf_dev.argmax(dim=-1).cpu()
+    ft_arg = ft_logits.argmax(dim=-1).cpu()
     agree_full = (hf_arg == ft_arg).float().mean().item()
     print()
     print(f"  argmax agreement [full]:      "
@@ -238,55 +275,43 @@ def main() -> int:
         agree_g = (hf_arg[prompt_T:] == ft_arg[prompt_T:]).float().mean().item()
         print(f"  argmax agreement [generated]: "
               f"{agree_g*100:.2f}% ({(hf_arg[prompt_T:] == ft_arg[prompt_T:]).sum().item()}/{n_gen})")
-        # First position in the generated region where argmax differs.
         diff_mask = (hf_arg[prompt_T:] != ft_arg[prompt_T:])
-        first_diff = int(diff_mask.nonzero()[0].item()) if diff_mask.any() else -1
-        if first_diff >= 0:
+        if diff_mask.any():
+            first_diff = int(diff_mask.nonzero()[0].item())
             print(f"  first generated-region argmax mismatch at "
                   f"prompt_T + {first_diff} = {prompt_T + first_diff} "
                   f"(HF={hf_arg[prompt_T + first_diff].item()} "
                   f"FT={ft_arg[prompt_T + first_diff].item()})")
 
-    # Next-token CE.
+    # CE losses (GPU).
     if T > 1:
-        targets = torch.tensor(ids[1:], dtype=torch.int64)
+        targets_dev = torch.tensor(ids[1:], dtype=torch.int64, device="cuda:0")
         ce_hf = torch.nn.functional.cross_entropy(
-            hf_logits[:-1].float(), targets, reduction="mean",
-        )
+            hf_dev[:-1].float(), targets_dev, reduction="mean",
+        ).item()
         ce_ft = torch.nn.functional.cross_entropy(
-            ft_logits_cpu[:-1].float(), targets, reduction="mean",
-        )
+            ft_logits[:-1].float(), targets_dev, reduction="mean",
+        ).item()
         print()
-        print(f"  next-token CE [full]:      HF={ce_hf.item():.4f}  FT={ce_ft.item():.4f}")
+        print(f"  next-token CE [full]:      HF={ce_hf:.4f}  FT={ce_ft:.4f}")
         if prompt_T > 1:
-            tg_p = torch.tensor(ids[1:prompt_T], dtype=torch.int64)
+            tg_p = targets_dev[: prompt_T - 1]
             ce_hf_p = torch.nn.functional.cross_entropy(
-                hf_logits[:prompt_T-1].float(), tg_p, reduction="mean",
-            )
+                hf_dev[: prompt_T - 1].float(), tg_p, reduction="mean",
+            ).item()
             ce_ft_p = torch.nn.functional.cross_entropy(
-                ft_logits_cpu[:prompt_T-1].float(), tg_p, reduction="mean",
-            )
-            print(
-                f"  next-token CE [prompt]:    "
-                f"HF={ce_hf_p.item():.4f}  FT={ce_ft_p.item():.4f}"
-            )
+                ft_logits[: prompt_T - 1].float(), tg_p, reduction="mean",
+            ).item()
+            print(f"  next-token CE [prompt]:    HF={ce_hf_p:.4f}  FT={ce_ft_p:.4f}")
         if n_gen > 0:
-            # Generated-region CE = how well each side predicts each
-            # actual generated token from the prefix-up-to-that-point.
-            tg_g = torch.tensor(ids[prompt_T:], dtype=torch.int64)
-            # The position predicting ids[prompt_T] is logits[prompt_T - 1];
-            # predicting ids[T-1] is logits[T-2]. So the slice is
-            # logits[prompt_T - 1 : T - 1].
+            tg_g = torch.tensor(ids[prompt_T:], dtype=torch.int64, device="cuda:0")
             ce_hf_g = torch.nn.functional.cross_entropy(
-                hf_logits[prompt_T - 1 : T - 1].float(), tg_g, reduction="mean",
-            )
+                hf_dev[prompt_T - 1 : T - 1].float(), tg_g, reduction="mean",
+            ).item()
             ce_ft_g = torch.nn.functional.cross_entropy(
-                ft_logits_cpu[prompt_T - 1 : T - 1].float(), tg_g, reduction="mean",
-            )
-            print(
-                f"  next-token CE [generated]: "
-                f"HF={ce_hf_g.item():.4f}  FT={ce_ft_g.item():.4f}"
-            )
+                ft_logits[prompt_T - 1 : T - 1].float(), tg_g, reduction="mean",
+            ).item()
+            print(f"  next-token CE [generated]: HF={ce_hf_g:.4f}  FT={ce_ft_g:.4f}")
 
     return 0
 
