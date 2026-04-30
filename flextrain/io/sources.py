@@ -106,6 +106,21 @@ class TokenSource(Protocol):
         offline scanning or caching."""
         ...
 
+    def push_back(self, seq: Sequence) -> None:
+        """Return a previously-popped sequence to the front of the
+        source's queue. The next ``get_sequences`` call will consider
+        this seq before any newly-tokenized records.
+
+        Used by the trainer to defer a sequence to the next step when
+        the engine's round packer would have pushed it into a
+        compute-sparse short tail-round (see ``flextrain.engine.schedule.split_sequences``).
+
+        Sources that don't support deferring may raise
+        ``NotImplementedError``; trainers should treat that as "spill
+        not supported" and just take the round-imbalance hit.
+        """
+        ...
+
 
 # ---------------------------------------------------------------------------
 # RawTokenSource: user-supplied, pre-tokenized.
@@ -317,6 +332,11 @@ class JsonSFTTokenSource:
         self._stop = threading.Event()
         self._exhausted = False  # True once producer thread exits.
         self._worker: threading.Thread | None = None
+        # Spill: sequences pushed-back by the trainer (deferred to next
+        # step). Consulted before ``_queue`` in ``_pop_by_tokens``.
+        # Protected by ``_lock``.
+        self._spill: deque[Sequence] = deque()
+        self._spill_tokens = 0
         # Register for the atexit shutdown sweep (see top of module).
         _LIVE_JSON_SFT_SOURCES.add(self)
 
@@ -601,6 +621,19 @@ class JsonSFTTokenSource:
             return self._pop_by_count(num_seqs)
         return self._pop_by_tokens(min_token_count, max_token_count)
 
+    def push_back(self, seq: Sequence) -> None:
+        """Defer a sequence to the next ``get_sequences`` call.
+
+        Used by the trainer to spill seqs that would have landed in a
+        compute-sparse short tail-round (see
+        ``flextrain.engine.schedule.split_sequences``). The deferred
+        seq is consulted before the producer queue on the next pop,
+        so it gets first-pick into the next step's batch.
+        """
+        with self._lock:
+            self._spill.appendleft(seq)
+            self._spill_tokens += len(seq)
+
     def _pop_by_count(self, num_seqs: int) -> list[Sequence]:
         out: list[Sequence] = []
         while len(out) < num_seqs:
@@ -637,6 +670,28 @@ class JsonSFTTokenSource:
         total = 0
         while True:
             with self._lock:
+                # First drain ``_spill`` — sequences the trainer
+                # pushed back from the prior step. Same fits-under-cap
+                # rule as the producer-queue drain below.
+                while self._spill:
+                    head = self._spill[0]
+                    if (
+                        max_token_count is not None
+                        and out
+                        and total + len(head) > max_token_count
+                    ):
+                        self._room.notify()
+                        return out
+                    self._spill.popleft()
+                    self._spill_tokens -= len(head)
+                    out.append(head)
+                    total += len(head)
+                    if (
+                        max_token_count is not None
+                        and total >= max_token_count
+                    ):
+                        self._room.notify()
+                        return out
                 # Greedy pop while next sequence fits under the cap.
                 while self._queue:
                     head = self._queue[0]

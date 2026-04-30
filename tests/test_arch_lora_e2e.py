@@ -322,11 +322,33 @@ def _ft_worker_main():
 
     losses: list[float] = []
     t0 = time.time()
+    from flextrain.engine.schedule import split_sequences
     for step in range(1, args.steps + 1):
         seqs = source.get_sequences(max_token_count=args.max_global_batch_tokens)
         if not seqs:
             print(f"  [ft] dataset exhausted at step {step}", flush=True)
             break
+        # Short-tail-round spill — see train.py for rationale.
+        ws = am.working_set
+        push_back = getattr(source, "push_back", None)
+        if push_back is not None:
+            for _spill_iter in range(4):
+                rounds, _ = split_sequences(
+                    seqs,
+                    target_round_tokens=ws.target_round_tokens,
+                    max_total_round_tokens=ws.max_total_round_tokens,
+                    max_chunk_size=ws.max_chunk_size,
+                    max_training_chunks=ws.max_training_chunks,
+                    policy=am.chunk_policy,
+                )
+                if len(rounds) <= ws.target_num_rounds:
+                    break
+                spilled = rounds[-1]
+                if len(spilled) >= len(seqs):
+                    break
+                for s in reversed(spilled):
+                    push_back(s)
+                seqs = seqs[: -len(spilled)]
         # ``loss_scale_factor`` denominator = active-token count
         # across the whole step (mean-over-active-tokens convention).
         # Cached on each Sequence as ``active_token_count`` (computed

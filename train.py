@@ -19,6 +19,7 @@ from flextrain.io.download import (
     hf_checkpoint_is_complete,
 )
 from flextrain.io.hf_weights import select_arch
+from flextrain.engine.schedule import split_sequences
 from flextrain.io.sources import JsonSFTTokenSource, SyntheticTokenSource
 from flextrain.optim.adamw import AdamW, AdamWHyperparams
 from flextrain.optim.hybrid import HybridMuonAdamW, HybridMuonAdamWHyperparams
@@ -215,6 +216,37 @@ def _run_training_loop(am, source, *, model_cfg, args, output_dir: str, save_arc
         if not seqs:
             print(f"[step {step}] data source exhausted")
             break
+
+        # ---- Short-tail-round spill -----------------------------------
+        # The working-set planner picked ``target_num_rounds`` for this
+        # step — but ``get_sequences`` packs FIFO-fits-under-cap, which
+        # can leave a few seqs over budget for an extra short round
+        # with terrible compute density. Simulate the engine's round
+        # packer (``split_sequences`` is a pure function); if it would
+        # produce more rounds than target, push the last round's seqs
+        # back to the source for next step. Converges in 1-2 iterations
+        # because each iteration strictly reduces the round count.
+        ws = am.working_set
+        push_back = getattr(source, "push_back", None)
+        if push_back is not None:
+            for _spill_iter in range(4):  # safety cap
+                rounds, _ = split_sequences(
+                    seqs,
+                    target_round_tokens=ws.target_round_tokens,
+                    max_total_round_tokens=ws.max_total_round_tokens,
+                    max_chunk_size=ws.max_chunk_size,
+                    max_training_chunks=ws.max_training_chunks,
+                    policy=am.chunk_policy,
+                )
+                if len(rounds) <= ws.target_num_rounds:
+                    break
+                spilled = rounds[-1]
+                # Don't spill so many that this step has nothing to do.
+                if len(spilled) >= len(seqs):
+                    break
+                for s in reversed(spilled):
+                    push_back(s)
+                seqs = seqs[: -len(spilled)]
 
         if profile_start_step is not None and step == profile_start_step:
             torch.cuda.synchronize()
