@@ -20,15 +20,6 @@ dependencies = [
 
 [project.optional-dependencies]
 linear-attention = ["flash-linear-attention", "causal-conv1d"]
-# tilelang is required only on Hopper (sm90+) with Triton >= 3.4.0 to
-# work around FLA issue #640 (default Triton chunk_bwd_dqkwg has a
-# correctness bug under that combination). Harmless on other GPUs;
-# linear_attn.py only imports it when the bug condition is detected.
-linear-attention-hopper = [
-    "flash-linear-attention",
-    "causal-conv1d",
-    "tilelang",
-]
 flash-attn = ["flash_attn_interface"]
 peft = ["peft"]
 
