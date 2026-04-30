@@ -777,12 +777,22 @@ class GatedDeltaNetBlock:
         bf = cfg.compute_dtype
         scale = cfg.head_k_dim ** -0.5
 
+        # FLA's kernels read via hardcoded ``stride=(H*K, 1)`` block-ptr
+        # math (e.g. fla/ops/common/chunk_o.py line 86), so token stride
+        # MUST equal ``H*K`` — they don't accept runtime strides. q_n /
+        # k_n are scratch-allocated contiguous in _fwd_qkv_heads (stride
+        # H*K), g / beta are contiguous from gate_prep, so those need
+        # no .contiguous(). v_h is a (T, HV, hv) reshape of a strided
+        # post_conv slice (token stride = conv_dim, not HV*hv) so it
+        # MUST be made contiguous before FLA. The stride[0]=0 from a
+        # bare ``.unsqueeze(0)`` is benign because FLA's kernels compute
+        # ``bos = i_b*T = 0`` for B=1.
         g_post, o, A_int, _, _, _ = chunk_gated_delta_rule_fwd(
-            q_n.unsqueeze(0).contiguous(),
-            k_n.unsqueeze(0).contiguous(),
+            q_n.unsqueeze(0),
+            k_n.unsqueeze(0),
             v_h.unsqueeze(0).contiguous(),
-            g.unsqueeze(0).contiguous(),
-            beta.unsqueeze(0).contiguous(),
+            g.unsqueeze(0),
+            beta.unsqueeze(0),
             scale=scale, initial_state=None,
             output_final_state=False, cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
@@ -1077,7 +1087,7 @@ class GatedDeltaNetBlock:
         # (T, n_v_heads, 64); add batch dim for FLA. lin_A_int is bf16
         # in the slot but FLA's bwd accepts bf16 directly.
         A_int = slot.lin_A_int.unsqueeze(0)                  # (1, T, H, 64)
-        g_post = slot.lin_g_post.unsqueeze(0).contiguous()   # (1, T, H), fp32
+        g_post = slot.lin_g_post.unsqueeze(0)                # (1, T, H), fp32
 
         W_out = weights["w_lin_out"]
         W_qkvz = weights["w_lin_qkvz"]
@@ -1141,15 +1151,21 @@ class GatedDeltaNetBlock:
         # internal state matches what it computed during fwd. FLA's bwd
         # applies a reverse-cumsum at the end so the returned ``dg`` is
         # in raw pre-cumsum g_input space — i.e. ∂L/∂(g_input).
-        # Force ``.contiguous()`` on every kernel input -- FLA's kernels
-        # use raw pointer arithmetic and silently produce wrong results
-        # on non-contiguous strides.
-        q_b = q_n.unsqueeze(0).contiguous()
-        k_b = k_n.unsqueeze(0).contiguous()
+        # FLA's kernels use hardcoded ``stride=(H*K, 1)`` block-ptr math
+        # (e.g. fla/ops/common/chunk_o.py:86) so token stride MUST equal
+        # H*K. q_n / k_n are scratch contiguous from _fwd_qkv_heads
+        # (stride = H*hk), beta is allocated contiguous, do is from
+        # gated_rmsnorm_bwd (torch.empty_like(o), contiguous). Only v_h
+        # is strided (token stride = conv_dim from the post_conv slice)
+        # so it alone needs .contiguous(). The stride[0]=0 from the
+        # bare ``.unsqueeze(0)`` is benign because FLA's kernels compute
+        # ``bos = i_b*T = 0`` for B=1.
+        q_b = q_n.unsqueeze(0)
+        k_b = k_n.unsqueeze(0)
         v_b = v_h.unsqueeze(0).contiguous()
         beta = b.float().sigmoid().to(dtype)
-        beta_b = beta.unsqueeze(0).contiguous()
-        do_b = do.unsqueeze(0).contiguous()
+        beta_b = beta.unsqueeze(0)
+        do_b = do.unsqueeze(0)
         scale = cfg.head_k_dim ** -0.5
         cu_seqlens = chunk.q_seq_offsets_i64 if chunk is not None else None
         chunk_indices = (
