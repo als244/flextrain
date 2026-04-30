@@ -88,7 +88,24 @@ def main() -> int:
         enc = tok.apply_chat_template(
             msgs, tokenize=True, add_generation_prompt=True,
         )
-        prompt_ids = list(enc["input_ids"]) if isinstance(enc, dict) else list(enc)
+        # Normalize to a flat list of int ids. ``apply_chat_template``
+        # may return:
+        #   * a plain list[int]
+        #   * a 2D list[list[int]] when batched (we passed a single
+        #     conversation but some HF versions still wrap)
+        #   * a BatchEncoding (dict-like with ``input_ids``) which
+        #     iterates over its KEYS, not values — so ``list(enc)``
+        #     gives ['input_ids', 'attention_mask'] (bug bait).
+        if hasattr(enc, "get") and "input_ids" in enc:
+            prompt_ids = enc["input_ids"]
+        else:
+            prompt_ids = enc
+        if hasattr(prompt_ids, "tolist"):
+            prompt_ids = prompt_ids.tolist()
+        # Unwrap a single-conversation batch dim if present.
+        if prompt_ids and isinstance(prompt_ids[0], (list, tuple)):
+            prompt_ids = list(prompt_ids[0])
+        prompt_ids = [int(x) for x in prompt_ids]
 
     if args.max_prompt_tokens is not None and len(prompt_ids) > args.max_prompt_tokens:
         prompt_ids = prompt_ids[: args.max_prompt_tokens]
