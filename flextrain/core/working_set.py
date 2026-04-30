@@ -879,14 +879,39 @@ def determine_working_set_config(
     # the worst-case ``max(home_size_bytes(1) for s in schemas) *
     # n_layers`` — same metric the in-loop host check uses, so the
     # ceiling and the per-option check are consistent.
+    # Per-token amortized bytes (level 0). For schemas with constant-
+    # shape fields (e.g. linear-attn ``lin_final_state`` of shape
+    # ``(HV, K, V)`` independent of token count), evaluating
+    # ``home_size_bytes(num_tokens=1)`` over-counts by treating the
+    # constant 2 MiB as 2 MiB-per-token. Evaluate at a realistic chunk
+    # size and divide so constant-shape fields amortize correctly:
+    # at chunk_size T, total per-chunk bytes = T * per_token_bytes +
+    # constant_bytes, so per-token effective = home_size_bytes(T) / T.
+    #
+    # Use ``max_chunk_size`` if provided, else fall back to 1024 (a
+    # small but non-tiny chunk size). For chunks smaller than the
+    # eval size, the effective per-token cost is higher, but total
+    # round bytes scale proportionally — so the cap is consistent
+    # in either direction.
+    eval_chunk_size_for_bpt = max_chunk_size if max_chunk_size else 1024
     if layer_schemas is not None and len(layer_schemas) > 0:
         min_bpt_per_layer = max(
-            int(s.home_size_bytes(1, model_dims, 0)) for s in layer_schemas
+            int(s.home_size_bytes(eval_chunk_size_for_bpt, model_dims, 0))
+            // eval_chunk_size_for_bpt
+            for s in layer_schemas
         )
         min_act_bpt = num_local_layers * min_bpt_per_layer
     else:
-        min_act_bpt = num_local_layers * min_act_slot_size_bytes(model_dims, 1)
-    full_agg_act_bpt = num_local_layers * full_act_slot_size_bytes(model_dims, 1)
+        min_act_bpt = (
+            num_local_layers
+            * min_act_slot_size_bytes(model_dims, eval_chunk_size_for_bpt)
+            // eval_chunk_size_for_bpt
+        )
+    full_agg_act_bpt = (
+        num_local_layers
+        * full_act_slot_size_bytes(model_dims, eval_chunk_size_for_bpt)
+        // eval_chunk_size_for_bpt
+    )
     full_save_tokens_per_round = remaining_total_mem // full_agg_act_bpt
     min_save_tokens_per_round = remaining_total_mem // min_act_bpt
 

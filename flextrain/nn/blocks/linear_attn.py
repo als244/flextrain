@@ -562,6 +562,43 @@ class GatedDeltaNetBlock:
                 lambda n, d: (n, cfg.num_v_heads),
                 torch.float32, tier=0,
             ),
+            # lin_final_state: per-(layer, chunk) recurrent state at
+            # chunk's END. Used for cross-chunk linear-attn (Item 3c):
+            # chunk N+1's fwd (or chunk N+1's bwd) of the SAME layer
+            # reads slot[L, N].lin_final_state into the engine's global
+            # ``lin_state_window.fwd`` to feed FLA's ``initial_state``.
+            #
+            # Shape: ``(HV, K, V)`` fp32 — a single tensor (not row-
+            # indexed) because ``_pack_sequences`` guarantees that any
+            # chunk participating in a multi-chunk sequence is a
+            # dedicated single-packed-seq chunk
+            # (``flextrain/engine/schedule.py:_emit_large``).
+            #
+            # ``token_axis=None`` because the shape does NOT depend on
+            # ``num_tokens`` — it's a constant per-chunk tensor. The
+            # slot's ``view_for`` correctly skips narrowing for fields
+            # with ``token_axis=None``.
+            #
+            # Tier 0 (always saved): the state is recurrent and not
+            # recomputable from chunk-N inputs alone (would require
+            # re-running fwd of every prior chunk in the seq). Same
+            # logic as why dense ``xk``/``xv`` are tier 0.
+            #
+            # Populated by chunk N's fwd ONLY when chunk N has more
+            # chunks ahead in its sequence. Slots for single-chunk
+            # seqs allocate the field but leave it zero-initialized.
+            #
+            # Field is allocated for all linear-attn schemas
+            # unconditionally (added in Commit C1); the engine wiring
+            # that actually populates and consumes it lands in later
+            # commits (C3/C4/C5). Zero-cost regression-wise: at this
+            # commit nothing reads or writes the field, so single-
+            # chunk parity stays bit-identical.
+            ActivationField(
+                "lin_final_state",
+                lambda n, d: (cfg.num_v_heads, cfg.head_k_dim, cfg.head_v_dim),
+                torch.float32, tier=0, token_axis=None,
+            ),
             # ==================================================
             # Tier 2: FLA scratch + FLA core output. Q/K/V/rstds are
             # NOT saved: bwd already pays a conv recompute (see Stage D2)
