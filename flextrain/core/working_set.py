@@ -490,7 +490,34 @@ def _baseline_gpu_activation_memory(
             + 3 * chunk_size * conv_dim * sz_act     # d_post_conv + d_post_conv_pre_silu + d_conv_in
             + chunk_size * proj_qkvz_dim * sz_act    # d_qkvz
         )
-        lin_attn_bwd_workspace = fla_scratch + own_bwd_scratch
+        # Hopper + Triton>=3.4 workaround for FLA #640: bwd expands
+        # q/k from (T, num_k_heads, K) to (T, num_v_heads, K) before
+        # the FLA call and FLA returns dq/dk at expanded shape too —
+        # 4 expanded tensors live simultaneously in the worst case
+        # (q/k expanded inputs + dq/dk expanded outputs). On
+        # non-Hopper GVA models (most other GPUs) this term is zero.
+        # See ``_hopper_gva_bwd_workaround_pre/_post`` in
+        # flextrain/nn/blocks/linear_attn.py.
+        try:
+            from fla.utils import (
+                IS_NVIDIA_HOPPER as _IS_HOPPER,
+                TRITON_ABOVE_3_4_0 as _TR_GE_3_4,
+            )
+            # Each expanded q or k is (T, num_v_heads, head_k_dim).
+            # Worst case ~4 of these alive (q_b, k_b, dq_n, dk_n).
+            _hopper_expanded_qk = (
+                chunk_size * num_v_heads * head_k_dim * sz_act
+            )
+            _hopper_bwd_extra = (
+                4 * _hopper_expanded_qk
+                if (_IS_HOPPER and _TR_GE_3_4 and num_v_heads != num_k_heads)
+                else 0
+            )
+        except ImportError:
+            _hopper_bwd_extra = 0
+        lin_attn_bwd_workspace = (
+            fla_scratch + own_bwd_scratch + _hopper_bwd_extra
+        )
         # Take ``max`` of fwd vs bwd (only one runs at a time per layer)
         # and ``max`` against the dense full-attn workspace (each layer
         # is either full-attn or linear-attn, not both simultaneously
