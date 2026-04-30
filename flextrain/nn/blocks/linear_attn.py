@@ -88,6 +88,82 @@ except ImportError as e:  # pragma: no cover
     ) from e
 
 
+# ---------------------------------------------------------------------------
+# Hopper + Triton>=3.4 GVA bwd workaround (FLA issue #640).
+# ---------------------------------------------------------------------------
+# Self-contained block: every Hopper-specific GVA workaround lives here so
+# this whole region can be deleted in one diff once FLA upstream fixes #640
+# (or the tilelang backend gains GVA support).
+#
+# Bug: FLA's default Triton ``chunk_bwd_dqkwg`` raises a RuntimeError on
+# Hopper (sm90+) under Triton >= 3.4.0. Tilelang has a working bwd, but
+# its verifier rejects GVA inputs (v.shape[2] != k.shape[2]). For our GVA
+# models we expand q/k pre-bwd so v/k head counts match (tilelang
+# accepts), then sum-reduce dq/dk groups back to per-K-head post-bwd.
+#
+# To revert this whole workaround: delete this block, change the bwd to
+# call ``chunk_gated_delta_rule_bwd(q=q_b, k=k_b, ...)`` directly without
+# the pre/post helpers, and remove the two helper call-sites.
+
+try:
+    from fla.utils import IS_NVIDIA_HOPPER, TRITON_ABOVE_3_4_0
+    _HOPPER_GVA_BWD_BUG = bool(IS_NVIDIA_HOPPER and TRITON_ABOVE_3_4_0)
+except ImportError:  # pragma: no cover - older FLA without these flags
+    _HOPPER_GVA_BWD_BUG = False
+
+if _HOPPER_GVA_BWD_BUG:
+    # Fail fast at import time on Hopper if the workaround dep is missing.
+    try:
+        import tilelang  # noqa: F401
+    except ImportError as _e:  # pragma: no cover - explicit user guidance
+        raise ImportError(
+            "Linear-attention bwd on Hopper (sm90+) with Triton >= 3.4.0 "
+            "hits FLA issue #640 in the default Triton chunk_bwd_dqkwg "
+            "kernel. Workaround requires the ``tilelang`` package — "
+            "install via: ``pip install tilelang``."
+        ) from _e
+
+
+def _hopper_gva_bwd_workaround_pre(
+    q_b: torch.Tensor,           # (1, T, num_k_heads, head_k_dim)
+    k_b: torch.Tensor,           # (1, T, num_k_heads, head_k_dim)
+    cfg: "GatedDeltaNetConfig",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pre-bwd: expand q/k to match v's head count on Hopper. No-op
+    elsewhere. See module-level FLA #640 comment for context."""
+    if not _HOPPER_GVA_BWD_BUG or cfg.num_v_heads == cfg.num_k_heads:
+        return q_b, k_b
+    grp = cfg.num_v_heads // cfg.num_k_heads
+    return (
+        q_b.repeat_interleave(grp, dim=2).contiguous(),
+        k_b.repeat_interleave(grp, dim=2).contiguous(),
+    )
+
+
+def _hopper_gva_bwd_workaround_post(
+    dq_n: torch.Tensor,          # (T, num_v_heads, head_k_dim) on Hopper,
+                                 # (T, num_k_heads, head_k_dim) elsewhere
+    dk_n: torch.Tensor,          # same shape pattern as dq_n
+    cfg: "GatedDeltaNetConfig",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Post-bwd: sum-reduce per-V-head grads back to per-K-head on
+    Hopper. ``view(T, H, grp, K).sum(dim=2)`` is the chain rule for
+    fwd's broadcast over grp v-heads. No-op elsewhere."""
+    if not _HOPPER_GVA_BWD_BUG or cfg.num_v_heads == cfg.num_k_heads:
+        return dq_n, dk_n
+    grp = cfg.num_v_heads // cfg.num_k_heads
+    T = dq_n.shape[0]
+    return (
+        dq_n.view(T, cfg.num_k_heads, grp, cfg.head_k_dim).sum(dim=2),
+        dk_n.view(T, cfg.num_k_heads, grp, cfg.head_k_dim).sum(dim=2),
+    )
+
+
+# ---------------------------------------------------------------------------
+# End of Hopper #640 workaround block.
+# ---------------------------------------------------------------------------
+
+
 def _fla_causal_conv1d_fwd_into(
     x_2d: torch.Tensor,                # (T, D), strided OK (kernel uses strides)
     weight: torch.Tensor,              # (D, W) bf16
@@ -1148,6 +1224,11 @@ class GatedDeltaNetBlock:
         q_b = q_n.unsqueeze(0)
         k_b = k_n.unsqueeze(0)
         v_b = v_h.unsqueeze(0).contiguous()
+        # See _hopper_gva_bwd_workaround_pre / _post helpers near the
+        # top of this module. On non-Hopper or non-GVA configs both are
+        # no-ops; on Hopper+Triton>=3.4 they expand q/k pre-bwd and
+        # reduce dq/dk post-bwd to dance around FLA #640.
+        q_b, k_b = _hopper_gva_bwd_workaround_pre(q_b, k_b, cfg)
         # Cache sig_b in fp32 — needed twice: once cast-to-dtype as
         # beta for FLA bwd, once for sigmoid bwd (db_via_beta below).
         sig_b = b.float().sigmoid()
@@ -1176,11 +1257,13 @@ class GatedDeltaNetBlock:
                 A_log=W_A_log, dt_bias=W_dt_bias,
             )
         )
-        dq_n = dq_n.squeeze(0)                               # (T, n_k_heads, head_k_dim)
+        dq_n = dq_n.squeeze(0)
         dk_n = dk_n.squeeze(0)
         dv_h = dv_h.squeeze(0)                               # (T, n_v_heads, head_v_dim)
         dbeta = dbeta.squeeze(0)                             # (T, n_v_heads)
         dg = dg.squeeze(0)                                   # (T, n_v_heads) — in raw-a space
+        # Reverse the Hopper-only expansion (no-op elsewhere).
+        dq_n, dk_n = _hopper_gva_bwd_workaround_post(dq_n, dk_n, cfg)
         # 3b. Back-propagate through the l2 norm. Our strided-input
         # bwd kernel takes (T, H, D) views directly. dq_n / dk_n come
         # from FLA's bwd via q.new_empty(B, T, H, K) (chunk_o.py:737)
