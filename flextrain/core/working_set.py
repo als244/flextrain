@@ -908,11 +908,26 @@ def determine_working_set_config(
         )
 
     target_tokens_per_round = min(min_save_tokens_per_round, target_tokens_per_round)
-    if target_tokens_per_round < max_seq_len:
+
+    # The round MUST be able to hold the longest single sequence —
+    # otherwise the engine cannot accept a `max_seq_len`-token sample
+    # at all. Memory-side limits (``min_save_tokens_per_round``) are
+    # the only true ceiling; the compute roofline that produces the
+    # initial ``target_tokens_per_round`` is just a heuristic for hiding
+    # transfer behind compute. If memory permits ``max_seq_len`` but
+    # compute heuristic is below it, raise the round to fit the seq.
+    # This matters for:
+    #   - small models with low FLOPs/layer (Llama-3.2-1B, etc.)
+    #   - long-context training where users set max_seq_len = 32k+
+    # If memory genuinely can't fit max_seq_len in min-save mode, that
+    # is a real configuration error and we still raise.
+    if min_save_tokens_per_round < max_seq_len:
         raise ValueError(
             f"Error: Could not find a valid configuration for seq len {max_seq_len}; "
             f"estimated max tokens with min activations to be {min_save_tokens_per_round}"
         )
+    if target_tokens_per_round < max_seq_len:
+        target_tokens_per_round = max_seq_len
 
     target_tokens_per_round = min(max_tokens_per_round, target_tokens_per_round)
     if min_tokens_per_round_limit is not None:

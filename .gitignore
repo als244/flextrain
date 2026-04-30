@@ -1,0 +1,43 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+*.so
+!flextrain/**/*.so
+
+# Editor / IDE
+.vscode/
+.claude/
+
+# Local dev artifacts
+GOOD_MORNING.md
+adaws_research_prototype.pdf
+docs/qwen3_5_status.md
+docs/lora_perf_notes.md
+external_moe_impl/
+
+# Large data + model files: never commit
+models/
+datasets/
+parity_results/
+hf_capture_*.pt
+*.pt.lock
+
+# Test logs (huge bundles)
+tests/multi_chunk_logs/*.pt
+tests/chunk_variance_logs/
+
+# Orig artifacts
+orig/dashboard/
+orig/fineweb
+orig/transmission_scheduler_pkg/build/
+orig/transmission_scheduler_pkg/**/_capi.*.so
+orig/transmission_scheduler_pkg/**/*.bak
+orig/awsm_transformer/ops/**/build/
+orig/awsm_transformer/ops/**/*.so
+orig/awsm_transformer/ops/**/*.egg-info/
+
+# Megatrain workspace
+megatrain/
