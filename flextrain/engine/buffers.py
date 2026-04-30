@@ -146,6 +146,29 @@ def _byte_size_of_tensors(specs: Sequence[TensorSpec], dims: Mapping[str, int],
     return total
 
 
+def _compute_region_bytes(
+    specs: Sequence[TensorSpec], dims: Mapping[str, int],
+) -> tuple[int, int]:
+    """Return ``(trainable_bytes, frozen_bytes)`` for ``compute`` role.
+
+    Used by :class:`BufferManager` to size the GPU param ring as
+    ``max_trainable + max_frozen`` so the two regions sit at fixed,
+    layer-spec-independent offsets within every slot. That lets the
+    optimizer step prefetch only the trainable region
+    (``skip_frozen=True``) without ever touching any layer's frozen
+    bytes — even with a heterogeneous backbone where layer specs
+    disagree on tensor order."""
+    train_total = 0
+    frozen_total = 0
+    for t in specs:
+        nb = t.compute_byte_size(dims)
+        if t.frozen:
+            frozen_total += nb
+        else:
+            train_total += nb
+    return train_total, frozen_total
+
+
 def _grad_key(name: str) -> str:
     """Rename ``w_X -> g_X`` so the dict keys match orig's naming
     convention used by the kernels."""
@@ -218,15 +241,38 @@ def _view_dict_from_spec_in_buffer(
     role: str,
     flat: torch.Tensor,  # uint8, on target device
     offset: int = 0,
+    frozen_region_offset: int | None = None,
 ) -> tuple[dict[str, torch.Tensor], int]:
     """Slice a uint8 ``flat`` buffer into a tensor-per-ParamSpec-entry
     dict. Returns ``(dict, bytes_used)``.
 
-    Used to build the GPU param / grad / opt ring slots out of one
-    contiguous allocation per ring.
+    Layout
+    ------
+    Default (single-region) layout packs all tensors of ``param_spec``
+    sequentially starting at ``offset``. Used by the grad and
+    opt-state rings (which only carry non-frozen tensors anyway).
+
+    Two-region layout (``role="compute"`` with ``frozen_region_offset``
+    set): non-frozen tensors are packed starting at ``offset``;
+    frozen tensors are packed starting at
+    ``offset + frozen_region_offset``. The two regions are sized to
+    ``(max_trainable_bytes, max_frozen_bytes)`` across the backbone
+    (see :func:`_compute_region_bytes`), giving fixed offsets that
+    don't move with layer-spec heterogeneity. That property is what
+    makes optimizer-step prefetches with ``skip_frozen=True`` safe on
+    backbones like Qwen3.5-MoE where full-attn and linear-attn layers
+    have different tensor orders.
+
+    The reported ``bytes_used`` is the highest byte position written —
+    i.e. the slot's total occupied bytes — not the sum of the two
+    regions (which would double-count padding).
     """
     out: dict[str, torch.Tensor] = {}
-    cursor = offset
+    train_cursor = offset
+    frozen_cursor = (
+        offset + frozen_region_offset if frozen_region_offset is not None
+        else offset
+    )
     for t in param_spec.tensors:
         if t.frozen and role in ("grad", "opt_state"):
             continue
@@ -241,6 +287,10 @@ def _view_dict_from_spec_in_buffer(
         for s in shape:
             nelem *= s
         nbytes = nelem * dtype.itemsize
+        use_frozen_region = (
+            t.frozen and frozen_region_offset is not None
+        )
+        cursor = frozen_cursor if use_frozen_region else train_cursor
         if cursor + nbytes > flat.numel():
             raise ValueError(
                 f"ring buffer too small: need {nbytes} at offset {cursor}, "
@@ -252,8 +302,12 @@ def _view_dict_from_spec_in_buffer(
             else t.name
         )
         out[key] = flat[cursor : cursor + nbytes].view(dtype).reshape(shape)
-        cursor += nbytes
-    return out, cursor - offset
+        if use_frozen_region:
+            frozen_cursor += nbytes
+        else:
+            train_cursor += nbytes
+    end = max(train_cursor, frozen_cursor)
+    return out, end - offset
 
 
 @dataclass
@@ -489,10 +543,30 @@ class BufferManager:
                 )
 
         # ---- Size the GPU param / grad rings (max across layer types) ----
-        max_param_bytes = max(
-            _byte_size_of_tensors(ps.tensors, self.dims, "compute")
+        # Param ring uses a TWO-REGION layout: non-frozen tensors at
+        # offsets ``[0..max_train_bytes)``, frozen tensors at
+        # ``[max_train_bytes..max_train_bytes+max_frozen_bytes)``.
+        # Region offsets are spec-independent so prefetching only the
+        # trainable region (``skip_frozen=True``) of layer Y into a slot
+        # that holds layer X's frozen bytes can never write into X's
+        # frozen region — the property that lets the optimizer step
+        # skip frozen H->D transfers on heterogeneous backbones (e.g.
+        # Qwen3.5-MoE: full-attn + linear-attn layers, different
+        # specs). For homogeneous backbones the two-region layout
+        # collapses to the same total size as a single max(layer.bytes)
+        # since per-layer (train+frozen) sums to the total per-layer
+        # bytes; for heterogeneous backbones the slot is at most a
+        # tens-of-MB padding larger than the old sizing.
+        per_layer_region_bytes = [
+            _compute_region_bytes(ps.tensors, self.dims)
             for ps in self.layer_param_specs
-        )
+        ]
+        max_train_bytes = max(t for t, _ in per_layer_region_bytes)
+        max_frozen_bytes = max(f for _, f in per_layer_region_bytes)
+        max_param_bytes = max_train_bytes + max_frozen_bytes
+        self._max_train_bytes = max_train_bytes
+        self._max_frozen_bytes = max_frozen_bytes
+
         max_grad_bytes = max(
             _byte_size_of_tensors(ps.tensors, self.dims, "grad")
             for ps in self.layer_param_specs
@@ -670,11 +744,18 @@ class BufferManager:
     ) -> dict[str, torch.Tensor]:
         """Return the per-name view dict for ring slot ``slot_idx`` at
         the layout implied by ``layer_spec`` (since layers have
-        different layouts in a heterogeneous backbone)."""
+        different layouts in a heterogeneous backbone).
+
+        Two-region slot layout: non-frozen tensors live at offsets
+        ``[0..max_train_bytes)`` (packed in spec order), frozen tensors
+        at ``[max_train_bytes..)``. The frozen region's *base* offset
+        is identical across layer specs; only the per-tensor packing
+        within each region varies."""
         off, _length = self.gpu_param_slot_views[slot_idx]
         views, _ = _view_dict_from_spec_in_buffer(
             layer_spec, self.dims, role="compute",
             flat=self.gpu_param_ring, offset=off,
+            frozen_region_offset=self._max_train_bytes,
         )
         return views
 

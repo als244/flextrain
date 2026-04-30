@@ -580,8 +580,17 @@ class ActiveModel:
                 next_w = k_ind + N_P
                 if next_w < num_layers:
                     next_lid = self.backbone[next_w].layer_id
+                    # ``skip_frozen=True``: the optimizer never reads
+                    # frozen masters (it ``continue``s past them), so
+                    # transferring them here is pure PCIe waste — under
+                    # LoRA on Qwen3.5-MoE-35B that's ~70 GB / step. The
+                    # two-region param-slot layout (BufferManager
+                    # ``_max_train_bytes`` / ``_max_frozen_bytes``)
+                    # guarantees the trainable-region write can't
+                    # corrupt any layer's frozen bytes — safe even on
+                    # heterogeneous backbones.
                     self.buffers.fetch_layer_params(
-                        next_lid, cur_w, non_blocking=True
+                        next_lid, cur_w, non_blocking=True, skip_frozen=True,
                     )
                     self.events.weight_inbound.record_on(
                         next_lid, self.streams.inbound
@@ -622,12 +631,17 @@ class ActiveModel:
 
         # ---- 6. Reload the first N_P layers' weights into slots 0..N_P-1
         #     so next fwd_bwd's weight_inbound waits find them. ----
+        # ``skip_frozen=True``: the trainable-region writes during
+        # steps 1-5 never touched the slots' frozen bytes (two-region
+        # layout). End-of-fwd_bwd left slot ``i`` holding layer ``i``'s
+        # frozen data, which is still intact — only the trainable
+        # region needs refreshing here.
         self.events.weight_inbound.clear()
         with torch.cuda.stream(self.streams.inbound):
             for slot_idx in range(min(N_P, num_layers)):
                 layer_id = self.backbone[slot_idx].layer_id
                 self.buffers.fetch_layer_params(
-                    layer_id, slot_idx, non_blocking=True
+                    layer_id, slot_idx, non_blocking=True, skip_frozen=True,
                 )
                 self.events.weight_inbound.record_on(
                     layer_id, self.streams.inbound
