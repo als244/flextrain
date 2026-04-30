@@ -226,10 +226,22 @@ def _run_training_loop(am, source, *, model_cfg, args, output_dir: str, save_arc
             torch.cuda.nvtx.range_push(f"step {step}")
 
         step_tokens = sum(len(s) for s in seqs)
+        # ``active_step_tokens`` = tokens that contribute to the loss
+        # (positions where ``targets != -100``). Cached on each
+        # Sequence at construction (``Sequence.active_token_count``)
+        # so this is just an integer sum, no host sync. Used both as
+        # the ``loss_scale_factor`` denominator (so head's wgrad-addmm
+        # alpha gives "sum ≡ mean" grads over active tokens — matches
+        # HF / PyTorch ``CrossEntropyLoss(ignore_index=-100)``) and
+        # for the per-step mean-loss reporting below.
+        active_step_tokens = sum(
+            getattr(s, "active_token_count", len(s)) for s in seqs
+        )
+        active_step_tokens = max(1, active_step_tokens)
         step_start = time.time()
         stats = am.fwd_bwd(
             seqs,
-            loss_scale_factor=1.0 / step_tokens,
+            loss_scale_factor=1.0 / active_step_tokens,
             total_tokens_per_step=step_tokens,
         )
         am.step()
@@ -250,7 +262,12 @@ def _run_training_loop(am, source, *, model_cfg, args, output_dir: str, save_arc
         total_effective_flops += effective_flops
         total_hardware_flops += hardware_flops
 
-        avg_loss = stats.total_loss / stats.total_tokens
+        # Mean loss over active (loss-bearing) tokens. ``stats.total_tokens``
+        # is raw tokens-processed (engine convention; includes prompt
+        # positions whose per-token-loss is 0 by ``targets == -100``).
+        # Dividing by raw count would dilute the mean by the prompt
+        # fraction; use ``active_step_tokens`` instead.
+        avg_loss = stats.total_loss / active_step_tokens
         smoothed_loss = (
             avg_loss if smoothed_loss is None
             else smooth_decay * smoothed_loss + (1 - smooth_decay) * avg_loss

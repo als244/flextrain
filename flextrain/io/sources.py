@@ -431,15 +431,24 @@ class JsonSFTTokenSource:
             return None
         tokens = torch.tensor(token_ids, dtype=torch.int64)
         targets = torch.roll(tokens, -1)
-        loss_mask = torch.ones(len(tokens), dtype=torch.bool)
-        loss_mask[: len(prompt_ids)] = False
-        loss_mask[-1] = False
-        if not bool(loss_mask.any().item()):
+        # Mask via -100 (HF/PyTorch CrossEntropyLoss(ignore_index=-100)
+        # convention). The loss kernel already zeros dZ + per-token-loss
+        # for ``labels == -100``, so we don't need a separate loss_mask.
+        # Excluded positions:
+        #   * positions 0..plen-2: target is also a prompt token (no
+        #     training signal). Position plen-1's target IS the first
+        #     response token, so it stays. This matches axolotl /
+        #     llama-recipes / HF PEFT convention.
+        #   * last position: its target is ``tokens[0]`` from the roll
+        #     (garbage), no real successor to predict.
+        if len(prompt_ids) > 0:
+            targets[: len(prompt_ids) - 1] = -100
+        targets[-1] = -100
+        if not bool((targets != -100).any().item()):
             return None
         return Sequence(
             tokens=tokens,
             targets=targets,
-            loss_mask=loss_mask,
             seq_id=seq_id,
         )
 

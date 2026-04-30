@@ -145,6 +145,8 @@ class TrainingChunk:
     label_ids
         Int64 on the compute device, shape ``(total_q,)``; may be
         ``None`` for inference-only rounds (future extension).
+        Positions where ``label_ids == -100`` are excluded from
+        the loss + gradient (PyTorch / HF ``ignore_index`` convention).
     seqs
         :class:`ChunkSeqRef` for each contributing sequence.
     """

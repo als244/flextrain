@@ -69,6 +69,15 @@ class Sequence:
         self.advantages = advantages
         self.ref_logprobs = ref_logprobs
         self.loss_function = loss_function
+        # ``active_token_count`` = number of positions that contribute
+        # to the loss = positions where ``targets != -100``. Cached
+        # once at construction (host-side, free for callers to access).
+        # Callers building a step's batch pass
+        # ``loss_scale_factor = 1.0 / sum(s.active_token_count for s
+        # in seqs)`` to the engine so dZ is scaled to the
+        # ``mean-over-active-tokens`` convention (matches HF /
+        # PyTorch ``CrossEntropyLoss(ignore_index=-100)``).
+        self.active_token_count = int((self.targets != -100).sum().item())
         try:
             self.per_token_loss = torch.zeros(
                 len(tokens), dtype=torch.float32,

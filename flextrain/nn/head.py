@@ -331,6 +331,22 @@ class LMHead:
 
             offset += t_prime
 
+        # ``token_count`` = raw token count for this chunk (NOT
+        # the active count, since deriving "active" from labels in
+        # the bwd path requires a host-sync ``.sum().item()`` per
+        # chunk we'd rather avoid). The engine sums ``token_count``
+        # across all chunks into ``StepStats.total_tokens``, which
+        # callers interpret as raw tokens-processed. To get a
+        # ``mean-over-active-tokens`` loss, the caller pre-computes
+        # ``active_step_tokens = sum(s.active_token_count for s in
+        # seqs)`` (cached on Sequence at build time, free) and:
+        #   * passes ``loss_scale_factor = 1.0 / active_step_tokens``
+        #     to ``fwd_bwd`` so the head's wgrad-addmm alpha
+        #     produces "sum ≡ mean" gradients over active tokens, AND
+        #   * reports ``mean_loss = stats.total_loss / active_step_tokens``
+        #     (NOT ``stats.total_loss / stats.total_tokens``, which
+        #     would dilute the mean across prompt positions whose
+        #     per-token-loss is 0 by the ``label == -100`` mask).
         stats = LossStats(
             per_token_loss=per_token_loss,
             next_prediction=next_prediction if any_next_prediction else per_token_loss.new_empty(0, dtype=torch.int64),
