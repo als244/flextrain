@@ -105,38 +105,48 @@ def _arch_module_for(hf_config: dict[str, Any]):
     return importlib.import_module(f"flextrain.io.arch.{mod_name}")
 
 
-def _get_model_flops_per_token(model_cfg, seq_len: int, *, using_lora: bool = False) -> int:
-    d_model = model_cfg.d_model
-    n_heads = model_cfg.n_heads
-    head_dim = model_cfg.head_dim
-    n_kv_heads = model_cfg.n_kv_heads
-    expert_dim = model_cfg.expert_dim
-    vocab = model_cfg.vocab_size
-    n_layers = model_cfg.n_layers
-    top_k = getattr(model_cfg, "top_k", 0)
-    num_shared = getattr(model_cfg, "num_shared_experts", 0)
-    is_causal = getattr(model_cfg, "is_causal", True)
-    matmul_factor = 4 if using_lora else 6
+def _step_flops_breakdown(
+    am, stats, *, mode: str,
+) -> tuple[int, int]:
+    """Return ``(effective_flops, hardware_flops)`` for one optimization step.
 
-    ctx_dim = n_kv_heads * head_dim
-    attn_dim = n_heads * head_dim
-    # MoE is gated on top_k > 0 (number of routed experts per token). The
-    # arch registry sets num_shared_experts=1 for plain dense MLPs — that
-    # is one shared MLP, not a shared expert that stacks on top of routed
-    # ones. Conflating the two double-counts the dense MLP FLOPs.
-    is_moe = top_k > 0
-    mlp_experts = num_shared + top_k if is_moe else 1
-    active_params_per_layer = (
-        2 * d_model * attn_dim
-        + 2 * d_model * ctx_dim
-        + 3 * mlp_experts * d_model * expert_dim
+    * Effective: useful work = fwd + bwd-grads + opt-step. What the
+      *model* needed; ignores compute spent on activation recompute.
+    * Hardware: effective + recompute. What the *GPU* actually
+      executed; this is the number to compare against device peak.
+
+    The engine fills ``stats.fwd_flops`` and ``stats.recompute_flops``
+    via :func:`flextrain.core.flop_accounting.round_compute_flops`,
+    which walks the save-level plan. We add the bwd-grad multiplier
+    (mode-dependent) and per-step optimizer cost here so the engine
+    stays mode-agnostic.
+
+    Mode handling for bwd:
+      * ``full``: every fwd matmul has both dgrad and wgrad in bwd
+        (~2× fwd). Head is unfrozen → also pays full bwd (~2× fwd).
+      * ``lora``: backbone base weights are frozen — only dgrads run,
+        plus tiny rank-r LoRA wgrads we ignore (~1× fwd). The LM head
+        is also frozen under LoRA (see api.py:311-324) so head bwd is
+        dgrad-only too (~1× fwd matmul cost).
+    Hence the same ``bwd_grad_factor`` (2 or 1) applies to both
+    backbone and head.
+    """
+    from flextrain.core.flop_accounting import opt_flops_per_step
+    bwd_grad_factor = 2 if mode == "full" else 1
+    # Head fwd FLOPs per token: (d_model, vocab) matmul ≈ 2·d·V.
+    # ``stats.fwd_flops`` integrates the backbone over all chunks but
+    # excludes the head — add it here.
+    head_fwd_per_token = 2 * am.dims["d_model"] * am.dims["vocab_size"]
+    head_total_flops = (
+        (1 + bwd_grad_factor) * head_fwd_per_token * stats.total_tokens
     )
-    matmul_flops_per_layer = matmul_factor * seq_len * active_params_per_layer
-    attn_factor = 0.5 if is_causal else 1.0
-    attn_flops_per_layer = 12 * attn_factor * seq_len * seq_len * attn_dim
-    backbone_flops = n_layers * (matmul_flops_per_layer + attn_flops_per_layer)
-    head_flops = matmul_factor * seq_len * d_model * vocab
-    return backbone_flops + head_flops
+    bwd_grad_flops = bwd_grad_factor * stats.fwd_flops
+    opt_flops = opt_flops_per_step(am)
+    effective = (
+        stats.fwd_flops + bwd_grad_flops + head_total_flops + opt_flops
+    )
+    hardware = effective + stats.recompute_flops
+    return effective, hardware
 
 
 def _lr_schedule(
@@ -189,7 +199,8 @@ def _run_training_loop(am, source, *, model_cfg, args, output_dir: str, save_arc
     smoothed_loss = None
     smooth_decay = 0.95
     total_tokens_processed = 0
-    total_flops_processed = 0
+    total_effective_flops = 0
+    total_hardware_flops = 0
     for step in range(1, total_steps + 1):
         lr = _lr_schedule(
             step, max_lr=max_lr, final_lr=final_lr,
@@ -232,16 +243,12 @@ def _run_training_loop(am, source, *, model_cfg, args, output_dir: str, save_arc
             profiler_running = False
             print(f"[profile] cudaProfilerStop after step {step}", flush=True)
 
-        step_flops = sum(
-            _get_model_flops_per_token(
-                model_cfg,
-                len(s),
-                using_lora=(args.mode == "lora"),
-            )
-            for s in seqs
+        effective_flops, hardware_flops = _step_flops_breakdown(
+            am, stats, mode=args.mode,
         )
         total_tokens_processed += step_tokens
-        total_flops_processed += step_flops
+        total_effective_flops += effective_flops
+        total_hardware_flops += hardware_flops
 
         avg_loss = stats.total_loss / stats.total_tokens
         smoothed_loss = (
@@ -249,7 +256,8 @@ def _run_training_loop(am, source, *, model_cfg, args, output_dir: str, save_arc
             else smooth_decay * smoothed_loss + (1 - smooth_decay) * avg_loss
         )
         tokens_per_sec = step_tokens / step_time
-        tflops_per_sec = (step_flops / step_time) / 1e12
+        eff_tflops = (effective_flops / step_time) / 1e12
+        hw_tflops = (hardware_flops / step_time) / 1e12
         max_alloc = torch.cuda.max_memory_allocated() / (1 << 30)
         max_reserve = torch.cuda.max_memory_reserved() / (1 << 30)
 
@@ -259,7 +267,8 @@ def _run_training_loop(am, source, *, model_cfg, args, output_dir: str, save_arc
             f"smoothed={smoothed_loss:.4f}  "
             f"tok/step={step_tokens}  "
             f"tok/s={tokens_per_sec:,.0f}  "
-            f"TFLOPS={tflops_per_sec:.2f}  "
+            f"TFLOPS_eff={eff_tflops:.2f}  "
+            f"TFLOPS_hw={hw_tflops:.2f}  "
             f"max_alloc={max_alloc:.1f}GiB  "
             f"max_reserve={max_reserve:.1f}GiB  "
             f"step={step_time*1000:.0f}ms  "
@@ -276,14 +285,22 @@ def _run_training_loop(am, source, *, model_cfg, args, output_dir: str, save_arc
 
     total_time = time.time() - train_start
     overall_tok_per_s = total_tokens_processed / total_time if total_time > 0 else 0
-    overall_tflops = (total_flops_processed / total_time) / 1e12 if total_time > 0 else 0
+    overall_eff_tflops = (
+        (total_effective_flops / total_time) / 1e12 if total_time > 0 else 0
+    )
+    overall_hw_tflops = (
+        (total_hardware_flops / total_time) / 1e12 if total_time > 0 else 0
+    )
     print(
         f"\nTraining complete.\n"
-        f"  total time:          {total_time / 60:.1f} min\n"
-        f"  total tokens:        {total_tokens_processed / 1e6:.2f} M\n"
-        f"  overall tok/s:       {overall_tok_per_s:,.0f}\n"
-        f"  overall TFLOPS:      {overall_tflops:.2f}\n"
-        f"  max alloc / reserve: "
+        f"  total time:           {total_time / 60:.1f} min\n"
+        f"  total tokens:         {total_tokens_processed / 1e6:.2f} M\n"
+        f"  overall tok/s:        {overall_tok_per_s:,.0f}\n"
+        f"  overall Eff TFLOPS:   {overall_eff_tflops:.2f}  "
+        f"(useful work / wall — model-progress metric)\n"
+        f"  overall HW TFLOPS:    {overall_hw_tflops:.2f}  "
+        f"(eff + recompute / wall — GPU-utilization metric)\n"
+        f"  max alloc / reserve:  "
         f"{torch.cuda.max_memory_allocated() / (1 << 30):.2f}GiB / "
         f"{torch.cuda.max_memory_reserved() / (1 << 30):.2f}GiB"
     )

@@ -65,6 +65,10 @@ from flextrain.core.activation_schema import (
     send_home,
     fetch_home,
 )
+from flextrain.core.flop_accounting import (
+    flash_attn_recompute_flops,
+    round_compute_flops,
+)
 from flextrain.core.working_set import WorkingSetConfig
 from flextrain.nn.loss import CrossEntropyLoss, LossFn, TokenContext
 from flextrain.optim.base import Optimizer
@@ -101,11 +105,24 @@ class StepStats:
     rounds
         Number of gradient-accumulation rounds the input was split
         into.
+    fwd_flops
+        Sum over (layer, chunk) of ``compute_cost.total_fwd_flops``
+        across every round. The "useful" forward FLOPs.
+    recompute_flops
+        Sum over (layer, chunk) of the per-tier recompute FLOPs the
+        plan implies — i.e. ``total_fwd_flops - avoided[tier]`` at
+        the chosen save tier. The *extra* compute the GPU spent in
+        bwd to recreate activations not saved at fwd. The two values
+        are reported separately so the caller can derive both
+        Effective TFLOPS (useful work / time) and Hardware TFLOPS
+        (effective + recompute / time).
     """
 
     total_tokens: int
     total_loss: float
     rounds: int
+    fwd_flops: int = 0
+    recompute_flops: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -306,6 +323,8 @@ class ActiveModel:
 
         total_loss = 0.0
         total_tokens = 0
+        total_fwd_flops = 0
+        total_recompute_flops = 0
 
         torch.cuda.nvtx.range_push("Fwd+Bwd")
         for round_idx, round_seqs in enumerate(rounds):
@@ -329,6 +348,25 @@ class ActiveModel:
             plan = self._plan_save_levels(prepared)
             if verbose:
                 self._log_round(round_idx, len(rounds), prepared, plan)
+            # Per-round FLOP breakdown (cheap; pure CPU sums over the
+            # blocks' compute_cost). Accumulated into StepStats so the
+            # train loop can surface Effective vs Hardware TFLOPS.
+            # NB: this is reporting-only — the DP solver above used the
+            # same per-block compute_costs but with its own time-side
+            # cost model. None of the numbers here feed back into
+            # planning.
+            round_fwd, round_recompute = round_compute_flops(
+                self.backbone, prepared.chunks, plan,
+            )
+            total_fwd_flops += round_fwd
+            total_recompute_flops += round_recompute
+            # Hardware-only correction: flash-attn bwd always recomputes
+            # ~half the fwd attention FLOPs, regardless of save tier.
+            # This contributes to Hardware TFLOPS but not Effective —
+            # see flop_accounting.flash_attn_recompute_flops.
+            total_recompute_flops += flash_attn_recompute_flops(
+                self.backbone, prepared.chunks,
+            )
             torch.cuda.nvtx.range_pop()
 
             # Sync at top of round so last round's tail DMAs are done
@@ -377,6 +415,8 @@ class ActiveModel:
             total_tokens=total_tokens,
             total_loss=total_loss,
             rounds=len(rounds),
+            fwd_flops=total_fwd_flops,
+            recompute_flops=total_recompute_flops,
         )
 
     def step(self, step_num: int | None = None) -> int:
