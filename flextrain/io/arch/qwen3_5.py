@@ -16,11 +16,13 @@ Each layer's ``layer_types[i]`` is either ``"linear_attention"`` or
 Linear-attn layers add (under ``linear_attn.*``):
 
 * ``in_proj_qkv``: (key_dim*2 + value_dim, hidden) — flat ``[q | k | v]``
-  along output. We bundle it with ``in_proj_z`` into FT's
-  ``w_lin_qkvz`` (per-K-head interleaved ``[q_h, k_h, v_grp, z_grp]``).
+  along output. Bundled with ``in_proj_z`` at load time into FT's
+  ``w_lin_qkvz``: block-major ``[Q | K | V | Z]`` along the column axis
+  (matches the MoE arch's loader, consumed zero-copy by
+  ``linear_attn._split_qkvz_ft``).
 * ``in_proj_z``: (value_dim, hidden) — flat ``z`` along output.
 * ``in_proj_b``: (num_v_heads, hidden) and ``in_proj_a`` similarly.
-  Bundled into FT's ``w_lin_ba``.
+  Bundled into FT's ``w_lin_ba`` as block-major ``[B | A]``.
 * ``conv1d``, ``dt_bias``, ``A_log``, ``norm.weight`` (1D, no bundling).
 * ``out_proj``: (hidden, value_dim).
 
@@ -123,8 +125,9 @@ def _qwen3_5_post_load_hook(
        shift every loaded RMSNorm γ by +1 at load time.
     2. **Linear-attn projection bundling**: HF stores split
        ``in_proj_qkv`` + ``in_proj_z`` + ``in_proj_b`` + ``in_proj_a``;
-       FT consumes them bundled as ``w_lin_qkvz`` (per-K-head
-       interleaved [q, k, v, z]) + ``w_lin_ba`` (per-K-head [b, a]).
+       FT consumes them bundled as ``w_lin_qkvz`` and ``w_lin_ba`` in
+       block-major column layout (matches the MoE arch loader; see
+       :func:`flextrain.nn.blocks.linear_attn.build_qkvz_perm`).
 
     HF layout (text-only, ignoring batch):
       in_proj_qkv : (out=key_dim*2 + value_dim, in=hidden)  flat [q | k | v]
@@ -133,15 +136,10 @@ def _qwen3_5_post_load_hook(
       in_proj_a   : (out=num_v_heads,           in=hidden)
 
     FT layout (after transpose to (in, out)):
-      w_lin_qkvz : (hidden, proj_qkvz_dim) interleaved per-K-head:
-                   [q_h0(hk), k_h0(hk), v_grp_h0(grp*hv), z_grp_h0(grp*hv),
-                    q_h1(hk), k_h1(hk), ...]
-        where grp = num_v_heads // num_k_heads.
-      w_lin_ba   : (hidden, 2*num_v_heads) interleaved per-K-head:
-                   [b_grp_h0(grp), a_grp_h0(grp), b_grp_h1(grp), ...]
-
-    For Qwen3.5-2B specifically: H=HV=16, hk=hv=128, grp=1, so each
-    head's qkvz tile is 4*128 = 512 wide and the ba tile is 2 wide.
+      w_lin_qkvz : (hidden, 2*key_dim + 2*value_dim) — block-major
+                   ``[Q | K | V | Z]`` along the column axis; each
+                   block laid out as (head, dim) row-major.
+      w_lin_ba   : (hidden, 2*num_v_heads) — block-major ``[B | A]``.
     """
     # ----- (1) RMSNorm γ shift: HF's ``Qwen3_5RMSNorm.forward`` does
     # ``output * (1 + weight)`` (so weights are stored as γ - 1).
@@ -229,49 +227,41 @@ def _qwen3_5_post_load_hook(
         assert key_dim_x2 % 2 == 0
         key_dim = key_dim_x2 // 2
 
-        # Per-K-head arithmetic, using cfg-supplied num_k / num_v.
-        # FT's _split_qkvz does qkvz.view(T, num_k_heads, 2*hk + 2*grp*hv)
-        # with grp = num_v / num_k. The 2B has grp=1; the 9B has grp=2.
         assert cfg_num_v == num_v, (
             f"qwen3_5 loader: ba shape implies num_v={num_v} but "
             f"config says linear_num_value_heads={cfg_num_v}"
         )
-        num_k = cfg_num_k
-        assert num_v % num_k == 0, (
+        assert num_v % cfg_num_k == 0, (
             f"linear_num_value_heads ({num_v}) must be divisible by "
-            f"linear_num_key_heads ({num_k})"
+            f"linear_num_key_heads ({cfg_num_k})"
         )
-        grp = num_v // num_k
-        hk = key_dim // num_k
-        hv = value_dim // num_v
-        head_block = 2 * hk + 2 * grp * hv  # per-K-head qkvz width
-        assert num_k * head_block == proj_qkvz_dim, (
-            f"qkvz bundling mismatch: num_k={num_k}, head_block="
-            f"{head_block}, expected {proj_qkvz_dim}, got "
-            f"{num_k*head_block}"
+        assert 2 * key_dim + 2 * value_dim == proj_qkvz_dim, (
+            f"qkvz bundling mismatch: key_dim={key_dim}, "
+            f"value_dim={value_dim}, expected proj_qkvz_dim="
+            f"{2 * key_dim + 2 * value_dim}, got {proj_qkvz_dim}"
         )
 
-        # Build the bundled HF-side qkvz with per-K-head interleaving.
-        # Reshape each piece to (num_k, per_head_dim, hidden):
-        q_view = hf_qkv[:key_dim, :].reshape(num_k, hk, hidden)
-        k_view = hf_qkv[key_dim:2*key_dim, :].reshape(num_k, hk, hidden)
-        v_view = hf_qkv[2*key_dim:, :].reshape(num_k, grp * hv, hidden)
-        z_view = hf_z.reshape(num_k, grp * hv, hidden)
-        # Concat along the per-head axis: (num_k, head_block, hidden).
-        bundled = torch.cat([q_view, k_view, v_view, z_view], dim=1)
-        # Flatten to (num_k * head_block, hidden) = (proj_qkvz_dim, hidden),
-        # then transpose to FT's (hidden, proj_qkvz_dim) layout.
-        bundled = bundled.reshape(num_k * head_block, hidden).T.contiguous()
+        # FT block-major column layout: ``[Q | K | V | Z]`` over the
+        # column axis; each block laid out as (head, dim) row-major.
+        # Matches the layout produced by the MoE arch loader and
+        # consumed by ``linear_attn._split_qkvz_ft``. See
+        # :func:`flextrain.nn.blocks.linear_attn.build_qkvz_perm`.
+        # HF input shapes are (out, in); we transpose to (in, out) at
+        # the end. ``hf_qkv`` is the fused [Q-block | K-block | V-block]
+        # along its first axis already.
+        q_block = hf_qkv[:key_dim, :]                           # (key_dim, hidden)
+        k_block = hf_qkv[key_dim:2*key_dim, :]                  # (key_dim, hidden)
+        v_block = hf_qkv[2*key_dim:, :]                         # (value_dim, hidden)
+        z_block = hf_z                                          # (value_dim, hidden)
+        bundled = torch.cat([q_block, k_block, v_block, z_block], dim=0)
+        bundled = bundled.T.contiguous()                        # (hidden, proj_qkvz_dim)
         ft_qkvz.copy_(bundled.to(ft_dtype))
 
-        # Same dance for ba: HF stores b_flat (num_v, hidden) and
-        # a_flat (num_v, hidden). FT's _split_ba does
-        # ba.view(T, num_k, 2*grp) → split [grp, grp]. So per-K-head
-        # block is [b_grp(grp), a_grp(grp)] with grp = num_v/num_k.
-        b_view = hf_b.reshape(num_k, grp, hidden)
-        a_view = hf_a.reshape(num_k, grp, hidden)
-        bundled_ba = torch.cat([b_view, a_view], dim=1)  # (num_k, 2*grp, hidden)
-        bundled_ba = bundled_ba.reshape(num_k * 2 * grp, hidden).T.contiguous()
+        # FT ba layout: ``[B | A]`` along columns (no per-K-head
+        # structure). HF stores in_proj_b / in_proj_a as separate
+        # (num_v, hidden) tensors.
+        bundled_ba = torch.cat([hf_b, hf_a], dim=0)             # (2*num_v, hidden)
+        bundled_ba = bundled_ba.T.contiguous()                  # (hidden, proj_ba_dim)
         ft_ba.copy_(bundled_ba.to(ft_dtype))
 
 
