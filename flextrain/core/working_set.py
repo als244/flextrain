@@ -409,20 +409,14 @@ def _baseline_gpu_activation_memory(
         chunk_size * (4 * n_h * hd + 4 * n_kv * hd) * sz_act
     )
 
-    # Per-chunk linear-attention bwd workspace (Qwen3-Next / Qwen3.5* /
-    # Qwen3.6* hybrid layers). Not all archs have linear-attn layers,
-    # but when they do they allocate substantial transient buffers in
-    # ``GatedDeltaNetBlock.bwd`` that the dense-transformer accounting
-    # above doesn't capture:
-    #   * ``d_post_conv`` (cat of dq/dk/dv pre):   T * conv_dim * 2
-    #   * ``d_conv_in`` (conv1d input grad):       T * conv_dim * 2
-    #     (this lives in FLA's causal_conv1d_bwd output buffer; counted
-    #     in fla_conv_scratch below.)
-    #   * ``d_qkvz`` (cat output for proj wgrad):  T * proj_qkvz_dim * 2
-    #   * FLA bwd internal scratch (rough bound).
-    # The old ``q_n``/``k_n`` fp32 promotion (2 * T * key_dim * 4
-    # bytes) is gone — q_n/k_n are now saved post-l2norm in the slot
-    # (lin_q/lin_k tier-2) and read directly in bwd; no recompute.
+    # Per-chunk linear-attention scratch workspace (Qwen3-Next /
+    # Qwen3.5* / Qwen3.6* hybrid layers). Not all archs have linear-attn
+    # layers; when they do, GatedDeltaNetBlock.fwd / .bwd allocate
+    # substantial transient buffers in addition to the saved slot
+    # fields. Stages D2 + D2.5 moved many former slot fields into
+    # scratch (post_conv, post_conv_pre_silu, q_n/k_n, q_rstd/k_rstd,
+    # o_normed). Stage D5 dropped lin_g; the only remaining gate
+    # scratch is post-cumsum g_post (which is a slot field, not scratch).
     # We size for the worst case: every in-flight chunk could be on a
     # linear-attn layer simultaneously. ``conv_dim = 2*key_dim + value_dim``
     # and ``proj_qkvz_dim = 2*key_dim + 2*value_dim``.
@@ -443,7 +437,6 @@ def _baseline_gpu_activation_memory(
         value_dim = num_v_heads * head_v_dim
         conv_dim = 2 * key_dim + value_dim
         proj_qkvz_dim = 2 * key_dim + 2 * value_dim
-        fp32 = torch.float32.itemsize
         # FLA's chunk_gated_delta_rule_fwd / _bwd allocates substantial
         # internal scratch tensors (see fla/ops/common/chunk_delta_h.py
         # and chunk_o.py). The dominant ones are per-FLA-chunk state
@@ -464,17 +457,40 @@ def _baseline_gpu_activation_memory(
         # similar). ~6 of these are live simultaneously in bwd.
         per_token_scratch = chunk_size * value_dim * sz_act
         fla_scratch = 4 * per_state + 6 * per_token_scratch
-        lin_attn_fwd_workspace = (
-            fla_scratch                                # FLA fwd internals
-            + chunk_size * value_dim * sz_act          # FLA core_out
+        # Our own scratch in GatedDeltaNetBlock.fwd (post-D5):
+        #   post_conv (silu output, scratch since D2)         T*conv_dim*sz
+        #   q_n, k_n (post-l2norm, scratch since D2.5)        2*T*key_dim*sz
+        #   q_rstd, k_rstd (fp32)                             ~ negligible
+        #   beta (sigmoid(b))                                 T*HV*sz (tiny)
+        #   o_normed (gated_rmsnorm fwd, scratch)             T*value_dim*sz
+        own_fwd_scratch = (
+            chunk_size * conv_dim * sz_act           # post_conv
+            + 2 * chunk_size * key_dim * sz_act      # q_n + k_n
+            + chunk_size * value_dim * sz_act        # o_normed
         )
-        lin_attn_bwd_workspace = (
-            chunk_size * conv_dim * sz_act             # d_post_conv (pre-silu-bwd cat)
-            + chunk_size * conv_dim * sz_act           # d_post_conv_pre_silu (silu_bwd output)
-            + chunk_size * conv_dim * sz_act           # FLA conv1d_bwd dx output
-            + chunk_size * proj_qkvz_dim * sz_act      # d_qkvz (pre-projection-wgrad cat)
-            + fla_scratch                              # FLA gated-delta-rule bwd internals
+        lin_attn_fwd_workspace = fla_scratch + own_fwd_scratch
+        # Bwd scratch in GatedDeltaNetBlock.bwd (post-D5):
+        #   post_conv_pre_silu (D2: conv-no-act recompute)     T*conv_dim*sz
+        #   post_conv (D2.5: silu(pre_silu))                   T*conv_dim*sz
+        #   q_n, k_n, q_rstd, k_rstd (D2.5: qkv_heads recompute) 2*T*key_dim*sz
+        #   o_normed (gated_rmsnorm fwd recompute)             T*value_dim*sz
+        #   do, dz, do_normed_2d (gated_rmsnorm_bwd outputs)  ~3*T*value_dim*sz
+        #   dq_h, dk_h (l2norm bwd outputs)                    2*T*key_dim*sz
+        #   d_post_conv (cat dq/dk/dv pre-silu)                T*conv_dim*sz
+        #   d_post_conv_pre_silu (silu_bwd output)             T*conv_dim*sz
+        #   d_conv_in (FLA causal_conv1d_bwd dx output)        T*conv_dim*sz
+        #   d_qkvz_2d (cat for proj wgrad)                     T*proj_qkvz_dim*sz
+        #   d_ba_2d                                             T*2*HV*sz (tiny)
+        own_bwd_scratch = (
+            2 * chunk_size * conv_dim * sz_act       # post_conv_pre_silu + post_conv
+            + 2 * chunk_size * key_dim * sz_act      # q_n + k_n
+            + chunk_size * value_dim * sz_act        # o_normed
+            + 3 * chunk_size * value_dim * sz_act    # do/dz/do_normed_2d
+            + 2 * chunk_size * key_dim * sz_act      # dq_h + dk_h
+            + 3 * chunk_size * conv_dim * sz_act     # d_post_conv + d_post_conv_pre_silu + d_conv_in
+            + chunk_size * proj_qkvz_dim * sz_act    # d_qkvz
         )
+        lin_attn_bwd_workspace = fla_scratch + own_bwd_scratch
         # Take ``max`` of fwd vs bwd (only one runs at a time per layer)
         # and ``max`` against the dense full-attn workspace (each layer
         # is either full-attn or linear-attn, not both simultaneously
