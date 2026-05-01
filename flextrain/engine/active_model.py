@@ -50,7 +50,6 @@ from flextrain.core.layer import (
     Layer,
     LayerContext,
     LossStats,
-    MoEChunkConfig,
     OutputLayer,
 )
 from flextrain.core.save_level import (
@@ -341,8 +340,6 @@ class ActiveModel:
                 device=self.device,
                 policy=self.chunk_policy,
             )
-            # Allocate per-chunk MoE scratch (no-op if no MoE layers).
-            self._allocate_moe_chunk_scratch(prepared)
             # Clear per-round event state so stale events from prior
             # rounds don't confuse the waits.
             self.events.clear_per_round()
@@ -964,50 +961,6 @@ class ActiveModel:
 
         return plan
 
-    def _allocate_moe_chunk_scratch(
-        self, prepared: PreparedRound
-    ) -> None:
-        """Allocate per-chunk MoE scratch tensors and stash them in each
-        ``chunk.meta.extra``. No-op if no backbone layer has a
-        ``moe_chunk_config`` attribute set.
-
-        Two tensors per (MoE-layer, chunk) pair:
-
-        * ``token_index_mapping``: ``(total_q, top_k)`` int32 on device.
-          Written by ``flextrain_moe_sort`` during fwd, read by
-          ``flextrain_moe_scatter`` / ``flextrain_moe_router_gate_bwd`` during bwd.
-        * ``expert_counts_host``: ``(num_experts,)`` int32 pinned CPU.
-          Written by ``flextrain_copy_expert_counts`` during fwd (via a
-          kernel that writes directly into mapped host memory), read
-          by the expert-loop dispatch at fwd AND bwd.
-
-        Mirrors ``orig/active_model.py::make_chunk_metadata``
-        (line 1246-1254).
-        """
-        # Fast path: no MoE layers anywhere in the backbone.
-        moe_layers: list[tuple[int, MoEChunkConfig]] = []
-        for layer in self.backbone:
-            mc = getattr(layer, "moe_chunk_config", None)
-            if mc is not None:
-                moe_layers.append((layer.layer_id, mc))
-        if not moe_layers:
-            return
-
-        for chunk in prepared.chunks:
-            token_index_mapping: dict[int, torch.Tensor] = {}
-            expert_counts_host: dict[int, torch.Tensor] = {}
-            total_q = chunk.meta.total_q
-            for lid, mc in moe_layers:
-                token_index_mapping[lid] = torch.zeros(
-                    total_q, mc.top_k,
-                    dtype=torch.int32, device=self.device,
-                )
-                expert_counts_host[lid] = torch.zeros(
-                    mc.num_experts,
-                    dtype=torch.int32, device="cpu", pin_memory=True,
-                )
-            chunk.meta.extra["moe_token_index_mapping"] = token_index_mapping
-            chunk.meta.extra["moe_expert_counts_host"] = expert_counts_host
 
     def _setup_round(
         self, prepared: PreparedRound, plan: SaveLevelPlan

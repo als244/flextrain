@@ -72,6 +72,10 @@ from flextrain.ops.full_moe import (
     routed_swiglu_moe_fwd,
     routed_swiglu_moe_recompute_x_up,
 )
+from flextrain.ops.moe_backend import (
+    FlextrainMoEExpertCompute,
+    MoEExpertCompute,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -151,34 +155,40 @@ class MoESwiGLUFFN:
     Backward mirrors the forward pipeline inverse; see ``bwd`` below.
     """
 
-    def __init__(self, cfg: MoESwiGLUConfig) -> None:
+    def __init__(
+        self, cfg: MoESwiGLUConfig,
+        *,
+        expert_compute: MoEExpertCompute | None = None,
+    ) -> None:
         self.cfg = cfg
-        # Maintained across steps for diagnostic/logging purposes
-        # (orig stores the same on CPU). Set to None until first forward
-        # so the fallback logic in backward can distinguish "never ran".
-        self._expert_hist: torch.Tensor | None = None
+        # Backend that owns scatter + per-expert MLP + gather. Defaults
+        # to flextrain. ScatterMoE / sonic backends are added later.
+        self.expert_compute: MoEExpertCompute = (
+            expert_compute if expert_compute is not None
+            else FlextrainMoEExpertCompute()
+        )
 
     # ------------------------------------------------------------------
     # Declarations consumed by the layer / engine.
     # ------------------------------------------------------------------
 
     def fields(self) -> tuple[ActivationField, ...]:
+        """Concatenate shared block fields + backend-private fields.
+
+        Shared (router state + pre-SwiGLU activations) are declared
+        here; the backend declares its private scatter bookkeeping
+        (e.g., flextrain's ``index_mapping``, ``expert_counts``,
+        ``scattered_router_weights``).
+        """
         cfg = self.cfg
         bf = cfg.compute_dtype
-        return (
-            # Tier 0 (always saved): router state.
+        shared = (
+            # Tier 0 (always saved): router state needed by router-bwd.
             ActivationField(
                 "x_router",
                 lambda n, d: (n, cfg.num_experts),
                 bf,
                 tier=0,
-            ),
-            ActivationField(
-                "expert_counts",
-                lambda n, d: (cfg.num_experts,),
-                torch.int32,
-                tier=0,
-                token_axis=None,  # shape independent of num_tokens
             ),
             ActivationField(
                 "router_weights",
@@ -192,14 +202,8 @@ class MoESwiGLUFFN:
                 torch.int32,
                 tier=0,
             ),
-            ActivationField(
-                "scattered_router_weights",
-                lambda n, d: (n * cfg.top_k, 1),
-                bf,
-                tier=0,
-                token_axis=None,  # (T*K, 1) — slices handled by block
-            ),
             # Tier 3 (max level): per-slot pre-SwiGLU activations.
+            # Recomputable via expert_compute.fwd_recompute when tier <3.
             ActivationField(
                 "x_up",
                 lambda n, d: (n * cfg.top_k, 2 * cfg.expert_dim),
@@ -208,6 +212,14 @@ class MoESwiGLUFFN:
                 token_axis=None,
             ),
         )
+        backend_private = self.expert_compute.activation_fields(
+            num_experts=cfg.num_experts,
+            top_k=cfg.top_k,
+            expert_dim=cfg.expert_dim,
+            d_model=cfg.d_model,
+            compute_dtype=bf,
+        )
+        return shared + backend_private
 
     def param_spec(self) -> ParamSpec:
         cfg = self.cfg
@@ -256,18 +268,14 @@ class MoESwiGLUFFN:
         """Compute the MoE SwiGLU forward.
 
         Thin caller of :func:`flextrain.ops.full_moe.routed_swiglu_moe_fwd`.
-        That op runs router + dispatch + expert-loop + gather end-to-end
-        and writes router state into tier-0 slot fields, per-slot pre-
-        SwiGLU activations into tier-3 ``slot.x_up``, and the
-        residual-added output into ``out_tensor``.
-
-        ``chunk.extra`` must contain ``moe_token_index_mapping`` and
-        ``moe_expert_counts_host`` dicts (engine allocates when layers
-        declare ``moe_chunk_config``). Per-layer entries survive
-        between fwd and bwd for this chunk.
+        Runs the router (always flextrain-owned) then delegates the
+        scatter + per-expert MLP + gather to ``self.expert_compute``.
+        Writes router state into tier-0 slot fields, per-slot pre-SwiGLU
+        activations into tier-3 ``slot.x_up`` (or whatever the backend
+        declares), and the residual-added output into ``out_tensor``.
         """
         cfg = self.cfg
-        expert_counts_cpu = routed_swiglu_moe_fwd(
+        routed_swiglu_moe_fwd(
             ffn_norm_output, weights,
             out_tensor=out_tensor,
             residual=attn_output_with_residual,
@@ -276,18 +284,12 @@ class MoESwiGLUFFN:
             layer_id=layer_id,
             top_k=cfg.top_k,
             num_experts=cfg.num_experts,
-            expert_dim=cfg.expert_dim,
             routing_mode=cfg.routing_mode,
             primary_stream=ctx.stream,
             secondary_stream=ctx.secondary_stream,
             scratch_fn=ctx.scratch,
+            expert_compute=self.expert_compute,
         )
-        # Per-block diagnostic: cumulative expert-usage histogram.
-        if self._expert_hist is None:
-            self._expert_hist = torch.zeros(
-                cfg.num_experts, dtype=torch.int64, device="cpu",
-            )
-        self._expert_hist.add_(expert_counts_cpu)
         return out_tensor
 
     def fwd_recompute_x_up(
@@ -300,20 +302,22 @@ class MoESwiGLUFFN:
         *,
         layer_id: int,
     ) -> None:
-        """Refill tier-3 ``slot.x_up`` by re-running the expert
-        up-projection. Called by the enclosing layer's
-        ``forward_recompute`` when save_level was < 3.
+        """Refill tier-3 ``slot.x_up`` (or whatever the backend
+        declares) by re-running the dropped fwd work. Called by the
+        enclosing layer's ``forward_recompute`` when save_level < 3.
 
-        Stashes the rescatter buffer on ``slot.aux["moe_scattered_x"]``
-        so the subsequent bwd reuses it instead of scattering again.
+        Stashes the backend's recompute handoff (e.g., a rescatter
+        buffer) on ``slot.aux["moe_recompute_handoff"]`` so the
+        subsequent bwd can reuse it.
         """
-        scattered_x = routed_swiglu_moe_recompute_x_up(
+        handoff = routed_swiglu_moe_recompute_x_up(
             ffn_norm_output, weights, slot, chunk.extra, layer_id,
-            top_k=self.cfg.top_k,
             primary_stream=ctx.stream,
             secondary_stream=ctx.secondary_stream,
+            scratch_fn=ctx.scratch,
+            expert_compute=self.expert_compute,
         )
-        slot.aux["moe_scattered_x"] = scattered_x
+        slot.aux["moe_recompute_handoff"] = handoff
 
     def bwd(
         self,
@@ -335,7 +339,8 @@ class MoESwiGLUFFN:
         thing they did before: skipped projections route per-expert
         ``(X, dY)`` tiles to the callback so the LoRA wrapper does
         rank-r accumulation without materializing per-expert dW.
-        ``g_router`` is callback-fired with ``eid=-1``.
+        ``g_router`` is callback-fired with ``eid=-1``. Only the
+        flextrain backend supports these LoRA kwargs today.
         """
         cfg = self.cfg
         ffn_norm_output = slot.aux.get("recompute_ffn_norm_output", None)
@@ -345,19 +350,20 @@ class MoESwiGLUFFN:
                 "via slot.aux['recompute_ffn_norm_output'] (same "
                 "convention as SwiGLUFFN dense)."
             )
-        scattered_x_recompute = slot.aux.pop("moe_scattered_x", None)
+        recompute_handoff = slot.aux.pop("moe_recompute_handoff", None)
         return routed_swiglu_moe_bwd(
             dy_resid, weights, grads, slot, chunk.extra, layer_id,
             ffn_norm_output=ffn_norm_output,
             top_k=cfg.top_k,
             num_experts=cfg.num_experts,
-            expert_dim=cfg.expert_dim,
             routing_mode=cfg.routing_mode,
             load_balance_coef=cfg.load_balance_coef,
             total_tokens_per_step=ctx.total_tokens_per_step,
             primary_stream=ctx.stream,
             secondary_stream=ctx.secondary_stream,
-            scattered_x_recompute=scattered_x_recompute,
+            scratch_fn=ctx.scratch,
+            expert_compute=self.expert_compute,
+            scattered_x_recompute=recompute_handoff,
             skip_grads=skip_grads,
             lora_per_expert_callback=lora_per_expert_callback,
         )

@@ -332,11 +332,6 @@ class LoRAWrapperLayer:
     ) -> None:
         self.base = base
         self.layer_id = base.layer_id
-        # MoE marker passes through transparently.
-        self.moe_chunk_config = getattr(base, "moe_chunk_config", None)
-        if self.moe_chunk_config is None:
-            # `Layer` Protocol probes this; absent on non-MoE base layers.
-            pass
         # Secondary-compute-stream marker passes through too. Without
         # this, the engine sees ``getattr(wrapper, 'uses_secondary_stream',
         # False) → False`` (the wrapper itself doesn't define the attr,

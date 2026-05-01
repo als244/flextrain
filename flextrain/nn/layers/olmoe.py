@@ -30,7 +30,6 @@ from flextrain.core.layer import (
     ChunkMeta,
     ComputeCost,
     LayerContext,
-    MoEChunkConfig,
     ParamSpec,
 )
 from flextrain.core.activation_schema import ActivationSlot
@@ -155,11 +154,6 @@ class OLMoEBlock:
                 master_dtype=cfg.master_dtype,
                 grad_dtype=cfg.grad_dtype,
             )
-        )
-
-        # Marker so the engine allocates per-chunk MoE scratch.
-        self.moe_chunk_config = MoEChunkConfig(
-            num_experts=cfg.num_experts, top_k=cfg.top_k,
         )
 
         x_inp_field = ActivationField(

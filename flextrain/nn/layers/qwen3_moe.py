@@ -28,7 +28,6 @@ from flextrain.core.layer import (
     ChunkMeta,
     ComputeCost,
     LayerContext,
-    MoEChunkConfig,
     ParamSpec,
 )
 from flextrain.nn.blocks import (
@@ -139,10 +138,6 @@ class Qwen3MoEBlock:
                 master_dtype=cfg.master_dtype,
                 grad_dtype=cfg.grad_dtype,
             )
-        )
-
-        self.moe_chunk_config = MoEChunkConfig(
-            num_experts=cfg.num_experts, top_k=cfg.top_k,
         )
 
         x_inp_field = ActivationField(

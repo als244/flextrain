@@ -27,7 +27,7 @@ from flextrain.core.activation_schema import (
     ActivationField, ActivationSchema, concat_fields,
 )
 from flextrain.core.layer import (
-    ChunkMeta, ComputeCost, LayerContext, MoEChunkConfig, ParamSpec,
+    ChunkMeta, ComputeCost, LayerContext, ParamSpec,
 )
 from flextrain.nn.blocks import (
     GQAAttentionGatedBlock, GQAAttentionGatedConfig, RMSNormBlock,
@@ -178,9 +178,6 @@ class Qwen3NextLinearLayer:
                 master_dtype=cfg.master_dtype,
                 grad_dtype=cfg.grad_dtype,
             )
-        )
-        self.moe_chunk_config = MoEChunkConfig(
-            num_experts=cfg.num_experts, top_k=cfg.top_k,
         )
 
         x_inp_field = ActivationField(
@@ -498,9 +495,6 @@ class Qwen3NextFullLayer:
             )
         )
 
-        self.moe_chunk_config = MoEChunkConfig(
-            num_experts=cfg.num_experts, top_k=cfg.top_k,
-        )
 
         x_inp_field = ActivationField(
             "x_inp",

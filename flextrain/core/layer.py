@@ -484,26 +484,6 @@ class ChunkMeta:
 ScratchFn = Callable[[tuple[int, ...], torch.dtype], torch.Tensor]
 
 
-@dataclass(frozen=True)
-class MoEChunkConfig:
-    """Declaration that a layer needs per-chunk MoE scratch tensors
-    (``token_index_mapping`` and ``expert_counts_host``).
-
-    The engine inspects each backbone layer at init time; if any layer
-    has ``.moe_chunk_config is not None``, the engine allocates the
-    matching per-(layer_id, chunk_id) tensors and stashes them in
-    ``ChunkMeta.extra`` before fwd/bwd runs. MoE layers read them via
-    ``chunk.extra["moe_token_index_mapping"][layer_id]`` and
-    ``chunk.extra["moe_expert_counts_host"][layer_id]``.
-
-    Centralized here (not in the layer implementations) so the engine
-    can allocate without a circular import on ``MoESwiGLUFFN``.
-    """
-
-    num_experts: int
-    top_k: int
-
-
 @dataclass
 class BackwardIntermediates:
     """Per-projection ``(X, dY)`` pairs and any layer-internal cache the
@@ -656,12 +636,6 @@ class Layer(Protocol):
 
     Attributes ``schema`` and ``param_spec`` must be set at ``__init__`` time
     and are read by the engine before the first forward.
-
-    Layers MAY optionally declare a ``moe_chunk_config: MoEChunkConfig``
-    attribute to request per-chunk MoE scratch tensors from the engine.
-    The engine probes each layer via
-    ``getattr(layer, "moe_chunk_config", None)`` at init time; layers
-    that don't need MoE scratch simply omit the attribute.
     """
 
     layer_id: int
