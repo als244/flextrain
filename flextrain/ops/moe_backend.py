@@ -447,3 +447,387 @@ class FlextrainMoEExpertCompute:
         slot.aux["moe_dprobs"] = dprobs
 
         return dx
+
+
+# ---------------------------------------------------------------------------
+# ScatterMoE implementation
+# ---------------------------------------------------------------------------
+
+
+class ScatterMoEExpertCompute:
+    """Drives the routed-MLP pipeline via scattermoe's Triton kernels.
+
+    Lower-level kernel calls (no autograd, no torch.autograd.Function):
+    we directly drive ``scatter2scatter``, ``group``, and ``group_bwd_W``
+    with our own intermediate tensors so we can save only the pre-act
+    ``(TK, 2F)`` into ``slot.x_up`` (matching the flextrain convention)
+    and recompute the SwiGLU activation in bwd.
+
+    Backend-private slot fields (all tier 0):
+      * ``scattermoe_sorted_expert_idxs: (TK,) int32`` — scattermoe's
+        sort-by-expert tensor (output of flatten_sort_count).
+      * ``scattermoe_sorted_scattered_idxs: (TK,) int32`` — inverse
+        permutation; needed by every scatter2scatter call.
+      * ``scattermoe_expert_offsets: (E,) int32`` — bincount cumsum;
+        equivalent of flextrain's expert_counts cumulated.
+      * ``index_mapping: (T, K) int32`` — flextrain-shaped permutation,
+        derived from sorted_scattered_idxs once at fwd. Used by the
+        unified ``flextrain_moe_router_gate_bwd`` so both backends
+        produce dprobs in scattered layout for the router-gate-bwd.
+
+    Limitations (Stage 2):
+      * ``supported_tiers = {3}`` only — scattermoe's bwd uses kernel
+        primitives that don't naturally support a "drop x_up, recompute
+        in bwd" pathway. If you need lower tiers, use the flextrain
+        backend or extend ``fwd_recompute`` later.
+      * No LoRA support: scattermoe doesn't expose a per-expert wgrad
+        hook, so ``skip_grads`` and ``lora_per_expert_callback`` are
+        rejected. Use the flextrain backend for LoRA.
+      * No inline residual add in gather. Caller adds residual after.
+    """
+
+    name = "scattermoe"
+
+    @property
+    def supports_residual_in_gather(self) -> bool:
+        return False
+
+    @property
+    def supported_tiers(self) -> frozenset[int]:
+        return frozenset({3})
+
+    # ------------------------------------------------------------------
+    # Schema
+    # ------------------------------------------------------------------
+
+    def activation_fields(
+        self, num_experts: int, top_k: int, expert_dim: int, d_model: int,
+        compute_dtype: torch.dtype,
+    ) -> tuple[ActivationField, ...]:
+        return (
+            ActivationField(
+                "scattermoe_sorted_expert_idxs",
+                lambda n, d: (n * top_k,),
+                torch.int32,
+                tier=0,
+                token_axis=None,
+            ),
+            ActivationField(
+                "scattermoe_sorted_scattered_idxs",
+                lambda n, d: (n * top_k,),
+                torch.int32,
+                tier=0,
+                token_axis=None,
+            ),
+            ActivationField(
+                "scattermoe_expert_offsets",
+                lambda n, d: (num_experts,),
+                torch.int32,
+                tier=0,
+                token_axis=None,
+            ),
+            # Flextrain-shaped index_mapping — populated at fwd from
+            # sorted_scattered_idxs so the unified router-gate-bwd can
+            # consume scattered dprobs the same way it does for the
+            # flextrain backend.
+            ActivationField(
+                "index_mapping",
+                lambda n, d: (n, top_k),
+                torch.int32,
+                tier=0,
+            ),
+        )
+
+    # ------------------------------------------------------------------
+    # Compute
+    # ------------------------------------------------------------------
+
+    def fwd(
+        self,
+        x: torch.Tensor,
+        router_weights: torch.Tensor,
+        chosen_experts: torch.Tensor,
+        weights: Mapping[str, torch.Tensor],
+        *,
+        out: torch.Tensor,
+        residual: torch.Tensor | None,
+        slot: Any,
+        chunk_extra: MutableMapping[str, Any],
+        layer_id: int,
+        primary_stream: torch.cuda.Stream,
+        secondary_stream: torch.cuda.Stream | None,
+        scratch_fn: Callable[[tuple[int, ...], torch.dtype], torch.Tensor],
+    ) -> None:
+        if residual is not None:
+            raise ValueError(
+                "ScatterMoEExpertCompute does not support inline residual "
+                "in the gather; caller must add it after fwd returns."
+            )
+        from scattermoe import kernels as scm_kernels
+        from scattermoe.parallel_experts import flatten_sort_count
+
+        # Dimensions.
+        num_experts = weights["w_up"].shape[0]
+        d_model = weights["w_up"].shape[1]
+        F = weights["w_down"].shape[1]
+        T = x.shape[0]
+        K = router_weights.shape[1]
+        TK = T * K
+
+        # 1. Sort + count. flatten_sort_count is a torch.compile'd
+        # routine that returns three tensors. We re-allocate (the
+        # @torch.compile cache holds, but the result tensors are fresh
+        # each call) and copy into our pre-allocated slot fields so
+        # bwd has stable per-(layer, chunk) views.
+        sorted_expert_idxs, sorted_scattered_idxs, expert_offsets = (
+            flatten_sort_count(chosen_experts, num_experts=num_experts)
+        )
+        slot.scattermoe_sorted_expert_idxs.copy_(sorted_expert_idxs)
+        slot.scattermoe_sorted_scattered_idxs.copy_(sorted_scattered_idxs)
+        slot.scattermoe_expert_offsets.copy_(expert_offsets)
+
+        # 2. Build flextrain-shaped index_mapping for the
+        # router-gate-bwd. index_mapping[t, k] = scatter position of
+        # token t's k-th routed expert. sorted_scattered_idxs[i] gives
+        # the original (t*K + k) for sorted position i; the inverse
+        # permutation is what we need.
+        # We compute it on GPU via scatter: for each i in [0..TK),
+        # index_mapping.flatten()[sorted_scattered_idxs[i]] = i.
+        # PyTorch supports this via index_copy_ on a flattened view.
+        index_mapping_flat = slot.index_mapping.view(-1)
+        # Note: sorted_scattered_idxs is int32; index_copy_ wants int64.
+        # The conversion here is ~µs.
+        index_mapping_flat.index_copy_(
+            0,
+            slot.scattermoe_sorted_scattered_idxs.long(),
+            torch.arange(TK, device=x.device, dtype=torch.int32),
+        )
+
+        # 3. Up-projection: scatter2scatter into pre-act.
+        # x: (T, d), w_up: (E, d, 2F), out: (TK, 2F) into slot.x_up.
+        scm_kernels.ops.scatter2scatter(
+            X=x, W=weights["w_up"],
+            sorted_expert_idxs=slot.scattermoe_sorted_expert_idxs,
+            sorted_scattered_idxs=slot.scattermoe_sorted_scattered_idxs,
+            k=K, x_grouped=False, y_grouped=True,
+            out=slot.x_up,
+        )
+
+        # 4. Activation: silu(gate) * value. slot.x_up packs as
+        # [value || gate] (flextrain convention; first half value,
+        # second half gate).
+        post_act = scratch_fn((TK, F), x.dtype)
+        value, gate = slot.x_up.chunk(2, dim=-1)
+        post_act.copy_(torch.nn.functional.silu(gate) * value)
+
+        # 5. Down-projection with gate-weighting.
+        # scatter2scatter w/ k=1, x_grouped=True, y_grouped=False:
+        # produces (TK, d) which we then weighted-sum to (T, d).
+        out_expanded = scratch_fn((TK, d_model), x.dtype)
+        scm_kernels.ops.scatter2scatter(
+            X=post_act, W=weights["w_down"],
+            sorted_expert_idxs=slot.scattermoe_sorted_expert_idxs,
+            sorted_scattered_idxs=slot.scattermoe_sorted_scattered_idxs,
+            k=1, x_grouped=True, y_grouped=True,  # both grouped now
+            out=out_expanded,
+        )
+        # Reshape (TK, d) -> (T, K, d) -> weighted-sum to (T, d).
+        # Match scattermoe's MLP wrapper:
+        #   output_expanded = output.view(T, K, d)
+        #   output = (gates.unsqueeze(1) @ output_expanded).squeeze(1)
+        out_view = out_expanded.view(T, K, d_model)
+        # router_weights (T, K) → (T, 1, K). bmm with (T, K, d) → (T, 1, d) → (T, d).
+        torch.bmm(
+            router_weights.unsqueeze(1),
+            out_view,
+            out=out.view(T, 1, d_model),
+        )
+
+        # Save scattermoe's `out_expanded` (post-down, pre-gate) for
+        # bwd (needed to compute d_gates). Stash on slot.aux for the
+        # subsequent bwd of THIS chunk; survives because the engine
+        # treats slot.aux as per-(layer, chunk) within fwd→bwd.
+        # CAVEAT: for offloaded slots, slot.aux is rebuilt at
+        # fetch-back time. Since scattermoe backend's supported_tiers
+        # = {3} only, the engine never offloads a scattermoe layer's
+        # slot — supported_tiers caps the schema's max_tier, the DP
+        # planner only picks tier 3 (= save x_up locally on host) for
+        # this layer's fields, and bwd-time fetch only re-creates the
+        # slot at level 3 with x_up fetched. The extra "out_expanded"
+        # scratch needs another save path. For Stage 2 simplicity:
+        # save it in chunk_extra under a backend-namespaced key so it
+        # survives any slot rebuild.
+        chunk_extra.setdefault(
+            "scattermoe.moe.out_expanded", {}
+        )[layer_id] = out_expanded
+        chunk_extra.setdefault(
+            "scattermoe.moe.post_act", {}
+        )[layer_id] = post_act
+
+    def fwd_recompute(
+        self,
+        x: torch.Tensor,
+        weights: Mapping[str, torch.Tensor],
+        *,
+        slot: Any,
+        chunk_extra: MutableMapping[str, Any],
+        layer_id: int,
+        primary_stream: torch.cuda.Stream,
+        secondary_stream: torch.cuda.Stream | None,
+        scratch_fn: Callable[[tuple[int, ...], torch.dtype], torch.Tensor],
+    ) -> Any:
+        raise NotImplementedError(
+            "ScatterMoEExpertCompute supports only tier 3 (everything saved); "
+            "fwd_recompute should never be called. supported_tiers={3}."
+        )
+
+    def bwd(
+        self,
+        dy: torch.Tensor,
+        x: torch.Tensor,
+        weights: Mapping[str, torch.Tensor],
+        grads: MutableMapping[str, torch.Tensor],
+        *,
+        slot: Any,
+        chunk_extra: MutableMapping[str, Any],
+        layer_id: int,
+        primary_stream: torch.cuda.Stream,
+        secondary_stream: torch.cuda.Stream | None,
+        scratch_fn: Callable[[tuple[int, ...], torch.dtype], torch.Tensor],
+        dx: torch.Tensor | None = None,
+        recompute_handoff: Any = None,
+        # Reject LoRA kwargs explicitly — backend doesn't support hooks.
+        skip_grads: frozenset[str] = frozenset(),
+        lora_per_expert_callback: object | None = None,
+    ) -> torch.Tensor:
+        if skip_grads or lora_per_expert_callback is not None:
+            raise NotImplementedError(
+                "ScatterMoEExpertCompute does not support LoRA per-expert "
+                "callbacks (skip_grads / lora_per_expert_callback). Use "
+                "FlextrainMoEExpertCompute for LoRA."
+            )
+        if recompute_handoff is not None:
+            raise NotImplementedError(
+                "ScatterMoEExpertCompute does not support tier <3 recompute."
+            )
+        from scattermoe import kernels as scm_kernels
+
+        # Dimensions.
+        num_experts = weights["w_up"].shape[0]
+        d_model = weights["w_up"].shape[1]
+        F = weights["w_down"].shape[1]
+        T = dy.shape[0]
+        K = slot.index_mapping.shape[1]
+        TK = T * K
+
+        # Pull saved fwd state.
+        out_expanded = chunk_extra["scattermoe.moe.out_expanded"].pop(layer_id)
+        post_act = chunk_extra["scattermoe.moe.post_act"].pop(layer_id)
+        sorted_expert_idxs = slot.scattermoe_sorted_expert_idxs
+        sorted_scattered_idxs = slot.scattermoe_sorted_scattered_idxs
+        expert_offsets = slot.scattermoe_expert_offsets
+        # Recover router_weights from the shared slot field.
+        router_weights = slot.router_weights  # (T, K) bf16
+
+        # 1. d_gates: dy ⋅ out_expanded (token-major). Mirrors scattermoe
+        # ParallelLinear.backward line 79.
+        d_gates = (out_expanded.view(T, K, d_model) @ dy.unsqueeze(-1)).squeeze(-1)
+        # (T, K) bf16. Will be scattered to (TK, 1) below for the unified
+        # router-gate-bwd.
+
+        # 2. Build grouped_grad_out = group(dy, sorted_scattered_idxs,
+        # fan_out=K, coeff=router_weights.flatten()) — the gather-bwd.
+        grouped_grad_out = scratch_fn((TK, d_model), dy.dtype)
+        scm_kernels.ops.group(
+            dy, sorted_scattered_idxs,
+            fan_out=K,
+            coeff=router_weights.flatten(),
+            out=grouped_grad_out,
+        )
+
+        # 3. d_w_down = group_bwd_W(DY=grouped_grad_out, X=post_act,
+        # offsets=expert_offsets). Accumulates into grads["g_down"]
+        # via .add_().
+        d_w_down, _ = scm_kernels.ops.group_bwd_W(
+            DY=grouped_grad_out, X=post_act,
+            expert_offsets=expert_offsets,
+            E=num_experts, has_bias=False,
+        )
+        if grads.get("g_down") is not None:
+            # group_bwd_W returns DW in shape (E, X_dim, DY_dim) =
+            # (E, F, d_model) — already matches g_down's storage layout.
+            grads["g_down"].add_(d_w_down)
+
+        # 4. d_post_act = scatter2scatter(grouped_grad_out, w_down.permute(0,2,1), k=1, ...)
+        # produces (TK, F).
+        d_post_act = scratch_fn((TK, F), dy.dtype)
+        scm_kernels.ops.scatter2scatter(
+            X=grouped_grad_out, W=weights["w_down"].permute(0, 2, 1).contiguous(),
+            sorted_expert_idxs=sorted_expert_idxs,
+            sorted_scattered_idxs=sorted_scattered_idxs,
+            k=1, x_grouped=True, y_grouped=True,
+            out=d_post_act,
+        )
+
+        # 5. Activation bwd: post_act = silu(gate) * value. Need
+        # d_pre_act = (d_post_act * d/d(silu*value)/d(pre_act)).
+        # value, gate = slot.x_up.chunk(2, dim=-1) (still valid).
+        value, gate = slot.x_up.chunk(2, dim=-1)
+        # silu_grad: derivative of silu. silu(x) = x * sigmoid(x).
+        # d_silu/dx = sigmoid(x) + x * sigmoid(x) * (1 - sigmoid(x))
+        sig_gate = torch.sigmoid(gate.float())
+        silu_gate = gate.float() * sig_gate
+        d_silu_d_gate = (sig_gate + silu_gate * (1.0 - sig_gate))
+        # post_act = silu(gate) * value
+        # d/d(value) = d_post_act * silu(gate)
+        # d/d(gate) = d_post_act * value * d_silu_d_gate
+        d_pre_act = scratch_fn((TK, 2 * F), dy.dtype)
+        d_value, d_gate = d_pre_act.chunk(2, dim=-1)
+        d_value.copy_((d_post_act.float() * silu_gate).to(d_post_act.dtype))
+        d_gate.copy_(
+            (d_post_act.float() * value.float() * d_silu_d_gate).to(d_post_act.dtype)
+        )
+
+        # 6. d_w_up = group_bwd_W(DY=d_pre_act, X=grouped_x, ...)
+        # Need grouped_x — compute via group(x, sorted_scattered_idxs,
+        # fan_out=K). Allocates (TK, d).
+        grouped_x = scratch_fn((TK, d_model), x.dtype)
+        scm_kernels.ops.group(
+            x, sorted_scattered_idxs, fan_out=K, out=grouped_x,
+        )
+        d_w_up, _ = scm_kernels.ops.group_bwd_W(
+            DY=d_pre_act, X=grouped_x,
+            expert_offsets=expert_offsets,
+            E=num_experts, has_bias=False,
+        )
+        if grads.get("g_up") is not None:
+            grads["g_up"].add_(d_w_up)
+
+        # 7. d_x = scatter2scatter(d_pre_act, w_up.T, k=1, x_grouped=True, y_grouped=False)
+        # then sum over K.
+        d_expanded_input = scratch_fn((TK, d_model), x.dtype)
+        scm_kernels.ops.scatter2scatter(
+            X=d_pre_act, W=weights["w_up"].permute(0, 2, 1).contiguous(),
+            sorted_expert_idxs=sorted_expert_idxs,
+            sorted_scattered_idxs=sorted_scattered_idxs,
+            k=1, x_grouped=True, y_grouped=False,
+            out=d_expanded_input,
+        )
+        if dx is None:
+            dx = torch.empty_like(dy)
+        # d_expanded_input is (TK, d) but in token-major layout
+        # (y_grouped=False). View as (T, K, d) and sum over K.
+        dx.copy_(d_expanded_input.view(T, K, d_model).sum(dim=1))
+
+        # 8. dprobs: scatter d_gates (T, K) into (TK, 1) via slot.index_mapping.
+        # The unified router-gate-bwd consumes scattered layout.
+        from flextrain.ops import flextrain_moe_scatter_routing_weights
+        dprobs_flat = scratch_fn((TK,), dy.dtype)
+        flextrain_moe_scatter_routing_weights(
+            d_gates.contiguous(), slot.index_mapping, out=dprobs_flat,
+        )
+        # Router-gate-bwd expects (TK, 1).
+        slot.aux["moe_dprobs"] = dprobs_flat.unsqueeze(-1)
+
+        return dx
+
