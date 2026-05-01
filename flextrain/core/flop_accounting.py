@@ -338,10 +338,14 @@ def round_compute_flops(
       ``layer.compute_cost(chunk).total_fwd_flops``. The "useful"
       forward count.
     * ``recompute_flops`` — sum over (layer, chunk) of
-      ``total_fwd_flops - avoided_recompute_flops[tier]`` where
-      ``tier`` is the plan's save level for that (layer, chunk).
-      This is the *extra* fwd-equivalent compute the GPU spends in
-      bwd to reconstruct activations the plan didn't save.
+      ``avoided_recompute_flops[max_tier] - avoided_recompute_flops[tier]``
+      where ``tier`` is the plan's save level. ``avoided[max_tier]``
+      is the total recoverable fwd FLOPs (everything that *can* be
+      saved is saved); the difference is the work bwd must redo at
+      the chosen tier. FLOPs that are never recomputed at any tier
+      (e.g. KV proj saved in the cache, FFN down which bwd uses
+      directly, lin-attn out_proj) never appear in ``avoided`` and
+      are correctly excluded from this difference.
 
     Bwd-gradient and optimizer FLOPs are NOT included here — the
     caller (train.py) applies its own mode factor (full FT vs LoRA)
@@ -371,7 +375,7 @@ def round_compute_flops(
             if not avoided:
                 continue
             tier = min(tier, len(avoided) - 1)
-            recompute_total += cost.total_fwd_flops - avoided[tier]
+            recompute_total += avoided[-1] - avoided[tier]
     return fwd_total, recompute_total
 
 

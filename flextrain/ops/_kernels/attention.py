@@ -15,8 +15,7 @@ try:
         device_name = torch.cuda.get_device_name(0).lower()
         return "h100" in device_name or "h200" in device_name or "hopper" in device_name
     FLASH_ATTN_3_AVAILABLE = is_hopper_gpu()
-except Exception as e:
-    print(f"Flash 3 not available. Exception: {e}")
+except Exception:
     FLASH_ATTN_3_AVAILABLE = False
 
 try:

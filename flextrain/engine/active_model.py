@@ -2151,6 +2151,18 @@ class ActiveModel:
             f"level {k}: {v}"
             for k, v in sorted(tiers.items(), key=lambda kv: -kv[0])
         )
+        # FLOP-side recompute fraction including the flash-attn bwd scan,
+        # which always recomputes ~half of fwd attention FLOPs regardless
+        # of save tier. ``Final Recompute Frac`` above is the DP solver's
+        # time-side fraction; this is the hardware-side FLOP fraction the
+        # GPU actually executes vs. the round's useful fwd FLOPs.
+        round_fwd, round_recompute = round_compute_flops(
+            self.backbone, prepared.chunks, plan,
+        )
+        flash_extra = flash_attn_recompute_flops(self.backbone, prepared.chunks)
+        flash_frac = (
+            (round_recompute + flash_extra) / round_fwd if round_fwd else 0.0
+        )
         print(
             f"[Save Level Plan] "
             f"{len(prepared.chunks)} chunks x {len(self.backbone)} layers; "
@@ -2159,7 +2171,8 @@ class ActiveModel:
             f"{self.working_set.host_act_buffer_size / (1 << 30):.2f}GiB. "
             f"Final Recompute Time: {plan.estimated_recompute_time_ms:.2f}ms / "
             f"{plan.estimated_fwd_time_ms:.2f}ms, "
-            f"Final Recompute Frac: {plan.recompute_fraction:.4f}",
+            f"Final Recompute Frac: {plan.recompute_fraction:.4f} "
+            f"(with flash-attn: {flash_frac:.4f})",
             flush=True,
         )
 
