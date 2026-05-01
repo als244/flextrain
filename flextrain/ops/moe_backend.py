@@ -1041,7 +1041,7 @@ class SonicMoEExpertCompute:
             )
         from quack.gemm_interface import gemm, gemm_gated
         from sonicmoe.functional.triton_kernels import (
-            general_routing_router_metadata_triton,
+            TC_topk_router_metadata_triton,
         )
         from sonicmoe.functional.forward import _router_forward
 
@@ -1053,32 +1053,21 @@ class SonicMoEExpertCompute:
         K = router_weights.shape[1]
         TK = T * K
 
-        # 1. Build sonic-shape (TK,) flat routing inputs.
-        # token_indices_flat: [0,0,...,1,1,...] sorted by token (sonic
-        # requires sorted_selected_T input, and arange.repeat_interleave
-        # produces this naturally).
-        # expert_indices_flat: chosen_experts viewed as (TK,) int32.
         # router_scores_flat: router_weights viewed as (TK,) float32
         # (sonic's gemm_dgated needs fp32 for the scaling; we cast here).
-        token_indices_flat = (
-            torch.arange(T, device=x.device, dtype=torch.int32)
-            .repeat_interleave(K)
-        )
-        expert_indices_flat = chosen_experts.view(-1).contiguous().to(torch.int32)
         router_scores_flat = router_weights.view(-1).float().contiguous()
 
-        # 2. Build all routing bookkeeping (6 tensors) into slot fields.
-        general_routing_router_metadata_triton(
-            token_indices_flat,
-            expert_indices_flat,
-            T,
+        # 1. Build routing bookkeeping using sonicmoe's TC (token-choice)
+        # path — fixed top-K, no num_activated_expert_per_token_offset.
+        # Mirrors sonicmoe/functional/__init__.py:364 (moe_TC_softmax_topk_layer).
+        TC_topk_router_metadata_triton(
+            chosen_experts.contiguous(),  # (T, K) int32
             num_experts,
             slot.sonic_expert_frequency,
             slot.sonic_expert_frequency_offset,
             slot.sonic_x_gather_idx,
             slot.sonic_s_scatter_idx,
             slot.sonic_s_reverse_scatter_idx,
-            slot.sonic_num_activated_offset,
         )
 
         # 3. Build flextrain-shape index_mapping (T, K) for unified
@@ -1092,14 +1081,37 @@ class SonicMoEExpertCompute:
             torch.arange(TK, device=x.device, dtype=torch.int32),
         )
 
-        # 4. Up-projection via gemm_gated. Produces pre-act (TK, 2F)
-        # into slot.x_up and post-act (TK, F) into a scratch buffer.
-        # Sonic's gemm_gated expects w1 in (I=2F, H=d, E) layout; our
-        # weights["w_up"] is (E, d, 2F), so permute(2, 1, 0).
+        # Convert flextrain's (E, in, out) layout to sonicmoe's
+        # (E, out, in) contiguous storage.
+        #
+        # CRITICAL — gating convention for w_up:
+        #   flextrain (and the parity-test reference) chunk(2) the
+        #   pre-activation as `value, gate = pre.chunk(2, dim=-1)`,
+        #   then compute `silu(gate) * value`. So flextrain's chunked
+        #   layout is [up_0..up_{F-1}, gate_0..gate_{F-1}] — UP FIRST,
+        #   GATE SECOND.
+        #   sonicmoe's _swiglu does `g = x[..., 0::2]; u = x[..., 1::2]`
+        #   then `u * silu(g)` — i.e. EVEN indices = gate, ODD = up,
+        #   with concat_layout=False (its default).
+        # To convert: split flextrain's (up_half, gate_half), interleave
+        # so that gate ends up at even indices and up at odd indices.
+        up, gate = weights["w_up"].chunk(2, dim=-1)       # each (E, d, F); flextrain order is [up; gate]
+        w_up_interleaved = torch.stack([gate, up], dim=-1).reshape(
+            num_experts, d_model, 2 * F,
+        )                                                  # (E, d, [g_0, u_0, g_1, u_1, ...])
+        w_up_native = w_up_interleaved.transpose(1, 2).contiguous()  # (E, 2F_interleaved, d)
+        # w_down has no gating, simple transpose suffices.
+        w_down_native = weights["w_down"].transpose(1, 2).contiguous()  # (E, d, F)
+
+        # 4. Up-projection via gemm_gated. Mirror sonicmoe verbatim
+        # (functional/__init__.py:114). MoE.forward passes
+        # `c_fc.weight.permute(1, 2, 0)` as w1, and _UpProjection.forward
+        # calls `gemm_gated(.., w1.permute(2, 1, 0), ..)`. We replicate.
         a_post = scratch_fn((TK, F), x.dtype)
+        w1_view = w_up_native.permute(1, 2, 0)            # (2F, d, E) — sonicmoe's saved w1
         gemm_gated(
             x,
-            weights["w_up"].permute(2, 1, 0),
+            w1_view.permute(2, 1, 0),                     # (E, d, 2F)
             activation="swiglu",
             cu_seqlens_m=slot.sonic_expert_frequency_offset,
             A_idx=slot.sonic_x_gather_idx,
@@ -1109,26 +1121,30 @@ class SonicMoEExpertCompute:
             bias=None,
         )
 
-        # 5. Down-projection: y = a_post @ w_down (scattered → scattered
-        # token-major). Sonic's gemm expects w2 in (H=d, I=F, E) layout;
-        # our weights["w_down"] is (E, F, d), permute(2, 1, 0).
+        # 5. Down-projection. Mirror sonicmoe (_DownProjection.forward
+        # line 237): `gemm(a, w2.permute(2, 1, 0), ...)` where
+        # `w2 = c_proj.weight.permute(1, 2, 0)`.
         y = scratch_fn((TK, d_model), x.dtype)
+        w2_view = w_down_native.permute(1, 2, 0)          # (d, F, E) — sonicmoe's saved w2
         gemm(
             a_post,
-            weights["w_down"].permute(2, 1, 0),
+            w2_view.permute(2, 1, 0),                     # (E, F, d)
             out=y,
             cu_seqlens_m=slot.sonic_expert_frequency_offset,
             bias=None,
         )
 
         # 6. Gather + weighted-sum: out (T, d) = sum over K of
-        # y[scatter_pos(t, k)] * router_scores[t, k]. Fixed-K routing.
+        # y[scatter_pos(t, k)] * router_scores[t, k]. TC fixed-K
+        # routing — pass None for num_activated_expert_per_token_offset
+        # and is_varlen_K=False. Mirrors sonicmoe's TC path
+        # (functional/__init__.py:391).
         _router_forward(
             y=y,
             o=out,
             topk_scores=router_scores_flat,
             s_reverse_scatter_idx=slot.sonic_s_reverse_scatter_idx,
-            num_activated_expert_per_token_offset=slot.sonic_num_activated_offset,
+            num_activated_expert_per_token_offset=None,
             varlen_K_max=K,
             H=d_model,
             is_varlen_K=False,
@@ -1199,6 +1215,22 @@ class SonicMoEExpertCompute:
         # the gradient scaling chain).
         router_scores_flat = slot.router_weights.view(-1).float().contiguous()
 
+        # Convert flextrain's (E, in, out) layout to sonicmoe's
+        # (E, out, in) contiguous storage (see fwd comment for the
+        # full gating convention discussion). flextrain chunked order
+        # is [up; gate]; sonicmoe interleaves with even=gate, odd=up.
+        up, gate = weights["w_up"].chunk(2, dim=-1)       # each (E, d, F); flextrain [up; gate]
+        w_up_interleaved = torch.stack([gate, up], dim=-1).reshape(
+            num_experts, d_model, 2 * F,
+        )
+        w_up_native = w_up_interleaved.transpose(1, 2).contiguous()    # (E, 2F_interleaved, d)
+        w_down_native = weights["w_down"].transpose(1, 2).contiguous()  # (E, d, F)
+
+        # sonicmoe's bwd helpers expect `w1`/`w2` in the form that
+        # MoE.forward constructs: `Experts.weight.permute(1, 2, 0)`.
+        w1_sonic = w_up_native.permute(1, 2, 0)           # (2F, d, E)
+        w2_sonic = w_down_native.permute(1, 2, 0)         # (d, F, E)
+
         # 1. Down-projection bwd + activation bwd, fused via gemm_dgated.
         #    - dh: (TK, 2F) — gradient at the pre-SwiGLU activation.
         #    - a_prime: (TK, F) — recomputed post-act, used as X for dw_down.
@@ -1210,7 +1242,7 @@ class SonicMoEExpertCompute:
         _down_projection_backward_act(
             dout=dy,
             h=slot.x_up,
-            w2=weights["w_down"],
+            w2=w2_sonic,
             dh=dh,
             ds=ds,
             b2=None,
@@ -1223,34 +1255,40 @@ class SonicMoEExpertCompute:
             activation_type="swiglu",
         )
 
-        # 2. dw_down = gemm(dy.T, a_prime). Sonic's reference allocates
-        # dw2 like w2 (= (d, F, E)), then writes via permute(2, 0, 1) →
-        # (E, d, F) layout. Our g_down is (E, F, d) so we accumulate
-        # via .add_(dw2_buf.permute(2, 1, 0)) which converts (d, F, E)
-        # → (E, F, d).
+        # 2. dw_down = gemm(dy.T, a_prime). Mirror sonicmoe's exact
+        # allocation pattern (functional/__init__.py:313): in sonicmoe
+        # `dw2 = torch.empty_like(w2)` where w2 is the (d, F, E) view of
+        # the underlying (E, d, F) storage. `empty_like` of a non-
+        # contiguous view PRESERVES strides, so dw2 has shape (d, F, E)
+        # with strides (F, 1, d*F) — NOT a fresh contiguous allocation.
+        # Then `dw2.permute(2, 0, 1)` → (E, d, F) view with strides
+        # (d*F, F, 1). Replicate by allocating (E, d, F) contiguous
+        # directly and taking that as the out= view.
         if grads.get("g_down") is not None:
-            dw_down_buf = torch.empty(
-                d_model, F, num_experts,
+            dw_down_storage = torch.empty(
+                num_experts, d_model, F,    # (E, d, F) sonicmoe storage
                 dtype=weights["w_down"].dtype, device=dy.device,
             )
+            dw2 = dw_down_storage.permute(1, 2, 0)            # (d, F, E) view
             gemm(
                 dy.T,
                 a_prime,
-                out=dw_down_buf.permute(2, 0, 1),  # (E, d, F)
+                out=dw2.permute(2, 0, 1),                     # (E, d, F)
                 cu_seqlens_k=slot.sonic_expert_frequency_offset,
                 A_idx=slot.sonic_x_gather_idx,
                 batch_idx_permute=None,
                 dynamic_scheduler=False,
             )
-            # (d, F, E) → (E, F, d) for our storage layout.
-            grads["g_down"].add_(dw_down_buf.permute(2, 1, 0))
+            # dw_down_storage is (E, d, F); flextrain g_down is (E, F, d).
+            grads["g_down"].add_(dw_down_storage.transpose(1, 2))
 
         # 3. Up-projection dgrad: dx_expanded (TK, d) = dh @ w_up^T.
-        # _up_projection_backward_act handles the gemm internally
-        # (it's a thin wrapper that calls gemm with the right perms).
+        # _up_projection_backward_act handles the gemm internally — it
+        # expects w1 in sonicmoe's (2F, d, E) storage and does the
+        # `.permute(2, 0, 1)` itself.
         dx_expanded = scratch_fn((TK, d_model), dy.dtype)
         _up_projection_backward_act(
-            w1=weights["w_up"],
+            w1=w1_sonic,
             dx_expanded=dx_expanded,
             dh=dh,
             db1=None,
@@ -1259,26 +1297,34 @@ class SonicMoEExpertCompute:
             concat_layout=False,
         )
 
-        # 4. dw_up = gemm(x.T, dh). Sonic's reference allocates dw1 like
-        # w1 (= (2F, d, E)), writes via permute(2, 1, 0) → (E, d, 2F).
-        # Our g_up is (E, d, 2F) → matches sonic's permute output exactly.
+        # 4. dw_up = gemm(x.T, dh). Same allocation pattern as step 2.
+        # sonicmoe (functional/__init__.py:187): `dw1 = torch.empty_like(w1)`
+        # where w1 is the (2F, d, E) view of (E, 2F, d) storage, then
+        # writes via dw1.permute(2, 1, 0) → (E, d, 2F).
         if grads.get("g_up") is not None:
-            dw_up_buf = torch.empty(
-                2 * F, d_model, num_experts,
+            dw_up_storage = torch.empty(
+                num_experts, 2 * F, d_model,    # (E, 2F, d) sonicmoe storage
                 dtype=weights["w_up"].dtype, device=dy.device,
             )
+            dw1 = dw_up_storage.permute(1, 2, 0)              # (2F, d, E) view
             gemm(
                 x.T,
                 dh,
-                out=dw_up_buf.permute(2, 1, 0),  # (E, d, 2F)
+                out=dw1.permute(2, 1, 0),                     # (E, d, 2F)
                 cu_seqlens_k=slot.sonic_expert_frequency_offset,
                 A_idx=slot.sonic_x_gather_idx,
                 batch_idx_permute=None,
                 dynamic_scheduler=False,
             )
-            # (2F, d, E) → (E, d, 2F) for our storage layout. The
-            # permute output IS already (E, d, 2F), so add_ directly.
-            grads["g_up"].add_(dw_up_buf.permute(2, 1, 0))
+            # dw_up_storage is (E, 2F_interleaved, d) — sonicmoe layout
+            # with interleaved gate(even)/up(odd). flextrain g_up is
+            # (E, d, [up; gate]) chunked (up first half, gate second).
+            # Transpose, then de-interleave back to flextrain's chunked
+            # [up; gate] order.
+            dw_up_view = dw_up_storage.transpose(1, 2)         # (E, d, 2F_interleaved)
+            dw_gate = dw_up_view[..., 0::2]                    # (E, d, F) — gate
+            dw_up_part = dw_up_view[..., 1::2]                 # (E, d, F) — up
+            grads["g_up"].add_(torch.cat([dw_up_part, dw_gate], dim=-1))
 
         # 5. dx_reduced = sum_k dx_expanded[scatter_pos(t, k)]: K-dim
         # reduction back to per-token dx.
@@ -1288,7 +1334,7 @@ class SonicMoEExpertCompute:
             dx_reduced=dx,
             dx_expanded=dx_expanded,
             s_reverse_scatter_idx=slot.sonic_s_reverse_scatter_idx,
-            num_activated_expert_per_token_offset=slot.sonic_num_activated_offset,
+            num_activated_expert_per_token_offset=None,
             varlen_K_max=K,
             H=d_model,
             is_varlen_K=False,
