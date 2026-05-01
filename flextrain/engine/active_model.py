@@ -1361,6 +1361,40 @@ class ActiveModel:
 
         ctx = self._layer_context(total_tokens_per_step=total_tokens_per_step)
 
+        # Pre-bwd init for the top layer's first reverse iteration
+        # (Item 3c). After fwd, ``lin_state_window.fwd`` holds
+        # state[N_last] of the last linear-attn layer's last chunk.
+        # But bwd of that chunk needs state[N_last - 1] = state at
+        # chunk's INPUT. The dispatcher's regular post-bwd refresh
+        # populates the window for iteration K+1 from iteration K's
+        # tail; for K=first_iteration, no prior dispatcher fire has
+        # happened, so do it once explicitly here.
+        #
+        # Mirrors what the dispatcher would do for an "imaginary"
+        # iteration just before the top layer's first reverse iter.
+        # Dense KV doesn't need this (fwd's last write left ``kv_fwd``
+        # correct for the top layer's last-chunk bwd) so we only
+        # invoke the lin-state branch.
+        if self.buffers.lin_state_window is not None:
+            top_layer = self.backbone[-1]
+            if top_layer.schema.has_field("lin_final_state"):
+                first_rev_chunk = prepared.seq_groups[-1][-1]
+                target_infos = self._lin_attn_round_plan.per_chunk[
+                    first_rev_chunk.id
+                ]
+                if any(info.has_prior_chunks for info in target_infos):
+                    src_chunk_id = first_rev_chunk.id - 1
+                    if src_chunk_id >= 0:
+                        # Source of state[first - 1] for top_layer's
+                        # first reverse iteration's bwd. Run on
+                        # inbound_fwd_context; the per-group entry
+                        # ``compute.wait_stream(inbound_fwd_context)``
+                        # below will block compute until this lands.
+                        self._refresh_lin_state_window(
+                            target_layer_id=top_layer.layer_id,
+                            src_chunk_id=src_chunk_id,
+                        )
+
         for k_ind in range(num_layers - 1, -1, -1):
             layer = self.backbone[k_ind]
             lid = layer.layer_id
@@ -1376,6 +1410,20 @@ class ActiveModel:
                 cur_weight_slot, layer.param_spec
             )
             grads = self.buffers.gpu_grad_slot(cur_grad_slot, layer.param_spec)
+
+            # Layer-entry zero of ``lin_state_window.bwd`` (Item 3c).
+            # Different layers' dh0/dht chains are independent; the
+            # bwd window populated by the previous layer's bwd is
+            # irrelevant for this layer. ``.fwd`` is NOT zeroed: the
+            # dispatcher's prior-iteration refresh (or the pre-bwd
+            # init for the top layer) has already populated it for
+            # this layer's first reverse chunk's bwd.
+            if (
+                self.buffers.lin_state_window is not None
+                and layer.schema.has_field("lin_final_state")
+            ):
+                with torch.cuda.stream(self.streams.compute):
+                    self.buffers.lin_state_window.bwd.zero_()
 
             cur_chunk_id = total_chunks - 1
             for seq_group_ind in range(len(prepared.seq_groups) - 1, -1, -1):
@@ -1397,6 +1445,23 @@ class ActiveModel:
                     dev_slot = self.events.dev_act_slot_mapping[
                         (lid, chunk.id)
                     ]
+
+                    # Populate cross-chunk linear-attn ctx for this
+                    # (layer, chunk). The block reads ctx in fwd
+                    # recompute AND in bwd.
+                    if (
+                        self.buffers.lin_state_window is not None
+                        and layer.schema.has_field("lin_final_state")
+                    ):
+                        ctx.lin_attn_chunk_seq_infos = (
+                            self._lin_attn_round_plan.per_chunk[chunk.id]
+                        )
+                        ctx.lin_attn_fwd_window = self.buffers.lin_state_window.fwd
+                        ctx.lin_attn_bwd_window = self.buffers.lin_state_window.bwd
+                    else:
+                        ctx.lin_attn_chunk_seq_infos = None
+                        ctx.lin_attn_fwd_window = None
+                        ctx.lin_attn_bwd_window = None
 
                     # Forward recompute (fills higher-tier fields that
                     # weren't saved) + backward.
@@ -1571,7 +1636,6 @@ class ActiveModel:
           via ``_refresh_kv_window``.
         * Layers with ``lin_final_state`` (linear attention, e.g.
           Gated DeltaNet) refresh via ``_refresh_lin_state_window``.
-          (Wired up in a later commit; currently a no-op.)
 
         Both branches use the same ``inbound_fwd_context`` stream, so
         they're sequential per-layer (a layer is one type or the
@@ -1593,6 +1657,149 @@ class ActiveModel:
             layer_ind=layer_ind,
             prepared=prepared,
         )
+
+        # Linear-attn branch: refresh ``lin_state_window.fwd`` for the
+        # NEXT reverse iteration when its target layer is linear-attn.
+        # No-op when no linear-attn in backbone (window is None) or
+        # when the target chunk doesn't need cross-chunk state.
+        if self.buffers.lin_state_window is not None:
+            self._refresh_lin_state_window_for_next_iter(
+                seq_group_ind=seq_group_ind,
+                chunk_in_group_ind=chunk_in_group_ind,
+                layer_ind=layer_ind,
+                prepared=prepared,
+            )
+
+    def _next_reverse_iteration_target(
+        self,
+        *,
+        seq_group_ind: int,
+        chunk_in_group_ind: int,
+        layer_ind: int,
+        prepared: PreparedRound,
+    ) -> tuple[int, "TrainingChunk"] | None:
+        """Identify the target ``(layer_ind, chunk)`` of the NEXT
+        reverse iteration after the just-completed
+        ``(layer_ind, seq_group_ind, chunk_in_group_ind)`` tuple.
+
+        Reverse traversal:
+        * Within a group: chunk_in_group - 1.
+        * Cross-group within layer: prior group's last chunk-in-group.
+        * Cross-layer: prior layer, last group, last chunk-in-group.
+        * No more iterations: returns None.
+
+        Used by the lin-state refresh branch (which needs to know
+        ``target_chunk_id - 1`` as the source slot). The dense KV
+        branch uses different source-resolution rules and doesn't
+        share this helper.
+        """
+        # Within group: previous chunk-in-group.
+        if chunk_in_group_ind > 0:
+            target_chunk = prepared.seq_groups[seq_group_ind][
+                chunk_in_group_ind - 1
+            ]
+            return (layer_ind, target_chunk)
+        # Cross-group within layer: prior group's last chunk.
+        if seq_group_ind > 0:
+            target_chunk = prepared.seq_groups[seq_group_ind - 1][-1]
+            return (layer_ind, target_chunk)
+        # Cross-layer: prior layer's last group's last chunk.
+        if layer_ind > 0:
+            target_chunk = prepared.seq_groups[-1][-1]
+            return (layer_ind - 1, target_chunk)
+        return None
+
+    def _refresh_lin_state_window_for_next_iter(
+        self,
+        *,
+        seq_group_ind: int,
+        chunk_in_group_ind: int,
+        layer_ind: int,
+        prepared: PreparedRound,
+    ) -> None:
+        """Determine the next reverse iteration's target and, if its
+        layer is linear-attn AND the target chunk is a continuation,
+        refresh ``lin_state_window.fwd`` from the prior chunk's
+        ``lin_final_state`` slot field.
+
+        Source slot rule (linear-attn-specific): for target chunk K,
+        source = ``slot[target_layer.layer_id, K - 1].lin_final_state``.
+        The off-by-one vs dense KV (which uses target chunk K's own
+        slot) reflects that ``lin_final_state`` is a boundary value
+        (state AFTER the chunk's tokens) rather than per-token data.
+        See ``docs/multi_chunk_seq_handling.md`` for the full analysis.
+        """
+        target = self._next_reverse_iteration_target(
+            seq_group_ind=seq_group_ind,
+            chunk_in_group_ind=chunk_in_group_ind,
+            layer_ind=layer_ind,
+            prepared=prepared,
+        )
+        if target is None:
+            return
+        target_layer_ind, target_chunk = target
+        target_layer = self.backbone[target_layer_ind]
+        if not target_layer.schema.has_field("lin_final_state"):
+            return  # target is dense; nothing to do for lin-state
+        # Round plan tells us whether target chunk needs prior state.
+        target_infos = self._lin_attn_round_plan.per_chunk[target_chunk.id]
+        if not any(info.has_prior_chunks for info in target_infos):
+            # Target chunk doesn't read the window (start-of-seq or
+            # small-seq packed chunk). Skip refresh; layer's safety
+            # net (info.has_prior_chunks=False -> initial_state=None)
+            # makes whatever's currently in the window irrelevant.
+            return
+        # Refresh from slot[target_layer, target_chunk_id - 1].
+        src_chunk_id = target_chunk.id - 1
+        if src_chunk_id < 0:
+            return  # defensive; shouldn't happen given the check above
+        self._refresh_lin_state_window(
+            target_layer_id=target_layer.layer_id,
+            src_chunk_id=src_chunk_id,
+        )
+
+    def _refresh_lin_state_window(
+        self,
+        *,
+        target_layer_id: int,
+        src_chunk_id: int,
+    ) -> None:
+        """Copy ``lin_final_state`` from a saved activation slot into
+        ``lin_state_window.fwd`` on ``inbound_fwd_context``.
+
+        Mirrors ``_refresh_kv_window`` but for the linear-attn state.
+        Source slot is identified by ``(target_layer_id, src_chunk_id)``
+        — the helper does NOT compute src_chunk_id; callers (the
+        dispatcher's lin branch and the pre-bwd init) pass it in.
+
+        Source can be on device (still in tail ring) or on host
+        (offloaded during fwd). Same dual-path event handling as
+        ``_refresh_kv_window``.
+        """
+        key = (target_layer_id, src_chunk_id)
+        win = self.buffers.lin_state_window
+        if win is None:
+            return
+        if key in self.events.inbound_act_slot_ready:
+            # Source on device.
+            self.streams.inbound_fwd_context.wait_event(
+                self.events.inbound_act_slot_ready.get(key)
+            )
+            src_slot: ActivationSlot = self.events.dev_act_slot_mapping[key]
+            if not src_slot.has("lin_final_state"):
+                return  # heterogeneous safety net (dense layer's slot)
+            with torch.cuda.stream(self.streams.inbound_fwd_context):
+                win.fwd.copy_(src_slot.lin_final_state)
+        else:
+            # Source on host.
+            avail = self.events.home_act_slot_available.get(key)
+            if avail is not None:
+                self.streams.inbound_fwd_context.wait_event(avail)
+            home_slot = self._host_act_slots.get(key)
+            if home_slot is None or not home_slot.has("lin_final_state"):
+                return
+            with torch.cuda.stream(self.streams.inbound_fwd_context):
+                win.fwd.copy_(home_slot.lin_final_state)
 
     def _refresh_kv_window(
         self,
