@@ -359,6 +359,19 @@ class ChunkMeta:
     # per-sequence prior context length (host copies used for KV placement)
     prior_seq_lens_host: Sequence[int]
     prior_seq_offsets_host: Sequence[int]
+    # per-packed-sequence: True iff later chunks of this sequence exist
+    # in fwd order. Equivalently, in bwd reverse traversal: True iff
+    # later-fwd chunks of this seq have ALREADY run their bwd and
+    # accumulated cross-chunk dK/dV contributions into the kv-grad
+    # window at this chunk's positions. Attention bwd uses this flag
+    # to decide whether to write flash_attn_bwd's dK/dV directly into
+    # ctx.kv_cache.dk/dv (overwriting prior — fine when no prior
+    # exists) or into scratch + add to preserve prior contributions.
+    #
+    # For small (packed) seqs this is always False. For long-seq
+    # continuation chunks emitted by ``_pack_sequences._emit_large``,
+    # this is True for every chunk except the seq's final fwd chunk.
+    has_more_chunks_host: Sequence[bool] = field(default_factory=list)
     # extensible -- some ops (MoE router, sliding window) need more
     extra: Mapping[str, Any] = field(default_factory=dict)
 
@@ -371,6 +384,7 @@ class ChunkMeta:
         prior_seq_offsets: Sequence[int],
         *,
         device: torch.device | str,
+        has_more_chunks: Sequence[bool] | None = None,
     ) -> "ChunkMeta":
         """Mirrors ``dense_layer.py:707`` ``make_chunk_metadata``."""
         import numpy as np
@@ -379,6 +393,12 @@ class ChunkMeta:
         assert (
             len(prior_seq_lens) == num_seqs
         ), "num_prior_seqs must match num_seqs"
+        if has_more_chunks is None:
+            has_more_chunks = [False] * num_seqs
+        else:
+            assert len(has_more_chunks) == num_seqs, (
+                f"has_more_chunks len ({len(has_more_chunks)}) != num_seqs ({num_seqs})"
+            )
 
         total_q = int(sum(seq_lens))
         total_k = int(sum(prior_seq_lens)) + total_q
@@ -437,6 +457,7 @@ class ChunkMeta:
             max_seqlen_k=max_seqlen_k,
             prior_seq_lens_host=list(prior_seq_lens),
             prior_seq_offsets_host=list(prior_seq_offsets),
+            has_more_chunks_host=list(has_more_chunks),
         )
 
     def as_orig_dict(self) -> dict:
@@ -447,6 +468,7 @@ class ChunkMeta:
             "seq_lens_host": list(self.seq_lens_host),
             "prior_seq_lens_host": list(self.prior_seq_lens_host),
             "prior_seq_offsets_host": list(self.prior_seq_offsets_host),
+            "has_more_chunks_host": list(self.has_more_chunks_host),
             "total_q": self.total_q,
             "total_k": self.total_k,
             "seq_positions": self.seq_positions,

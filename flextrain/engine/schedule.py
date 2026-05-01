@@ -333,6 +333,14 @@ class _PendingChunk:
     pos: list[int] = field(default_factory=list)
     prior_lens: list[int] = field(default_factory=list)
     prior_offsets: list[int] = field(default_factory=list)
+    # Per-contributing-seq flag: True iff later chunks of this seq exist
+    # in fwd order. Small (packed) seqs are always False (they fit in
+    # one chunk). Large-seq continuation chunks are True for every
+    # emitted chunk except the seq's final chunk. Used by attention
+    # bwd to decide whether prior reverse iters' cross-chunk dK/dV
+    # contributions are sitting in the kv_cache.dk/dv window and must
+    # be preserved across this chunk's flash_attn_bwd call.
+    has_more_chunks: list[bool] = field(default_factory=list)
     contributions: list[_SeqContribution] = field(default_factory=list)
     size: int = 0
 
@@ -357,6 +365,7 @@ def _pack_small(seq, pc: _PendingChunk) -> None:
     pc.pos.extend(range(n))
     pc.prior_lens.append(0)
     pc.prior_offsets.append(start)
+    pc.has_more_chunks.append(False)
     pc.contributions.append(
         _SeqContribution(
             seq=seq, seq_range=(0, n), chunk_range=(start, start + n)
@@ -380,6 +389,8 @@ def _emit_large(seq, max_chunk_size: int) -> Iterator[_PendingChunk]:
         pc.pos.extend(range(cursor, cursor + take))
         pc.prior_lens.append(cursor)  # <-- key: continuation chunks have prior_len>0
         pc.prior_offsets.append(0)
+        # has_more_chunks: True iff this is NOT the final chunk of seq.
+        pc.has_more_chunks.append(cursor + take < n)
         pc.contributions.append(
             _SeqContribution(
                 seq=seq, seq_range=(cursor, cursor + take), chunk_range=(0, take)
@@ -444,6 +455,7 @@ def _materialize(
         seq_positions=pc.pos,
         prior_seq_lens=pc.prior_lens,
         prior_seq_offsets=pc.prior_offsets,
+        has_more_chunks=pc.has_more_chunks,
         device=device,
     )
     seqs = [

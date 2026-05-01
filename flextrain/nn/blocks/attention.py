@@ -623,8 +623,33 @@ class GQAAttentionBlock:
 
         # 3. flash-attn bwd -- writes into dq and into the running dk/dv
         #    context ring.
+        #
+        # Cross-chunk dK/dV accumulation: ``flextrain_attention_bwd``
+        # OVERWRITES the dk/dv tensors it's given (per the note in
+        # ``flextrain/ops/_kernels/attention.py``). For multi-chunk
+        # seqs where later-fwd chunks have ALREADY run their bwd in
+        # the reverse traversal, those chunks accumulated cross-chunk
+        # dK/dV contributions into ``ctx.kv_cache.dk/dv`` at this
+        # chunk's positions. Writing flash_attn_bwd's output directly
+        # into the kv-cache window would clobber them.
+        #
+        # Detect via ``chunk.has_more_chunks_host`` (set by
+        # ``_pack_sequences._emit_large`` for non-final chunks of a
+        # long seq). When True, write to scratch + add. Otherwise
+        # write directly to the kv-cache window (legacy fast path).
         dq = ctx.scratch(dx_up_attn.shape, dx_up_attn.dtype)
         dq.zero_()
+        need_dkv_accum = any(chunk.has_more_chunks_host)
+        if need_dkv_accum:
+            dk_target = ctx.scratch(
+                (total_k, n_kv, head_dim), ctx.kv_cache.dk.dtype,
+            )
+            dv_target = ctx.scratch(
+                (total_k, n_kv, head_dim), ctx.kv_cache.dv.dtype,
+            )
+        else:
+            dk_target = ctx.kv_cache.dk[:total_k, :]
+            dv_target = ctx.kv_cache.dv[:total_k, :]
         flextrain_attention_bwd(
             dx_up_attn,
             slot.xq.view(-1, n_heads, head_dim),
@@ -633,8 +658,8 @@ class GQAAttentionBlock:
             slot.attn_result,
             slot.softmax_lse,
             dq,
-            ctx.kv_cache.dk[:total_k, :],
-            ctx.kv_cache.dv[:total_k, :],
+            dk_target,
+            dv_target,
             chunk.q_seq_offsets,
             chunk.k_seq_offsets,
             chunk.q_seq_lens,
@@ -645,6 +670,9 @@ class GQAAttentionBlock:
             window_size=(cfg.window_size_left, cfg.window_size_right),
             softcap=cfg.attn_logit_softcap,
         )
+        if need_dkv_accum:
+            ctx.kv_cache.dk[:total_k, :].add_(dk_target)
+            ctx.kv_cache.dv[:total_k, :].add_(dv_target)
 
         # 4. Pull out this chunk's local dK / dV from the backward ring and
         #    zero those positions so the previous chunk doesn't double-count.

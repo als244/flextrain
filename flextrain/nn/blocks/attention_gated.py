@@ -545,11 +545,35 @@ class GQAAttentionGatedBlock:
             d_gated * attn_result_2d * sig_gate * (1.0 - sig_gate)
         )
 
-        # 4. flash-attn bwd consumes d_attn_result, writes dq + dk/dv
-        #    into the running KV-grad ring.
+        # 4. flash-attn bwd consumes d_attn_result, writes dq + dk/dv.
+        #
+        # Cross-chunk dK/dV accumulation: ``flextrain_attention_bwd``
+        # OVERWRITES the dk/dv tensors it's given (per the note in
+        # ``flextrain/ops/_kernels/attention.py``). For multi-chunk
+        # seqs where later-fwd chunks have ALREADY run their bwd in
+        # the reverse traversal, those chunks accumulated cross-chunk
+        # dK/dV contributions into ``ctx.kv_cache.dk/dv`` at this
+        # chunk's positions. Writing flash_attn_bwd's output directly
+        # into the kv-cache window would clobber them.
+        #
+        # Detect via ``chunk.has_more_chunks_host`` (set by
+        # ``_pack_sequences._emit_large`` for non-final chunks of a
+        # long seq). When True, write to scratch + add. Otherwise
+        # write directly to the kv-cache window (legacy fast path).
         d_attn_result_3d = d_attn_result_2d.view(num_tokens, n_heads, head_dim)
         dq = ctx.scratch(d_attn_result_3d.shape, d_attn_result_3d.dtype)
         dq.zero_()
+        need_dkv_accum = any(chunk.has_more_chunks_host)
+        if need_dkv_accum:
+            dk_target = ctx.scratch(
+                (total_k, n_kv, head_dim), ctx.kv_cache.dk.dtype,
+            )
+            dv_target = ctx.scratch(
+                (total_k, n_kv, head_dim), ctx.kv_cache.dv.dtype,
+            )
+        else:
+            dk_target = ctx.kv_cache.dk[:total_k, :]
+            dv_target = ctx.kv_cache.dv[:total_k, :]
         flextrain_attention_bwd(
             d_attn_result_3d,
             slot.xq.view(-1, n_heads, head_dim),
@@ -558,8 +582,8 @@ class GQAAttentionGatedBlock:
             slot.attn_result,
             slot.softmax_lse,
             dq,
-            ctx.kv_cache.dk[:total_k, :],
-            ctx.kv_cache.dv[:total_k, :],
+            dk_target,
+            dv_target,
             chunk.q_seq_offsets,
             chunk.k_seq_offsets,
             chunk.q_seq_lens,
@@ -570,6 +594,9 @@ class GQAAttentionGatedBlock:
             window_size=(cfg.window_size_left, cfg.window_size_right),
             softcap=cfg.attn_logit_softcap,
         )
+        if need_dkv_accum:
+            ctx.kv_cache.dk[:total_k, :].add_(dk_target)
+            ctx.kv_cache.dv[:total_k, :].add_(dv_target)
 
         # 5. Pull this chunk's local dK / dV from the bwd ring + zero the
         #    consumed positions so the prior chunk doesn't double-count.

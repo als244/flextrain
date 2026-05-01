@@ -38,7 +38,7 @@ def flash2_attention_fwd(q, k, v, out, softmax_lse, q_seq_offsets, k_seq_offsets
                                                                     leftpad_k, block_table, alibi_slopes, 
                                                                     max_seqlen_q, max_seqlen_k,
                                                                     dropout_p, softmax_scale, True,
-                                                                    causal, window_size[0], window_size[1],
+                                                                    causal, window_size[0], window_size[1], 
                                                                     softcap, False, None)
 
     softmax_lse.copy_(gpu_softmax_lse)
@@ -168,7 +168,20 @@ def flextrain_attention_fwd(q, k, v, out, softmax_lse, q_seq_offsets, k_seq_offs
 
 def flextrain_attention_bwd(dout, q, k, v, out, softmax_lse, dq, dk, dv, q_seq_offsets, k_seq_offsets, q_seq_lens, k_seq_lens, max_seqlen_q, max_seqlen_k, causal=True, window_size=(-1, -1),
                         deterministic=True, sm_margin=0, softcap=0.0):
-    
+    # IMPORTANT — accumulation semantics:
+    # ``dq``/``dk``/``dv`` are caller-supplied output buffers. The
+    # underlying flash_attn varlen_bwd OVERWRITES these tensors (if not
+    # None) — it does NOT accumulate. Pre-existing values are clobbered.
+    # If a caller is None, the backend allocates a fresh tensor and
+    # returns it.
+    #
+    # For multi-chunk training where a prior reverse iteration has
+    # written cross-chunk dK/dV contributions into a global window
+    # at this chunk's positions, callers MUST pass scratch buffers
+    # to dk/dv (or None) and accumulate the result back into the
+    # window themselves. See ``GQAAttentionBlock.bwd`` /
+    # ``GQAAttentionGatedBlock.bwd`` for the pattern.
+
     # dout: (total tokens, n_q_heads, head_dim)
     # q: (total tokens, n_q_heads, head_dim)
     # k: (total tokens, n_kv_heads, head_dim)
