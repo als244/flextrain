@@ -37,8 +37,8 @@ def flash2_attention_fwd(q, k, v, out, softmax_lse, q_seq_offsets, k_seq_offsets
                                                                     q_seq_offsets, k_seq_offsets, k_seq_lens, 
                                                                     leftpad_k, block_table, alibi_slopes, 
                                                                     max_seqlen_q, max_seqlen_k,
-                                                                    dropout_p, softmax_scale, False,
-                                                                    causal, window_size[0], window_size[1], 
+                                                                    dropout_p, softmax_scale, True,
+                                                                    causal, window_size[0], window_size[1],
                                                                     softcap, False, None)
 
     softmax_lse.copy_(gpu_softmax_lse)
@@ -91,7 +91,7 @@ def flash2_attention_bwd(dout, q, k, v, out, softmax_lse, dq, dk, dv, q_seq_offs
                           alibi_slopes,
                           max_seqlen_q, max_seqlen_k,
                           dropout_p, softmax_scale,
-                          False, causal, window_size[0], window_size[1],
+                          True, causal, window_size[0], window_size[1],
                           softcap, deterministic, None, rng_state)
     
     del softmax_d
