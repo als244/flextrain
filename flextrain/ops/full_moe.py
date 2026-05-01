@@ -633,7 +633,7 @@ def swiglu_expert_loop_bwd(
 
         with torch.cuda.stream(cur_stream):
             # a) dx_act_up = exp_upstream @ w_down.T
-            cur_dispatcher.matmul(
+            cur_dispatcher.matmul_fast(
                 cur_stream_ptr, A=exp_upstream, B=w_down_e.T, D=dx_act_up,
             )
             # b) SwiGLU bwd: rescale + d_router_weight + recomputed fwd_act
@@ -651,14 +651,14 @@ def swiglu_expert_loop_bwd(
                     )
             elif grads.get("g_down") is not None:
                 g_down_e = grads["g_down"][eid, :, :]
-                cur_dispatcher.matmul(
+                cur_dispatcher.matmul_fast(
                     cur_stream_ptr,
                     A=fwd_act.T, B=exp_upstream,
                     C=g_down_e, D=g_down_e,
                     beta=1.0, alpha=1.0,
                 )
             # d) dx_pre = dx_up_up @ w_up.T (overwrites exp_upstream)
-            cur_dispatcher.matmul(
+            cur_dispatcher.matmul_fast(
                 cur_stream_ptr, A=dx_up_up, B=w_up_e.T, D=exp_upstream,
             )
             # e) g_up[e] += scattered_x[start:end].T @ dx_up_up  (or LoRA callback)
@@ -672,7 +672,7 @@ def swiglu_expert_loop_bwd(
                     )
             elif grads.get("g_up") is not None:
                 g_up_e = grads["g_up"][eid, :, :]
-                cur_dispatcher.matmul(
+                cur_dispatcher.matmul_fast(
                     cur_stream_ptr,
                     A=exp_inp.T, B=dx_up_up,
                     C=g_up_e, D=g_up_e,

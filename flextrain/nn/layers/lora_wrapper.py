@@ -635,7 +635,8 @@ class LoRAWrapperLayer:
         that ``ffn_moe.bwd`` calls per-expert (or once for router) for
         each LoRA-targeted projection. The closure does the rank-r
         matmul into the LoRA A/B grad accumulators directly via the
-        caller's cuBLASLt dispatcher, so we never materialize the full
+        caller's cuBLASLt dispatcher fast path (CPython ``matmul_fast``,
+        bypassing ctypes entirely), so we never materialize the full
         per-expert ``dW`` and never trip through PyTorch's matmul
         dispatcher (~3x cheaper per call vs. eager ``@`` + ``.add_()``).
 
@@ -697,8 +698,8 @@ class LoRAWrapperLayer:
                 A, B, ga, gb = A_full, B_full, ga_full, gb_full
 
             if dispatcher is None:
-                # Slow path (router callback, called once per layer):
-                # plain PyTorch @ + .add_(). Simpler; not on hot path.
+                # Slow path (router callback): plain PyTorch @ + .add_().
+                # Cold; called at most once per layer.
                 dY_B = dY @ B.transpose(-1, -2)
                 dA = (X.transpose(-1, -2) @ dY_B) * scale
                 X_A = X @ A
@@ -707,20 +708,19 @@ class LoRAWrapperLayer:
                 gb.add_(dB.to(gb.dtype))
                 return
 
+            # Fast path: 4x dispatcher.matmul_fast (CPython METH_FASTCALL,
+            # cached cuBLASLt + fused epilogue). Per-stream scratch
+            # avoids any allocator hits.
             T_e = X.shape[0]
-            dY_B = dY_B_buf[:T_e, :r]                       # (T_e, r)
-            X_A  = X_A_buf[:T_e, :r]                        # (T_e, r)
-            # 1) dY_B = dY @ B^T          (T_e, out) x (out, r) -> (T_e, r)
-            dispatcher.matmul(stream_ptr, A=dY, B=B.T, D=dY_B)
-            # 2) X_A  = X @ A             (T_e, in)  x (in, r)  -> (T_e, r)
-            dispatcher.matmul(stream_ptr, A=X,  B=A,   D=X_A)
-            # 3) ga += scale * X^T @ dY_B   (in, T_e) x (T_e, r) -> (in, r)
-            dispatcher.matmul(
+            dY_B = dY_B_buf[:T_e, :r]
+            X_A  = X_A_buf[:T_e, :r]
+            dispatcher.matmul_fast(stream_ptr, A=dY, B=B.T, D=dY_B)
+            dispatcher.matmul_fast(stream_ptr, A=X,  B=A,   D=X_A)
+            dispatcher.matmul_fast(
                 stream_ptr, A=X.T, B=dY_B,
                 C=ga, D=ga, alpha=scale, beta=1.0,
             )
-            # 4) gb += scale * X_A^T @ dY   (r, T_e) x (T_e, out) -> (r, out)
-            dispatcher.matmul(
+            dispatcher.matmul_fast(
                 stream_ptr, A=X_A.T, B=dY,
                 C=gb, D=gb, alpha=scale, beta=1.0,
             )

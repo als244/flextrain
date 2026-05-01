@@ -90,19 +90,53 @@ def _get_layout(t):
         )
 
 
-# --- 4. Python Wrapper Class ---
+# --- 4. CPython fast-path (METH_FASTCALL, no ctypes) ---
+
+try:
+    from . import _dispatch_pyext as _pyext
+    _matmul_fast = _pyext.matmul_fast
+    matmul_fast = _matmul_fast  # module-level alias for raw callers
+except ImportError:
+    _matmul_fast = None
+    matmul_fast = None
+
+_dtype_to_enum = {
+    torch.float16: 1,
+    torch.bfloat16: 2,
+    torch.float32: 0,
+}
+
+
+def tensor_layout(t):
+    """Return ``(data_ptr, leading_dim, trans_flag)`` for a 2-D tensor."""
+    return _get_layout(t)
+
+
+def dtype_enum(dtype):
+    """Map a torch dtype to the dispatcher's int enum (0=fp32, 1=fp16, 2=bf16)."""
+    try:
+        return _dtype_to_enum[dtype]
+    except KeyError:
+        raise ValueError(f"unsupported dtype {dtype} for matmul_fast")
+
+
+# --- 5. Python Wrapper Class ---
 
 class CublasLtDispatcher:
     def __init__(self, round_multiple=32, max_algos=5):
         self.round_multiple = round_multiple
         self.max_algos = max_algos
         self.ctx = _lib.create_dispatcher(round_multiple, max_algos)
-        self.workspace_size = 64 * 1024 * 1024 
+        self.workspace_size = 64 * 1024 * 1024
         self.workspace = torch.empty(self.workspace_size, dtype=torch.uint8, device='cuda')
         self.ws_ptr = self.workspace.data_ptr()
         self.fp16 = torch.float16
         self.bf16 = torch.bfloat16
         self.total_python_ns = 0
+        # Cached as plain ints so the FASTCALL hot path can pass them
+        # without conversion. ctypes' c_void_p restype already returns a
+        # Python int.
+        self._ctx_int = int(self.ctx) if self.ctx is not None else 0
 
     def __del__(self):
         if hasattr(self, 'ctx') and self.ctx:
@@ -191,6 +225,54 @@ class CublasLtDispatcher:
 
         if ret != 0:
             raise RuntimeError("Failed to dispatch matmul")
-        
+
         self.total_python_ns += (time.perf_counter_ns() - t0)
         return D
+
+    def matmul_fast(self, stream_ptr, A, B, C=None, D=None, alpha=1.0, beta=0.0):
+        """Minimal-overhead drop-in for :meth:`matmul` for the hot path.
+
+        Differences vs :meth:`matmul`:
+          * Calls the CPython METH_FASTCALL extension (no ctypes FFI).
+          * Skips dim/None/dtype validation. Caller is responsible.
+          * Skips the ``total_python_ns`` instrumentation.
+
+        Same math contract: ``D = alpha * A @ B + beta * C``. ``D`` must be
+        provided (no implicit allocation). Tensors must be 2-D bf16/fp16/fp32.
+        """
+        # Inline tensor introspection — same logic as ``_get_layout`` but
+        # avoids the function-call overhead.
+        a_stride = A.stride()
+        if a_stride[1] == 1:
+            ptr_A, ld_A, trans_a = A.data_ptr(), a_stride[0], 0
+        else:
+            ptr_A, ld_A, trans_a = A.data_ptr(), a_stride[1], 1
+        b_stride = B.stride()
+        if b_stride[1] == 1:
+            ptr_B, ld_B, trans_b = B.data_ptr(), b_stride[0], 0
+        else:
+            ptr_B, ld_B, trans_b = B.data_ptr(), b_stride[1], 1
+        d_stride = D.stride()
+        ptr_D, ld_D = D.data_ptr(), d_stride[0]
+        if C is None:
+            ptr_C, ld_C = 0, ld_D
+        else:
+            ptr_C, ld_C = C.data_ptr(), C.stride(0)
+
+        M, K = A.shape
+        _, N = B.shape
+        dt = _dtype_to_enum[A.dtype]
+
+        _matmul_fast(
+            self._ctx_int, stream_ptr,
+            M, N, K,
+            ptr_A, ld_A, trans_a,
+            ptr_B, ld_B, trans_b,
+            ptr_C, ld_C,
+            ptr_D, ld_D,
+            self.ws_ptr, self.workspace_size,
+            dt, dt, dt, dt, 0,
+            alpha, beta,
+        )
+
+

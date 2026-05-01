@@ -1,77 +1,126 @@
+"""Build script for ``matmul_dispatcher``.
+
+Two build targets:
+
+1. ``libmatmul_dispatcher.so`` — the C++/CUDA shared library that owns
+   the cuBLASLt context, algo cache, and ``dispatch_matmul`` C ABI.
+   Built via CMake (CUDA toolchain integration).
+2. ``matmul_dispatcher._dispatch_pyext`` — a CPython extension module
+   that exposes ``matmul_fast`` (METH_FASTCALL) and links against
+   ``libmatmul_dispatcher.so`` to call ``dispatch_matmul`` directly,
+   bypassing ctypes for hot paths.
+
+Both end up inside the ``matmul_dispatcher`` package directory so the
+Python wrapper at ``matmul_dispatcher/__init__.py`` can dlopen the .so
+and import the extension.
+"""
 import os
 import subprocess
 import sys
 import shutil
+import sysconfig
+from pathlib import Path
+
 from setuptools import setup, Extension, find_packages
 from setuptools.command.build_ext import build_ext
 
+
+_HERE = Path(__file__).resolve().parent
+_PKG_DIR = _HERE / "matmul_dispatcher"
+
+
+# ---------------------------------------------------------------------------
+# CMake-built C++/CUDA shared library.
+# ---------------------------------------------------------------------------
+
+
 class CMakeExtension(Extension):
-    def __init__(self, name, sourcedir=''):
-        Extension.__init__(self, name, sources=[])
+    def __init__(self, name, sourcedir=""):
+        super().__init__(name, sources=[])
         self.sourcedir = os.path.abspath(sourcedir)
 
-class CMakeBuild(build_ext):
+
+# ---------------------------------------------------------------------------
+# Custom build_ext: route CMake extensions through cmake, route plain
+# Extensions (the CPython pyext) through the default builder.
+# ---------------------------------------------------------------------------
+
+
+class CMakeOrSetuptoolsBuild(build_ext):
     def run(self):
-        for ext in self.extensions:
-            self.build_extension(ext)
+        # First build the CMake extension(s) so the .so is on disk
+        # before the CPython extension links against it.
+        cmake_exts = [e for e in self.extensions if isinstance(e, CMakeExtension)]
+        other_exts = [e for e in self.extensions if not isinstance(e, CMakeExtension)]
 
-    def build_extension(self, ext):
-        # 1. Determine build directory
-        extdir = os.path.abspath(os.path.dirname(self.get_ext_fullpath(ext.name)))
-        if not extdir.endswith(os.path.sep):
-            extdir += os.path.sep
+        for ext in cmake_exts:
+            self._build_cmake(ext)
 
-        # 2. CMake Arguments
+        # Now let setuptools build the regular Extensions.
+        self.extensions = other_exts
+        super().run()
+        # Restore for downstream tools.
+        self.extensions = cmake_exts + other_exts
+
+    def _build_cmake(self, ext):
+        extdir = Path(self.get_ext_fullpath(ext.name)).resolve().parent
+        extdir.mkdir(parents=True, exist_ok=True)
+
         cmake_args = [
-            f'-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={extdir}',
-            f'-DPYTHON_EXECUTABLE={sys.executable}',
-            '-DCMAKE_BUILD_TYPE=Debug',
+            f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={extdir}",
+            f"-DPYTHON_EXECUTABLE={sys.executable}",
+            "-DCMAKE_BUILD_TYPE=Release",
         ]
+        Path(self.build_temp).mkdir(parents=True, exist_ok=True)
 
-        if not os.path.exists(self.build_temp):
-            os.makedirs(self.build_temp)
+        subprocess.check_call(
+            ["cmake", ext.sourcedir] + cmake_args, cwd=self.build_temp
+        )
+        subprocess.check_call(
+            ["cmake", "--build", ".", "--parallel"], cwd=self.build_temp
+        )
 
-        # 3. Run CMake
-        subprocess.check_call(['cmake', ext.sourcedir] + cmake_args, cwd=self.build_temp)
-        subprocess.check_call(['cmake', '--build', '.'], cwd=self.build_temp)
+        # Copy the built .so into the package source tree so editable
+        # installs find it (CMake itself targets ``matmul_dispatcher/``
+        # but explicit copy makes the contract obvious).
+        for f in os.listdir(extdir):
+            if f.startswith("libmatmul_dispatcher") and (
+                f.endswith(".so") or f.endswith(".dll") or f.endswith(".dylib")
+            ):
+                src = extdir / f
+                dst = _PKG_DIR / f
+                if src.resolve() != dst.resolve():
+                    print(f"Copying {src} -> {dst}")
+                    shutil.copy(src, dst)
 
-        # 4. ROBUST COPY: Copy generated library to source tree for editable installs
-        lib_name = "libmatmul_dispatcher"
-        built_file = None
-        
-        # Look for the built file in the build_temp directory or where CMake put it
-        # Because CMakeLists.txt might force output to source, we check both locations
-        possible_locs = [extdir, os.path.join(os.path.dirname(os.path.abspath(__file__)), "matmul_dispatcher")]
-        
-        for loc in possible_locs:
-            if not os.path.exists(loc): continue
-            for f in os.listdir(loc):
-                if lib_name in f and (f.endswith('.so') or f.endswith('.dll') or f.endswith('.dylib')):
-                    built_file = os.path.join(loc, f)
-                    break
-            if built_file: break
 
-        if built_file:
-            dest_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "matmul_dispatcher")
-            dest_path = os.path.join(dest_dir, os.path.basename(built_file))
-            
-            # --- FIX: Only copy if source and destination are different ---
-            try:
-                if os.path.abspath(built_file) != os.path.abspath(dest_path):
-                    print(f"Copying {built_file} -> {dest_dir}")
-                    shutil.copy(built_file, dest_dir)
-                else:
-                    print(f"Library already in correct location: {built_file}")
-            except shutil.SameFileError:
-                pass # Explicitly ignore if they are the same file
+# ---------------------------------------------------------------------------
+# CPython fast-path extension module.
+# ---------------------------------------------------------------------------
+
+
+pyext = Extension(
+    name="matmul_dispatcher._dispatch_pyext",
+    sources=[str(_HERE / "src" / "dispatch_pyext.cpp")],
+    include_dirs=[str(_HERE / "src")],
+    library_dirs=[str(_PKG_DIR)],
+    libraries=["matmul_dispatcher"],
+    runtime_library_dirs=["$ORIGIN"],
+    extra_compile_args=["-O3", "-std=c++17"],
+    language="c++",
+)
+
 
 setup(
-    name='matmul_dispatcher',
-    version='0.0.1',
+    name="matmul_dispatcher",
+    version="0.0.2",
     packages=find_packages(),
-    package_data={'matmul_dispatcher': ['*.so', '*.dll', '*.dylib']}, 
-    ext_modules=[CMakeExtension('matmul_dispatcher.libmatmul_dispatcher')],
-    cmdclass=dict(build_ext=CMakeBuild),
+    package_data={"matmul_dispatcher": ["*.so", "*.dll", "*.dylib"]},
+    ext_modules=[
+        CMakeExtension("matmul_dispatcher.libmatmul_dispatcher"),
+        pyext,
+    ],
+    cmdclass={"build_ext": CMakeOrSetuptoolsBuild},
     zip_safe=False,
-    install_requires=['torch'],
+    install_requires=["torch"],
 )

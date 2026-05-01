@@ -29,49 +29,49 @@ import math
 @triton.jit
 def swiglu_fwd_weighted_kernel(
     X_PTR,      # Packed Input (T x 2F)
-    W_PTR,      # Router Weights (T)
+    W_PTR,      # Router Weights (T) — only read when USE_W
     OUT_PTR,    # Output (T x F)
-    stride_x_t, 
-    stride_out_t, 
-    F: tl.constexpr,         
-    BLOCK_SIZE: tl.constexpr
+    stride_x_t,
+    stride_out_t,
+    F: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    USE_W: tl.constexpr,
 ):
     """
-    SwiGLU forward with router weight scaling.
-    
+    SwiGLU forward with optional router weight scaling.
+
     IMPORTANT: Input X is packed as [x3, x1] where:
       - x3 (value) is in the FIRST half:  X[:, :F]
       - x1 (gate) is in the SECOND half:  X[:, F:]
-    
-    Computes: out = w * (SiLU(x1) * x3)
+
+    Computes: out = (SiLU(x1) * x3) [* w if USE_W]
     """
-    pid_t = tl.program_id(0).to(tl.int64) 
+    pid_t = tl.program_id(0).to(tl.int64)
     pid_f = tl.program_id(1).to(tl.int64)
-    
+
     offs_f = pid_f * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask_f = offs_f < F
 
-    w = tl.load(W_PTR + pid_t).to(tl.float32)
-
     row_start_ptr = X_PTR + (pid_t * stride_x_t)
-    
+
     # FIXED: x3 (value) is first half, x1 (gate) is second half
     x3_ptrs = row_start_ptr + offs_f          # value: first half [0:F]
     x1_ptrs = row_start_ptr + F + offs_f      # gate: second half [F:2F]
-    
-    x3 = tl.load(x3_ptrs, mask=mask_f)  # value
-    x1 = tl.load(x1_ptrs, mask=mask_f)  # gate
+
+    x3 = tl.load(x3_ptrs, mask=mask_f)
+    x1 = tl.load(x1_ptrs, mask=mask_f)
 
     x1_f32 = x1.to(tl.float32)
     x3_f32 = x3.to(tl.float32)
     s = tl.sigmoid(x1_f32)
 
     swiglu_out = (x1_f32 * s) * x3_f32
-    
-    out = swiglu_out * w
+    if USE_W:
+        w = tl.load(W_PTR + pid_t).to(tl.float32)
+        swiglu_out = swiglu_out * w
 
     out_ptrs = OUT_PTR + (pid_t * stride_out_t) + offs_f
-    tl.store(out_ptrs, out.to(OUT_PTR.dtype.element_ty), mask=mask_f)
+    tl.store(out_ptrs, swiglu_out.to(OUT_PTR.dtype.element_ty), mask=mask_f)
 
 
 @triton.jit
@@ -1307,32 +1307,35 @@ def flextrain_swiglu_moe_fwd(
     """
     if not x.is_cuda:
         raise ValueError("x must be a CUDA tensor")
-    
-    if w is not None:
-        if not w.is_cuda:
-            raise ValueError("w must be a CUDA tensor")
-    else:
-        w = torch.ones((x.shape[0],), device=x.device, dtype=x.dtype)
-    
+
+    use_w = w is not None
+    if use_w and not w.is_cuda:
+        raise ValueError("w must be a CUDA tensor")
+
     T, F2 = x.shape
     if F2 % 2 != 0:
         raise ValueError(f"x last dimension must be even (got {F2}), as it contains packed [value, gate]")
     F = F2 // 2
-    
+
     if out is None:
         out = torch.empty((T, F), device=x.device, dtype=x.dtype)
     else:
         if out.shape != (T, F):
             raise ValueError(f"out shape {out.shape} must be [{T}, {F}]")
-    
+
     BLOCK_SIZE = 1024
     grid = (T, triton.cdiv(F, BLOCK_SIZE))
-    
+
+    # When USE_W is False, the kernel doesn't read W_PTR — pass x as a
+    # dummy non-null pointer to keep Triton's launch happy.
+    w_arg = w if use_w else x
+
     swiglu_fwd_weighted_kernel[grid](
-        x, w, out,
+        x, w_arg, out,
         x.stride(0), out.stride(0),
         F=F,
-        BLOCK_SIZE=BLOCK_SIZE
+        BLOCK_SIZE=BLOCK_SIZE,
+        USE_W=use_w,
     )
     return out
 
