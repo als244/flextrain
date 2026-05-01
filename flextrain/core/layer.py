@@ -629,6 +629,16 @@ class LayerContext:
     # in ``_backward_pass`` and False everywhere else.
     lin_attn_recompute_only: bool = False
 
+    # ``lin_conv_*_window``: engine's per-layer global ``(conv_dim, W)
+    # bf16`` buffers for the depthwise causal conv1d cross-chunk state
+    # (Item 3c, C8). Same semantics as ``lin_attn_*_window`` but for
+    # the conv1d's last-W-tokens state instead of the recurrent state.
+    # The same ``lin_attn_recompute_only`` flag gates writes during
+    # forward_recompute (recompute updates slot.lin_conv_state but
+    # leaves the global window untouched).
+    lin_conv_fwd_window: torch.Tensor | None = None
+    lin_conv_bwd_window: torch.Tensor | None = None
+
 
 # ---------------------------------------------------------------------------
 # Layer Protocols. Three variants:

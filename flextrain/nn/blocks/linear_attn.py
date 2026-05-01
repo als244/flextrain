@@ -43,6 +43,7 @@ post-conv (silu output) is also NOT saved (transient scratch).
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Mapping, MutableMapping
 
@@ -172,6 +173,8 @@ def _fla_causal_conv1d_fwd_into(
     cu_seqlens: torch.Tensor | None = None,
     bt: int = 64,
     activation: str | None = None,
+    initial_state: torch.Tensor | None = None,    # (N, D, W) bf16; None disables
+    final_state_out: torch.Tensor | None = None,  # (D, W) bf16; written in-place if not None
 ) -> None:
     """Direct call into FLA's ``causal_conv1d_fwd_kernel`` writing into
     a caller-supplied output buffer.
@@ -185,6 +188,15 @@ def _fla_causal_conv1d_fwd_into(
     chunk_indices for varlen) but skip the allocation. The output
     must already be contiguous (the kernel writes contiguously, but
     we read it back as a (T, D) view).
+
+    ``initial_state``/``final_state_out`` (Item 3c, C8): when provided,
+    enable cross-chunk plumbing per FLA's conv state semantics
+    (``initial_state[n, d, j]`` for ``j ∈ [1, W-1]`` is the prior
+    chunk's token at relative position ``j - W``; index 0 unused).
+    ``final_state_out`` is written via FLA's
+    ``causal_conv1d_update_states`` helper from the last W tokens of
+    ``x_2d`` — providing it triggers FLA's standard final-state build
+    (= last W tokens transposed, shape ``(N, D, W)``).
     """
     import triton  # local import to keep top-of-file imports light
     from fla.modules.conv.triton.ops import prepare_chunk_indices, rearrange
@@ -216,7 +228,7 @@ def _fla_causal_conv1d_fwd_into(
         bias=None,
         residual=None,
         cu_seqlens=cu_seqlens,
-        initial_state=None,
+        initial_state=initial_state,
         chunk_indices=chunk_indices,
         B=B, T=T, D=D, W=W,
         BT=bt, BW=BW, NB=NB,
@@ -225,6 +237,22 @@ def _fla_causal_conv1d_fwd_into(
         stride_x_d=stride_x_d,
         ACTIVATION=activation,
     )
+    if final_state_out is not None:
+        # Build final_state from the last W tokens of ``x_2d`` per FLA's
+        # standard ``causal_conv1d_update_states`` helper. The helper
+        # allocates a fresh ``(N, D, W)`` tensor; copy into our caller-
+        # supplied buffer to avoid retaining the helper's allocation
+        # across kernel launches.
+        from fla.modules.conv.triton.ops import causal_conv1d_update_states
+        fs = causal_conv1d_update_states(
+            x=x,
+            state_len=W,
+            initial_state=initial_state,
+            cu_seqlens=cu_seqlens,
+        )
+        # ``fs`` shape: (N, D, W). For our single-packed-seq cross-chunk
+        # path N=1 → squeeze. The caller supplies a ``(D, W)`` buffer.
+        final_state_out.copy_(fs.squeeze(0))
 
 
 def _fla_l2norm_fwd_into(
@@ -599,6 +627,42 @@ class GatedDeltaNetBlock:
                 lambda n, d: (cfg.num_v_heads, cfg.head_k_dim, cfg.head_v_dim),
                 torch.float32, tier=0, token_axis=None,
             ),
+            # lin_conv_state: per-(layer, chunk) depthwise-causal-conv1d
+            # state at chunk's END (= last W tokens of chunk N's conv input).
+            # Used for cross-chunk conv state (Item 3c extended, C8):
+            # chunk N+1's fwd reads slot[L, N].lin_conv_state into the
+            # engine's global ``lin_conv_state_window.fwd`` to feed FLA's
+            # ``causal_conv1d_fwd(initial_state=...)`` so positions 0..W-2
+            # of the continuation chunk see chunk N's tail instead of zero
+            # padding. Bwd analogously plumbs ``dht`` (= grad w.r.t. final
+            # state) so chunk N's last W-1 tokens accumulate the right
+            # ``dx`` from chunk N+1's leading positions.
+            #
+            # Shape: ``(conv_dim, W)`` bf16 — per FLA's
+            # ``causal_conv1d_update_states`` layout: index ``[d, w]`` for
+            # ``w ∈ [0, W-1]`` holds ``x[T-W+w, d]`` (most-recent-first
+            # semantics on the W axis: w=W-1 is x[T-1], w=0 is x[T-W];
+            # w=0 is dead-weight per FLA's convention but allocated for
+            # layout simplicity).
+            #
+            # ``token_axis=None`` because the shape does NOT depend on
+            # ``num_tokens`` — it's a constant per-chunk tensor.
+            #
+            # Tier 0 (always saved): the state can't be reproduced from
+            # chunk-N inputs alone (would require re-running fwd of the
+            # prior chunk's conv). Same logic as ``lin_final_state``.
+            #
+            # Populated by chunk N's fwd ONLY when chunk N has more
+            # chunks ahead in its sequence. Slots for single-chunk seqs
+            # allocate the field but leave it zero-initialized.
+            #
+            # Memory cost: ~ conv_dim * W * 2 bytes per slot. For
+            # Qwen3.5-2B: 4096 * 4 * 2 = 32 KiB/slot — negligible.
+            ActivationField(
+                "lin_conv_state",
+                lambda n, d: (cfg.conv_dim, cfg.conv_kernel_size),
+                bf, tier=0, token_axis=None,
+            ),
             # ==================================================
             # Tier 2: FLA scratch + FLA core output. Q/K/V/rstds are
             # NOT saved: bwd already pays a conv recompute (see Stage D2)
@@ -762,6 +826,10 @@ class GatedDeltaNetBlock:
         conv_in: torch.Tensor,
         weights: Mapping[str, torch.Tensor],
         ctx: LayerContext,
+        slot=None,
+        *,
+        activation: str | None = "silu",
+        recompute_only: bool | None = None,
     ) -> torch.Tensor:
         """Stage 2: depthwise causal conv1d + silu, fused.
 
@@ -773,6 +841,25 @@ class GatedDeltaNetBlock:
         allocated from scratch — no slot field for the conv output. The
         bwd path recomputes pre-silu via a conv with activation=None
         when it needs to silu_bwd.
+
+        Cross-chunk state (Item 3c, C8): when ``ctx`` provides
+        ``lin_attn_chunk_seq_infos`` AND the chunk has any seq with
+        prior or future chunks, the layer reads
+        ``ctx.lin_conv_fwd_window`` as ``initial_state`` (FLA expects
+        ``(N=1, D, W)``) so positions ``0..W-2`` of the continuation
+        chunk see the prior chunk's tail instead of zero padding. When
+        the chunk has more chunks ahead, the returned
+        ``final_state`` (= last W tokens of conv input transposed) is
+        written to ``slot.lin_conv_state`` AND to ``ctx.lin_conv_fwd_window``
+        for the NEXT chunk's fwd consumption.
+
+        ``activation`` is exposed as a kwarg so the bwd-side pre-silu
+        recompute path can call this same helper with
+        ``activation=None`` (re-deriving pre-silu post_conv into scratch
+        for ``silu_bwd``).
+
+        ``recompute_only`` overrides the ctx flag (used by the bwd
+        recompute path; mirrors ``_fwd_fla``'s ``recompute_only`` logic).
         """
         cfg = self.cfg
         # FLA weight shape is (D, W); our slot weight is (D, 1, W) for
@@ -780,12 +867,87 @@ class GatedDeltaNetBlock:
         w = weights["w_lin_conv"].squeeze(1).contiguous()
         T = conv_in.shape[0]
         post_conv = ctx.scratch((T, cfg.conv_dim), cfg.compute_dtype)
+
+        # Decide whether this chunk needs cross-chunk conv-state
+        # plumbing. Symmetric with ``_fwd_fla``'s logic.
+        infos = (
+            ctx.lin_attn_chunk_seq_infos if ctx is not None else None
+        )
+        fwd_window = (
+            ctx.lin_conv_fwd_window if ctx is not None else None
+        )
+        need_xchunk = (
+            infos is not None
+            and fwd_window is not None
+            and any(
+                info.has_prior_chunks or info.has_more_chunks
+                for info in infos
+            )
+        )
+        if not need_xchunk:
+            # Legacy path — bit-identical to pre-C8.
+            _fla_causal_conv1d_fwd_into(
+                x_2d=conv_in,
+                weight=w,
+                out_2d=post_conv,
+                activation=activation,
+            )
+            return post_conv
+
+        # Cross-chunk path. Build initial_state of shape (N=1, D, W) iff
+        # any info has prior chunks (otherwise the chunk's positions
+        # 0..W-2 should still see zero padding — same as legacy). Per
+        # ``_pack_sequences``, multi-chunk seqs are dedicated single-
+        # packed-seq → N=1.
+        D, W = cfg.conv_dim, cfg.conv_kernel_size
+        any_has_prior = any(info.has_prior_chunks for info in infos)
+        any_has_more = any(info.has_more_chunks for info in infos)
+
+        init_state = None
+        if any_has_prior:
+            # Window is shape (D, W); FLA expects (N=1, D, W).
+            init_state = fwd_window.unsqueeze(0)
+
+        # We need final_state iff this chunk has more chunks ahead AND
+        # we have a slot to write to. The window write also needs a
+        # destination buffer — write directly into the global window
+        # iff not in recompute_only mode.
+        if recompute_only is None:
+            recompute_only = bool(
+                ctx is not None
+                and getattr(ctx, "lin_attn_recompute_only", False)
+            )
+        # The ``final_state_out`` arg must be a (D, W) buffer. We always
+        # need it when ``any_has_more`` (so we can save final_state to
+        # slot for bwd's later refresh consumption). On non-recompute,
+        # we ALSO want to advance the global window so the next chunk's
+        # fwd reads the correct initial_state.
+        final_state_out = None
+        if any_has_more:
+            # On recompute we still need to write the slot (idempotent
+            # rewrite — same input → same output as the original fwd's
+            # save) but NOT the window. Allocate a transient (D, W)
+            # scratch in that case; on real fwd write straight into the
+            # window so the next chunk reads it without an extra copy.
+            if recompute_only:
+                final_state_out = ctx.scratch((D, W), cfg.compute_dtype)
+            else:
+                final_state_out = fwd_window  # advance global window in-place
+
         _fla_causal_conv1d_fwd_into(
             x_2d=conv_in,
             weight=w,
             out_2d=post_conv,
-            activation="silu",
+            activation=activation,
+            initial_state=init_state,
+            final_state_out=final_state_out,
         )
+
+        # Save final_state into the slot for bwd's refresh. Slot field
+        # was added in C8; older snapshots may not have it.
+        if any_has_more and slot is not None and slot.has("lin_conv_state"):
+            slot.lin_conv_state.copy_(final_state_out)
+
         return post_conv
 
     def _fwd_qkv_heads(
@@ -909,7 +1071,6 @@ class GatedDeltaNetBlock:
                 for info in infos
             )
         )
-
         if not need_xchunk:
             # Legacy path — bit-identical to pre-3c.
             g_post, o, A_int, _, _, _ = chunk_gated_delta_rule_fwd(
@@ -1049,7 +1210,7 @@ class GatedDeltaNetBlock:
             chunk.fla_chunk_indices_64 if chunk is not None else None
         )
         z, conv_in = self._fwd_proj_split(x, weights, slot)
-        post_conv = self._fwd_conv(conv_in, weights, ctx)
+        post_conv = self._fwd_conv(conv_in, weights, ctx, slot)
         q_n, k_n, v_h, _q_rstd, _k_rstd = self._fwd_qkv_heads(post_conv, ctx)
         b, a = _split_ba_ft(slot.lin_ba, self.cfg)
         beta = self._fwd_beta(b, self.cfg.compute_dtype)
@@ -1285,14 +1446,37 @@ class GatedDeltaNetBlock:
         # giving us pre-silu for silu_bwd later) then silu+l2norm. The
         # conv was already mandatory in bwd since Stage D2 (FLA pattern).
         # The added work vs pre-D2.5 is one silu + two strided l2norms.
+        #
+        # Cross-chunk state (Item 3c, C8): this recompute MUST receive
+        # the same ``initial_state`` as the original fwd (= prior chunk's
+        # last W tokens), otherwise positions 0..W-2 of post_conv_pre_silu
+        # would read zero-padding while the original fwd's saved
+        # ``post_conv`` (transitively, via lin_qkvz → conv) reflected the
+        # cross-chunk state. The mismatch would corrupt silu_bwd's
+        # output AND l2norm_bwd's q_rstd/k_rstd derived from the wrong
+        # post_conv.
         post_conv_pre_silu = ctx.scratch(
             (T, cfg.conv_dim), cfg.compute_dtype,
         )
+        infos_conv_bwd = (
+            ctx.lin_attn_chunk_seq_infos if ctx is not None else None
+        )
+        fwd_window_conv_bwd = (
+            ctx.lin_conv_fwd_window if ctx is not None else None
+        )
+        init_state_conv_bwd = None
+        if (
+            infos_conv_bwd is not None
+            and fwd_window_conv_bwd is not None
+            and any(info.has_prior_chunks for info in infos_conv_bwd)
+        ):
+            init_state_conv_bwd = fwd_window_conv_bwd.unsqueeze(0)
         _fla_causal_conv1d_fwd_into(
             x_2d=conv_in,
             weight=weights["w_lin_conv"].squeeze(1).contiguous(),
             out_2d=post_conv_pre_silu,
             activation=None,
+            initial_state=init_state_conv_bwd,
         )
         # post_conv = silu(post_conv_pre_silu); allocate fresh scratch
         # since silu_bwd later needs pre-silu intact.
@@ -1575,11 +1759,55 @@ class GatedDeltaNetBlock:
         W_fla = W_conv.squeeze(1).contiguous()
         x_fla = conv_in.unsqueeze(0)                          # (1, T, D)
         dy_fla = d_post_conv_pre_silu.unsqueeze(0)            # (1, T, D)
-        dx_fla, dw_fla, _db, _dr, _dh0 = causal_conv1d_bwd(
-            x=x_fla, dy=dy_fla, dht=None,
-            weight=W_fla, bias=None, residual=None,
-            initial_state=None, activation=None,
+        # Cross-chunk conv state (Item 3c, C8): supply ``initial_state``
+        # so dW accumulates the missing cross-chunk x*dy contributions
+        # for chunk N's positions 0..W-2 (where the prior chunk's
+        # tokens act as the "left context"). Supply ``dht`` from
+        # ``lin_conv_bwd_window`` (populated by chunk N+1's bwd's
+        # ``dh0`` — same compute stream, no cross-stream sync needed,
+        # symmetric with the FLA gated-delta-rule cross-chunk plumbing
+        # in ``_fwd_fla`` / bwd above) so chunk N's last W-1 tokens
+        # accumulate dx from chunk N+1's leading positions.
+        infos_conv_bwd2 = (
+            ctx.lin_attn_chunk_seq_infos if ctx is not None else None
         )
+        fwd_window_conv = (
+            ctx.lin_conv_fwd_window if ctx is not None else None
+        )
+        bwd_window_conv = (
+            ctx.lin_conv_bwd_window if ctx is not None else None
+        )
+        init_state_conv = None
+        dht_conv = None
+        if (
+            infos_conv_bwd2 is not None
+            and fwd_window_conv is not None
+            and any(info.has_prior_chunks for info in infos_conv_bwd2)
+        ):
+            init_state_conv = fwd_window_conv.unsqueeze(0)
+        if (
+            infos_conv_bwd2 is not None
+            and bwd_window_conv is not None
+            and any(info.has_more_chunks for info in infos_conv_bwd2)
+        ):
+            dht_conv = bwd_window_conv.unsqueeze(0)
+        dx_fla, dw_fla, _db, _dr, dh0_conv = causal_conv1d_bwd(
+            x=x_fla, dy=dy_fla, dht=dht_conv,
+            weight=W_fla, bias=None, residual=None,
+            initial_state=init_state_conv, activation=None,
+        )
+        # Save dh0 for chunk N-1's bwd to consume as its dht. Per
+        # ``_pack_sequences``, multi-chunk seqs are dedicated single-
+        # packed-seq → at most one row needs the write.
+        if (
+            dh0_conv is not None
+            and bwd_window_conv is not None
+            and infos_conv_bwd2 is not None
+            and any(info.has_prior_chunks for info in infos_conv_bwd2)
+        ):
+            # ``dh0_conv`` is (N=1, D, W); window is (D, W).
+            bwd_window_conv.copy_(dh0_conv.squeeze(0))
+
         # FLA's conv_bwd allocates dx via torch.empty_like; .squeeze(0)
         # is a contiguous view (no copy). Copy [Q|K|V] into d_qkvz_2d's
         # first conv_dim columns; Z slice was already written above by

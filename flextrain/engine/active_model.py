@@ -1027,6 +1027,9 @@ class ActiveModel:
         # incrementally populates it; bwd refreshes it via the dispatcher.
         if self.buffers.lin_state_window is not None:
             self.buffers.lin_state_window.zero_()
+        # Same for the conv-state window (Item 3c, C8).
+        if self.buffers.lin_conv_state_window is not None:
+            self.buffers.lin_conv_state_window.zero_()
 
         # 1. Reset host-act cursor; allocate a slot for each
         #    (layer, chunk) pair with a home level >= 0.
@@ -1133,6 +1136,13 @@ class ActiveModel:
             ):
                 with torch.cuda.stream(self.streams.compute):
                     self.buffers.lin_state_window.zero_()
+            # Same for the conv-state window (C8).
+            if (
+                self.buffers.lin_conv_state_window is not None
+                and layer.schema.has_field("lin_conv_state")
+            ):
+                with torch.cuda.stream(self.streams.compute):
+                    self.buffers.lin_conv_state_window.zero_()
 
             for chunk in prepared.chunks:
                 # Wait: ring slot safe to overwrite.
@@ -1164,6 +1174,19 @@ class ActiveModel:
                     ctx.lin_attn_chunk_seq_infos = None
                     ctx.lin_attn_fwd_window = None
                     ctx.lin_attn_bwd_window = None
+                # Conv-state window (C8) — same pattern, independent of
+                # the recurrent-state window so heterogeneous schemas
+                # (e.g. backbones that have lin_final_state but not
+                # lin_conv_state, hypothetical) do the right thing.
+                if (
+                    self.buffers.lin_conv_state_window is not None
+                    and layer.schema.has_field("lin_conv_state")
+                ):
+                    ctx.lin_conv_fwd_window = self.buffers.lin_conv_state_window.fwd
+                    ctx.lin_conv_bwd_window = self.buffers.lin_conv_state_window.bwd
+                else:
+                    ctx.lin_conv_fwd_window = None
+                    ctx.lin_conv_bwd_window = None
 
                 # Forward on the compute stream.
                 torch.cuda.nvtx.range_push(f"Forward: Chunk {chunk.id}")
@@ -1395,6 +1418,29 @@ class ActiveModel:
                             src_chunk_id=src_chunk_id,
                         )
 
+        # Pre-bwd init for the conv-state window (C8). Same logic as
+        # the recurrent-state pre-bwd init above: the top linear-attn
+        # layer's first reverse chunk's bwd needs ``lin_conv_state``
+        # of chunk N-1 in the global window. After fwd, the window
+        # holds state[N_last] of the last linear-attn layer (= last W
+        # tokens of the seq's tail), but bwd of chunk N_last needs
+        # state[N_last - 1] (last W tokens of the chunk N_last - 1
+        # input).
+        if self.buffers.lin_conv_state_window is not None:
+            top_layer = self.backbone[-1]
+            if top_layer.schema.has_field("lin_conv_state"):
+                first_rev_chunk = prepared.seq_groups[-1][-1]
+                target_infos = self._lin_attn_round_plan.per_chunk[
+                    first_rev_chunk.id
+                ]
+                if any(info.has_prior_chunks for info in target_infos):
+                    src_chunk_id = first_rev_chunk.id - 1
+                    if src_chunk_id >= 0:
+                        self._refresh_lin_conv_state_window(
+                            target_layer_id=top_layer.layer_id,
+                            src_chunk_id=src_chunk_id,
+                        )
+
         for k_ind in range(num_layers - 1, -1, -1):
             layer = self.backbone[k_ind]
             lid = layer.layer_id
@@ -1424,6 +1470,13 @@ class ActiveModel:
             ):
                 with torch.cuda.stream(self.streams.compute):
                     self.buffers.lin_state_window.bwd.zero_()
+            # Same for the conv-state window (C8).
+            if (
+                self.buffers.lin_conv_state_window is not None
+                and layer.schema.has_field("lin_conv_state")
+            ):
+                with torch.cuda.stream(self.streams.compute):
+                    self.buffers.lin_conv_state_window.bwd.zero_()
 
             cur_chunk_id = total_chunks - 1
             for seq_group_ind in range(len(prepared.seq_groups) - 1, -1, -1):
@@ -1462,6 +1515,18 @@ class ActiveModel:
                         ctx.lin_attn_chunk_seq_infos = None
                         ctx.lin_attn_fwd_window = None
                         ctx.lin_attn_bwd_window = None
+                    # Conv-state window (C8) — independent of the
+                    # recurrent-state window (different schema field
+                    # gates).
+                    if (
+                        self.buffers.lin_conv_state_window is not None
+                        and layer.schema.has_field("lin_conv_state")
+                    ):
+                        ctx.lin_conv_fwd_window = self.buffers.lin_conv_state_window.fwd
+                        ctx.lin_conv_bwd_window = self.buffers.lin_conv_state_window.bwd
+                    else:
+                        ctx.lin_conv_fwd_window = None
+                        ctx.lin_conv_bwd_window = None
 
                     # Forward recompute (fills higher-tier fields that
                     # weren't saved) + backward.
@@ -1677,6 +1742,16 @@ class ActiveModel:
                 layer_ind=layer_ind,
                 prepared=prepared,
             )
+        # Conv-state branch (C8) — same dispatch logic but keyed off
+        # ``has_field("lin_conv_state")`` and uses
+        # ``slot[target_lid, target_chunk_id - 1].lin_conv_state``.
+        if self.buffers.lin_conv_state_window is not None:
+            self._refresh_lin_conv_state_window_for_next_iter(
+                seq_group_ind=seq_group_ind,
+                chunk_in_group_ind=chunk_in_group_ind,
+                layer_ind=layer_ind,
+                prepared=prepared,
+            )
 
     def _next_reverse_iteration_target(
         self,
@@ -1808,6 +1883,84 @@ class ActiveModel:
                 return
             with torch.cuda.stream(self.streams.inbound_fwd_context):
                 win.fwd.copy_(home_slot.lin_final_state)
+
+    def _refresh_lin_conv_state_window_for_next_iter(
+        self,
+        *,
+        seq_group_ind: int,
+        chunk_in_group_ind: int,
+        layer_ind: int,
+        prepared: PreparedRound,
+    ) -> None:
+        """Mirror of ``_refresh_lin_state_window_for_next_iter`` but
+        for the depthwise causal conv1d state (Item 3c, C8). Determines
+        the next reverse iteration's target and refreshes
+        ``lin_conv_state_window.fwd`` from
+        ``slot[target_layer, target_chunk_id - 1].lin_conv_state``.
+
+        Same off-by-one source-slot rule as ``lin_final_state``: the
+        saved field is a boundary value (= last W tokens of chunk N's
+        conv input, written by chunk N's fwd at slot[L, N]); chunk
+        N+1's bwd needs chunk N's value, which lives at slot[L, N].
+        Equivalently for a target chunk K: source slot = K-1.
+        """
+        target = self._next_reverse_iteration_target(
+            seq_group_ind=seq_group_ind,
+            chunk_in_group_ind=chunk_in_group_ind,
+            layer_ind=layer_ind,
+            prepared=prepared,
+        )
+        if target is None:
+            return
+        target_layer_ind, target_chunk = target
+        target_layer = self.backbone[target_layer_ind]
+        if not target_layer.schema.has_field("lin_conv_state"):
+            return  # target is dense; nothing to do for conv-state
+        target_infos = self._lin_attn_round_plan.per_chunk[target_chunk.id]
+        if not any(info.has_prior_chunks for info in target_infos):
+            return
+        src_chunk_id = target_chunk.id - 1
+        if src_chunk_id < 0:
+            return
+        self._refresh_lin_conv_state_window(
+            target_layer_id=target_layer.layer_id,
+            src_chunk_id=src_chunk_id,
+        )
+
+    def _refresh_lin_conv_state_window(
+        self,
+        *,
+        target_layer_id: int,
+        src_chunk_id: int,
+    ) -> None:
+        """Copy ``lin_conv_state`` from a saved activation slot into
+        ``lin_conv_state_window.fwd`` on ``inbound_fwd_context``.
+
+        Mirror of ``_refresh_lin_state_window`` for the conv1d state.
+        Same dual-path device/host source handling.
+        """
+        key = (target_layer_id, src_chunk_id)
+        win = self.buffers.lin_conv_state_window
+        if win is None:
+            return
+        if key in self.events.inbound_act_slot_ready:
+            self.streams.inbound_fwd_context.wait_event(
+                self.events.inbound_act_slot_ready.get(key)
+            )
+            src_slot: ActivationSlot = self.events.dev_act_slot_mapping[key]
+            if not src_slot.has("lin_conv_state"):
+                return
+            with torch.cuda.stream(self.streams.inbound_fwd_context):
+                win.fwd.copy_(src_slot.lin_conv_state)
+        else:
+            avail = self.events.home_act_slot_available.get(key)
+            if avail is not None:
+                self.streams.inbound_fwd_context.wait_event(avail)
+            home_slot = self._host_act_slots.get(key)
+            if home_slot is None or not home_slot.has("lin_conv_state"):
+                return
+            with torch.cuda.stream(self.streams.inbound_fwd_context):
+                win.fwd.copy_(home_slot.lin_conv_state)
 
     def _refresh_kv_window(
         self,

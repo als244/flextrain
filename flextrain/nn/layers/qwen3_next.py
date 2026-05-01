@@ -268,19 +268,19 @@ class Qwen3NextLinearLayer:
             # Recompute conv → qkv_heads into scratch, then FLA into slot.
             # Conv input is slot.lin_qkvz (just repopulated above if
             # need_proj) sliced to the first conv_dim columns.
-            from flextrain.nn.blocks.linear_attn import (
-                _fla_causal_conv1d_fwd_into,
-            )
+            #
+            # Cross-chunk conv state (Item 3c, C8): use ``_fwd_conv``
+            # so the recompute reads ``ctx.lin_conv_fwd_window`` as
+            # initial_state for continuation chunks. ``recompute_only``
+            # routes the final_state to scratch (idempotently re-writes
+            # slot.lin_conv_state but does NOT advance the global
+            # window — the window already holds state[N-1] for chunk
+            # N's bwd to read).
             la_cfg = self.lin_attn.cfg
             conv_in = slot.lin_qkvz[:, :la_cfg.conv_dim]
-            post_conv = ctx.scratch(
-                (chunk.total_q, la_cfg.conv_dim), la_cfg.compute_dtype,
-            )
-            _fla_causal_conv1d_fwd_into(
-                x_2d=conv_in,
-                weight=weights["w_lin_conv"].squeeze(1).contiguous(),
-                out_2d=post_conv,
-                activation="silu",
+            post_conv = self.lin_attn._fwd_conv(
+                conv_in, weights, ctx, slot,
+                activation="silu", recompute_only=True,
             )
             q_n, k_n, v_h, _qr, _kr = self.lin_attn._fwd_qkv_heads(
                 post_conv, ctx,

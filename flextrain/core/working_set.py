@@ -565,6 +565,9 @@ def _baseline_gpu_activation_memory(
         # 2 buffers × HV × K × V × fp32(4 bytes)
         lin_state_window_bytes = 2 * num_v_heads * head_k_dim * head_v_dim * 4
         bytes_used += lin_state_window_bytes
+    # Note: the C8 conv-state window (LinConvStateWindow, ~64 KiB at
+    # Qwen3.5-2B = 2 × conv_dim × W × bf16) is small enough to fall
+    # below the planner's resolution; not accounted here.
 
     return bytes_used
 

@@ -99,6 +99,63 @@ class KVContextWindow:
 
 
 @dataclass
+class LinConvStateWindow:
+    """Per-layer global depthwise-causal-conv1d state window for linear
+    attention (Item 3c extended — C8: cross-chunk conv state).
+
+    Mirror of :class:`LinAttnStateWindow` but for the depthwise causal
+    conv1d's last-W-tokens "state". Two tensors:
+
+    * ``fwd``: per-(layer, seq) conv state at chunk N's INPUT (= last W
+      tokens of chunk N-1's conv input). Used as FLA's ``initial_state``
+      for ``causal_conv1d_fwd`` so positions 0..W-2 of the continuation
+      chunk see chunk N-1's tail instead of zero padding. During bwd,
+      reused as ``initial_state`` for ``causal_conv1d_bwd`` (the bwd
+      kernel needs these tokens to compute ``dW`` correctly at chunk
+      N's leading positions). Refreshed during bwd from
+      ``slot[L, N-1].lin_conv_state``.
+
+    * ``bwd``: the dh0 chain accumulator. Chunk N's bwd writes
+      ``dh0`` (= grad w.r.t. ``initial_state``) into this buffer; chunk
+      N-1's bwd reads it as its ``dht`` argument so its last W-1 tokens
+      accumulate the correct ``dx`` from chunk N's leading positions.
+      Same compute stream as bwd; no cross-stream sync required.
+
+    Single tensor per buffer (shape ``(conv_dim, W) bf16`` per FLA's
+    ``causal_conv1d_update_states`` layout). Allocated once at engine
+    init iff any backbone layer's schema declares ``lin_conv_state``.
+    Reused across all rounds and all linear-attn layers via per-layer-
+    boundary refresh, exactly like :class:`LinAttnStateWindow`.
+
+    Memory cost: 2 × conv_dim × W × element_size — for Qwen3.5-2B,
+    2 × 4096 × 4 × 2 = 64 KiB total. Negligible.
+    """
+
+    fwd: torch.Tensor   # (conv_dim, W) bf16 — initial_state for FLA conv fwd / bwd
+    bwd: torch.Tensor   # (conv_dim, W) bf16 — dh0 chain accumulator
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        conv_dim: int,
+        conv_kernel_size: int,
+        device: torch.device | str,
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> "LinConvStateWindow":
+        shape = (conv_dim, conv_kernel_size)
+        return cls(
+            fwd=torch.zeros(shape, dtype=dtype, device=device),
+            bwd=torch.zeros(shape, dtype=dtype, device=device),
+        )
+
+    def zero_(self) -> "LinConvStateWindow":
+        self.fwd.zero_()
+        self.bwd.zero_()
+        return self
+
+
+@dataclass
 class LinAttnStateWindow:
     """Per-layer global recurrent-state window for linear attention
     (Item 3c — cross-chunk linear-attn correctness).
@@ -478,6 +535,12 @@ class BufferManager:
     # zero memory).
     lin_state_window: "LinAttnStateWindow | None"
 
+    # === Linear-attn cross-chunk conv1d state window (Item 3c, C8) ===
+    # Mirror of ``lin_state_window`` for the depthwise causal conv1d
+    # state (last W tokens of conv input). ``None`` when backbone is
+    # dense.
+    lin_conv_state_window: "LinConvStateWindow | None"
+
     # === transition table (residual-stream holder, one tensor per chunk) ===
     # Chunks are materialized on demand during fwd_bwd; we don't pre-
     # allocate a fixed (num_chunks, d_model) tensor because chunk count
@@ -826,6 +889,46 @@ class BufferManager:
                 num_v_heads=num_v_heads,
                 head_k_dim=head_k_dim,
                 head_v_dim=head_v_dim,
+                device=self.device,
+            )
+
+        # ---- Linear-attn cross-chunk conv-state window (Item 3c, C8) ----
+        # Allocate iff any backbone layer's schema declares
+        # ``lin_conv_state``. Same pattern as ``lin_state_window`` — the
+        # presence of the schema field is the trigger; dense models leave
+        # the window as None.
+        self.lin_conv_state_window = None
+        has_lin_conv_state = any(
+            any(f.name == "lin_conv_state" for f in s.fields)
+            for s in layer_schemas
+        )
+        if has_lin_conv_state:
+            conv_dim = (
+                dims.get("conv_dim")
+                or dims.get("linear_conv_dim")
+            )
+            conv_kernel_size = (
+                dims.get("conv_kernel_size")
+                or dims.get("linear_conv_kernel_dim")
+                or dims.get("linear_conv_kernel")
+            )
+            if not (conv_dim and conv_kernel_size):
+                raise ValueError(
+                    "Backbone has linear-attn layers with lin_conv_state "
+                    "field but model_dims is missing one of conv_dim / "
+                    "conv_kernel_size (or their ``linear_*`` aliases). "
+                    "Cannot size the lin_conv_state_window."
+                )
+            if verbose:
+                import sys
+                print(
+                    f"[BufferManager] Allocating LinConvStateWindow "
+                    f"(D={conv_dim} W={conv_kernel_size} bf16)",
+                    flush=True, file=sys.stderr,
+                )
+            self.lin_conv_state_window = LinConvStateWindow.create(
+                conv_dim=conv_dim,
+                conv_kernel_size=conv_kernel_size,
                 device=self.device,
             )
 
@@ -1192,5 +1295,7 @@ class BufferManager:
 __all__ = [
     "BufferManager",
     "KVContextWindow",
+    "LinAttnStateWindow",
+    "LinConvStateWindow",
     "ScratchPool",
 ]
