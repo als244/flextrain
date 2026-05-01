@@ -622,13 +622,16 @@ class ScatterMoEExpertCompute:
 
         # 5. Down-projection with gate-weighting.
         # scatter2scatter w/ k=1, x_grouped=True, y_grouped=False:
-        # produces (TK, d) which we then weighted-sum to (T, d).
+        # input is grouped (sorted by expert), output is token-major
+        # (TK,d) viewable as (T, K, d) for the per-token-per-k weighted
+        # sum below. Matches scattermoe's GLUMLP output_experts call
+        # which uses (grouped_in=True, grouped_out=False).
         out_expanded = scratch_fn((TK, d_model), x.dtype)
         scm_kernels.ops.scatter2scatter(
             X=post_act, W=weights["w_down"],
             sorted_expert_idxs=slot.scattermoe_sorted_expert_idxs,
             sorted_scattered_idxs=slot.scattermoe_sorted_scattered_idxs,
-            k=1, x_grouped=True, y_grouped=True,  # both grouped now
+            k=1, x_grouped=True, y_grouped=False,
             out=out_expanded,
         )
         # Reshape (TK, d) -> (T, K, d) -> weighted-sum to (T, d).
