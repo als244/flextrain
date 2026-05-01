@@ -470,6 +470,19 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--attn-backend",
+        type=str,
+        default="auto",
+        choices=["auto", "fa4", "fa3", "fa2", "eager"],
+        help=(
+            "Attention backend. 'auto' (default) picks the highest-priority "
+            "available at import time (fa4 > fa3 > fa2 > eager). Pinning to "
+            "a specific backend that isn't installed in this env raises at "
+            "startup. 'eager' is a slow pure-PyTorch fallback for dev "
+            "machines without flash-attn."
+        ),
+    )
+    p.add_argument(
         "--use-muon",
         action="store_true",
         help=(
@@ -756,6 +769,11 @@ def main(argv: list[str] | None = None) -> int:
         "This includes the working-set solve, engine construction, and HF weight load.",
         flush=True,
     )
+    # Pin attention backend if user requested a specific one (auto = let
+    # the dispatcher pick the highest-priority available at call time).
+    from flextrain.ops._kernels.attention import set_attention_backend
+    set_attention_backend(None if args.attn_backend == "auto" else args.attn_backend)
+
     # Construct MoE backend instance from --moe-backend selection.
     if args.moe_backend == "flextrain":
         from flextrain.ops.moe_backend import FlextrainMoEExpertCompute
