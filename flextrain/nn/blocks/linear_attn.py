@@ -852,6 +852,8 @@ class GatedDeltaNetBlock:
         self, q_n, k_n, v_h, a, beta, A_log, dt_bias, slot,
         cu_seqlens: torch.Tensor | None = None,
         chunk_indices: torch.Tensor | None = None,
+        *,
+        ctx: "LayerContext | None" = None,
     ) -> torch.Tensor:
         """Stage 5: FLA chunk-gated-delta-rule with fused gate (Stage D5).
 
@@ -870,26 +872,125 @@ class GatedDeltaNetBlock:
         FLA's kernels read via hardcoded ``stride=(H*K, 1)`` block-ptr
         math; only v_h needs an explicit ``.contiguous()`` because its
         token stride is conv_dim (from post_conv slice), not HV*hv.
+
+        Cross-chunk state (Item 3c): when ``ctx`` provides a populated
+        ``lin_attn_chunk_seq_infos`` AND the chunk has any seq with
+        prior or future chunks, the layer reads ``ctx.lin_attn_fwd_window``
+        as ``initial_state`` (FLA expects ``(N_packed, HV, K, V)``)
+        and writes the returned ``final_state`` back into the window
+        AND into ``slot.lin_final_state`` for bwd consumption.
+
+        Single-chunk seqs and trivial rounds fall through to the
+        legacy path (``initial_state=None, output_final_state=False``)
+        — bit-identical to pre-3c behavior.
         """
         cfg = self.cfg
         bf = cfg.compute_dtype
         scale = cfg.head_k_dim ** -0.5
 
-        g_post, o, A_int, _, _, _ = chunk_gated_delta_rule_fwd(
+        # Decide whether this chunk needs cross-chunk state plumbing.
+        # Even when the round has SOME multi-chunk seqs, an individual
+        # chunk may contain only single-packed-seqs (e.g. a small-seq
+        # packed chunk in a round that also has a long-seq); we want
+        # zero-overhead pass-through for those chunks.
+        infos = (
+            ctx.lin_attn_chunk_seq_infos
+            if ctx is not None else None
+        )
+        fwd_window = (
+            ctx.lin_attn_fwd_window
+            if ctx is not None else None
+        )
+        need_xchunk = (
+            infos is not None
+            and fwd_window is not None
+            and any(
+                info.has_prior_chunks or info.has_more_chunks
+                for info in infos
+            )
+        )
+
+        if not need_xchunk:
+            # Legacy path — bit-identical to pre-3c.
+            g_post, o, A_int, _, _, _ = chunk_gated_delta_rule_fwd(
+                q_n.unsqueeze(0),
+                k_n.unsqueeze(0),
+                v_h.unsqueeze(0).contiguous(),
+                a.unsqueeze(0),
+                beta.unsqueeze(0),
+                scale=scale, initial_state=None,
+                output_final_state=False, cu_seqlens=cu_seqlens,
+                chunk_indices=chunk_indices,
+                use_gate_in_kernel=True, A_log=A_log, dt_bias=dt_bias,
+            )
+            o = o.squeeze(0)
+            slot.lin_g_post.copy_(g_post.squeeze(0))
+            slot.lin_A_int.copy_(A_int.squeeze(0).to(bf))
+            slot.lin_core_out.copy_(o.to(bf))
+            return o
+
+        # Cross-chunk path. Build ``initial_state`` of shape
+        # ``(N_packed, HV, K, V)`` fp32. Per ``_pack_sequences``'s
+        # rule, any chunk participating in a multi-chunk seq is a
+        # dedicated single-packed-seq chunk, so ``N_packed == 1``
+        # for chunks with non-trivial cross-chunk state. We still
+        # support the general N_packed shape so a chunk that
+        # incidentally has multiple packed-seqs (none of which are
+        # multi-chunk) takes a no-op cross-chunk path.
+        N = len(infos)
+        HV, K_d, V_d = cfg.num_v_heads, cfg.head_k_dim, cfg.head_v_dim
+        device = q_n.device
+        init_state = torch.zeros(
+            (N, HV, K_d, V_d), dtype=torch.float32, device=device,
+        )
+        for i, info in enumerate(infos):
+            if info.has_prior_chunks:
+                # The engine populated the global ``fwd_window`` with
+                # the prior chunk's final state via either:
+                #   (a) the prior chunk's own fwd writing the window
+                #       (within-layer fwd traversal), or
+                #   (b) the dispatcher's ``_refresh_lin_state_window``
+                #       hop during bwd of chunk N+1.
+                # Either way, ``fwd_window`` is the right value here.
+                init_state[i] = fwd_window
+        output_final = any(info.has_more_chunks for info in infos)
+
+        out = chunk_gated_delta_rule_fwd(
             q_n.unsqueeze(0),
             k_n.unsqueeze(0),
             v_h.unsqueeze(0).contiguous(),
             a.unsqueeze(0),
             beta.unsqueeze(0),
-            scale=scale, initial_state=None,
-            output_final_state=False, cu_seqlens=cu_seqlens,
+            scale=scale,
+            initial_state=init_state,
+            output_final_state=output_final,
+            cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
             use_gate_in_kernel=True, A_log=A_log, dt_bias=dt_bias,
         )
+        # FLA returns ``(g_post, o, A_int, h_kv_state, dh_init, final_state)``.
+        # ``final_state`` is shape ``(N_packed, HV, K, V)``.
+        g_post, o, A_int = out[0], out[1], out[2]
+        final_state = out[5]
+
         o = o.squeeze(0)
         slot.lin_g_post.copy_(g_post.squeeze(0))
         slot.lin_A_int.copy_(A_int.squeeze(0).to(bf))
         slot.lin_core_out.copy_(o.to(bf))
+
+        if output_final and final_state is not None:
+            # Save final state for the seq that continues. Per
+            # ``_pack_sequences``, this is the one packed-seq with
+            # ``has_more_chunks=True``; there is at most one such
+            # row (multi-chunk seqs are dedicated single-packed-seq
+            # chunks).
+            for i, info in enumerate(infos):
+                if info.has_more_chunks:
+                    fwd_window.copy_(final_state[i])
+                    if slot.has("lin_final_state"):
+                        slot.lin_final_state.copy_(final_state[i])
+                    break
+
         return o
 
     def _fwd_norm_out(
@@ -941,6 +1042,7 @@ class GatedDeltaNetBlock:
             q_n, k_n, v_h, a, beta,
             weights["w_lin_A_log"], weights["w_lin_dt_bias"], slot,
             cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
+            ctx=ctx,
         )
         return self._fwd_norm_out(core_out, z, weights)
 
@@ -993,6 +1095,8 @@ class GatedDeltaNetBlock:
         weights: Mapping[str, torch.Tensor],
         slot,
         chunk: ChunkMeta | None = None,
+        *,
+        ctx: "LayerContext | None" = None,
     ) -> torch.Tensor:
         """Tier-2 recompute (FLA half): re-run FLA fwd from supplied
         Q/K/V (typically scratch-allocated via _fwd_qkv_heads on a
@@ -1004,7 +1108,14 @@ class GatedDeltaNetBlock:
         ``chunk`` is forwarded so the recompute uses the same
         ``cu_seqlens`` as the original fwd — otherwise saved and
         recomputed ``core_out`` would diverge across packed-seq
-        boundaries inside the chunk."""
+        boundaries inside the chunk.
+
+        ``ctx`` (Item 3c): when provided, ``ctx.lin_attn_fwd_window``
+        is read as the recurrent ``initial_state`` so the recompute
+        matches the original fwd of a multi-chunk seq. The engine's
+        ``_refresh_lin_state_window`` populates the window before bwd,
+        so this just-in-time recompute lands on the correct initial
+        state."""
         b, a = _split_ba_ft(slot.lin_ba, self.cfg)
         beta = self._fwd_beta(b, self.cfg.compute_dtype)
         cu_seqlens = chunk.q_seq_offsets_i64 if chunk is not None else None
@@ -1015,6 +1126,7 @@ class GatedDeltaNetBlock:
             q_n, k_n, v_h, a, beta,
             weights["w_lin_A_log"], weights["w_lin_dt_bias"], slot,
             cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
+            ctx=ctx,
         )
 
     def _gated_rmsnorm_bwd(
@@ -1285,15 +1397,88 @@ class GatedDeltaNetBlock:
         # python elementwise ops on (T, HV) tensors with one fused
         # kernel pair.
         a_b = a.unsqueeze(0)
-        dq_n, dk_n, dv_h, dbeta, dg, _, dA_log_fla, ddt_bias_fla = (
-            chunk_gated_delta_rule_bwd(
+
+        # Cross-chunk state (Item 3c): when ``ctx`` provides populated
+        # cross-chunk infos AND this chunk has any seq with prior or
+        # future chunks, FLA bwd takes ``initial_state`` (= state at
+        # chunk's input, sourced from ``ctx.lin_attn_fwd_window``)
+        # AND ``dht`` (= grad w.r.t. chunk's output state, sourced
+        # from ``ctx.lin_attn_bwd_window`` which the more-recent
+        # reverse iteration's bwd populated). FLA returns ``dh0`` —
+        # grad w.r.t. ``initial_state`` — which we copy into the bwd
+        # window for the next reverse iteration's bwd to consume as
+        # its ``dht``.
+        infos_bwd = (
+            ctx.lin_attn_chunk_seq_infos
+            if ctx is not None else None
+        )
+        fwd_window_bwd = (
+            ctx.lin_attn_fwd_window
+            if ctx is not None else None
+        )
+        bwd_window_bwd = (
+            ctx.lin_attn_bwd_window
+            if ctx is not None else None
+        )
+        need_xchunk_bwd = (
+            infos_bwd is not None
+            and fwd_window_bwd is not None
+            and any(
+                info.has_prior_chunks or info.has_more_chunks
+                for info in infos_bwd
+            )
+        )
+
+        if need_xchunk_bwd:
+            N = len(infos_bwd)
+            HV, K_d, V_d = cfg.num_v_heads, cfg.head_k_dim, cfg.head_v_dim
+            init_state_bwd = torch.zeros(
+                (N, HV, K_d, V_d), dtype=torch.float32, device=device,
+            )
+            for i, info in enumerate(infos_bwd):
+                if info.has_prior_chunks:
+                    init_state_bwd[i] = fwd_window_bwd
+            dht_bwd = None
+            if any(info.has_more_chunks for info in infos_bwd):
+                # Build ``(N, HV, K, V)`` dht; row i = bwd_window iff
+                # info[i].has_more_chunks else zeros.
+                dht_bwd = torch.zeros(
+                    (N, HV, K_d, V_d), dtype=torch.float32, device=device,
+                )
+                for i, info in enumerate(infos_bwd):
+                    if info.has_more_chunks and bwd_window_bwd is not None:
+                        dht_bwd[i] = bwd_window_bwd
+            (
+                dq_n, dk_n, dv_h, dbeta, dg,
+                dh0_out, dA_log_fla, ddt_bias_fla,
+            ) = chunk_gated_delta_rule_bwd(
                 q=q_b, k=k_b, v=v_b, g=g_post, beta=beta_b, A=A_int,
-                scale=scale, initial_state=None, do=do_b, dht=None,
+                scale=scale, initial_state=init_state_bwd,
+                do=do_b, dht=dht_bwd,
                 cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
                 use_gate_in_kernel=True, g_input=a_b,
                 A_log=W_A_log, dt_bias=W_dt_bias,
             )
-        )
+            # Save dh0 into bwd_window for next reverse iter's bwd.
+            # Per ``_pack_sequences``, multi-chunk seqs are dedicated
+            # single-packed-seq chunks → at most one row with
+            # has_prior_chunks=True. Find it and write the window.
+            if dh0_out is not None and bwd_window_bwd is not None:
+                for i, info in enumerate(infos_bwd):
+                    if info.has_prior_chunks:
+                        bwd_window_bwd.copy_(dh0_out[i])
+                        break
+        else:
+            # Legacy path — bit-identical to pre-3c.
+            dq_n, dk_n, dv_h, dbeta, dg, _, dA_log_fla, ddt_bias_fla = (
+                chunk_gated_delta_rule_bwd(
+                    q=q_b, k=k_b, v=v_b, g=g_post, beta=beta_b, A=A_int,
+                    scale=scale, initial_state=None, do=do_b, dht=None,
+                    cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
+                    use_gate_in_kernel=True, g_input=a_b,
+                    A_log=W_A_log, dt_bias=W_dt_bias,
+                )
+            )
         dq_n = dq_n.squeeze(0)
         dk_n = dk_n.squeeze(0)
         dv_h = dv_h.squeeze(0)                               # (T, n_v_heads, head_v_dim)

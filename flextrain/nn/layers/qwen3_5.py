@@ -498,7 +498,7 @@ class Qwen3_5LinearLayer:
                 post_conv, ctx,
             )
             self.lin_attn.fwd_recompute_fla(
-                q_n, k_n, v_h, weights, slot, chunk,
+                q_n, k_n, v_h, weights, slot, chunk, ctx=ctx,
             )
         recompute_x1 = not slot.has("x1")
         recompute_x3 = not slot.has("x3")

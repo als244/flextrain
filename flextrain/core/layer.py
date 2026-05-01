@@ -570,6 +570,34 @@ class LayerContext:
     # loss coefficient. None for non-MoE workloads.
     total_tokens_per_step: int | None = None
 
+    # ---- Cross-chunk linear-attention state (Item 3c) ----
+    # Set by the engine before each linear-attn layer's fwd/bwd call.
+    # Layers reading any of these MUST tolerate ``None`` (e.g. unit
+    # tests that drive a layer outside the engine, or rounds where
+    # the backbone has no linear-attn layers).
+    #
+    # ``lin_attn_chunk_seq_infos``: per-packed-seq metadata for the
+    # CURRENT chunk. List of ``MultiChunkSeqInfo`` parallel to
+    # ``ChunkMeta.seq_lens_host``. Each entry tells the layer
+    # whether that packed-seq is a continuation (has prior chunk's
+    # state to consume) or a starter, and whether it has more
+    # chunks ahead (final state must be saved).
+    #
+    # ``lin_attn_fwd_window``: the engine's per-layer global
+    # ``(HV, K, V) fp32`` buffer holding state at chunk INPUT.
+    # Source for FLA's ``initial_state``. Owned by ``BufferManager``;
+    # read by the layer, written by the layer (fwd extends it for the
+    # next chunk; bwd does not write it).
+    #
+    # ``lin_attn_bwd_window``: the engine's per-layer global
+    # ``(HV, K, V) fp32`` buffer holding ``dh0`` from the more-
+    # recent reverse iteration. Source for FLA bwd's ``dht``.
+    # Owned by ``BufferManager``; written by the layer's bwd to
+    # propagate gradient backward across chunks.
+    lin_attn_chunk_seq_infos: Any = None         # list[MultiChunkSeqInfo] | None
+    lin_attn_fwd_window: torch.Tensor | None = None
+    lin_attn_bwd_window: torch.Tensor | None = None
+
 
 # ---------------------------------------------------------------------------
 # Layer Protocols. Three variants:
