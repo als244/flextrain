@@ -455,6 +455,19 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--lora-rank", type=int, default=16, help="LoRA rank when --mode lora. Default: 16.")
     p.add_argument("--lora-alpha", type=float, default=16.0, help="LoRA alpha when --mode lora. Default: 16.0.")
     p.add_argument(
+        "--moe-backend",
+        type=str,
+        default="flextrain",
+        choices=["flextrain", "scattermoe"],
+        help=(
+            "MoE expert-compute backend. 'flextrain' (default) uses our "
+            "dispatch_scatter + per-expert dispatcher loop + combine_gather "
+            "and supports LoRA. 'scattermoe' calls scattermoe's Triton "
+            "scatter2scatter / group_bwd_W kernels — no LoRA support, "
+            "tier 3 only. No-op for non-MoE models."
+        ),
+    )
+    p.add_argument(
         "--use-muon",
         action="store_true",
         help=(
@@ -741,6 +754,16 @@ def main(argv: list[str] | None = None) -> int:
         "This includes the working-set solve, engine construction, and HF weight load.",
         flush=True,
     )
+    # Construct MoE backend instance from --moe-backend selection.
+    if args.moe_backend == "flextrain":
+        from flextrain.ops.moe_backend import FlextrainMoEExpertCompute
+        moe_backend_obj = FlextrainMoEExpertCompute()
+    elif args.moe_backend == "scattermoe":
+        from flextrain.ops.moe_backend import ScatterMoEExpertCompute
+        moe_backend_obj = ScatterMoEExpertCompute()
+    else:
+        moe_backend_obj = None
+
     am = from_pretrained(
         local_model_dir,
         optimizer=optimizer,
@@ -761,6 +784,7 @@ def main(argv: list[str] | None = None) -> int:
         max_chunk_size=args.max_chunk_size,
         master_dtype=master_dtype,
         grad_dtype=grad_dtype,
+        moe_backend=moe_backend_obj,
         strict=False,
         verbose=True,
     )

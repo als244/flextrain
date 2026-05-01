@@ -281,7 +281,10 @@ def _olmoe_block_builder(layer_idx: int, ctx) -> object:
         grad_dtype=ctx.grad_dtype,
         norm_grad_dtype=ctx.norm_grad_dtype,
     )
-    base = OLMoEBlock(layer_id=layer_idx, cfg=block_cfg)
+    base = OLMoEBlock(
+        layer_id=layer_idx, cfg=block_cfg,
+        expert_compute=getattr(ctx, "moe_backend", None),
+    )
     if not ctx.lora_targets:
         return base
     from flextrain.nn.layers.lora_wrapper import LoRAWrapperLayer

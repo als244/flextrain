@@ -129,7 +129,11 @@ class Qwen3NextLinearLayer:
 
     """Qwen3-Next layer with gated-DeltaNet linear attention + MoE FFN."""
 
-    def __init__(self, layer_id: int, cfg: Qwen3NextLayerConfig) -> None:
+    def __init__(
+        self, layer_id: int, cfg: Qwen3NextLayerConfig,
+        *,
+        expert_compute=None,  # MoEExpertCompute | None
+    ) -> None:
         self.layer_id = layer_id
         self.cfg = cfg
         self._dims = cfg.dims()
@@ -177,7 +181,8 @@ class Qwen3NextLinearLayer:
                 compute_dtype=cfg.compute_dtype,
                 master_dtype=cfg.master_dtype,
                 grad_dtype=cfg.grad_dtype,
-            )
+            ),
+            expert_compute=expert_compute,
         )
 
         x_inp_field = ActivationField(
@@ -441,7 +446,11 @@ class Qwen3NextFullLayer:
     types in ``layer_types``.
     """
 
-    def __init__(self, layer_id: int, cfg: Qwen3NextLayerConfig) -> None:
+    def __init__(
+        self, layer_id: int, cfg: Qwen3NextLayerConfig,
+        *,
+        expert_compute=None,  # MoEExpertCompute | None
+    ) -> None:
         self.layer_id = layer_id
         self.cfg = cfg
         self._dims = cfg.dims()
@@ -492,7 +501,8 @@ class Qwen3NextFullLayer:
                 compute_dtype=cfg.compute_dtype,
                 master_dtype=cfg.master_dtype,
                 grad_dtype=cfg.grad_dtype,
-            )
+            ),
+            expert_compute=expert_compute,
         )
 
 

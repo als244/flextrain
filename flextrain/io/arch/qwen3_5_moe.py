@@ -636,10 +636,15 @@ def _qwen3_5_moe_block_builder(layer_idx: int, ctx) -> object:
         norm_grad_dtype=ctx.norm_grad_dtype,
     )
 
+    moe_backend = getattr(ctx, "moe_backend", None)
     if is_full:
-        base = Qwen3NextFullLayer(layer_id=layer_idx, cfg=block_cfg)
+        base = Qwen3NextFullLayer(
+            layer_id=layer_idx, cfg=block_cfg, expert_compute=moe_backend,
+        )
     else:
-        base = Qwen3NextLinearLayer(layer_id=layer_idx, cfg=block_cfg)
+        base = Qwen3NextLinearLayer(
+            layer_id=layer_idx, cfg=block_cfg, expert_compute=moe_backend,
+        )
 
     if not ctx.lora_targets:
         return base

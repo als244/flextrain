@@ -305,7 +305,7 @@ def routed_swiglu_moe_bwd(
     if load_balance_coef > 0.0 and total_tokens_per_step is not None:
         flextrain_load_balance_bwd(
             logits=slot.x_router,
-            expert_counts=slot.expert_counts,
+            expert_counts=expert_compute.expert_counts_gpu(slot),
             num_experts=num_experts,
             alpha=load_balance_coef,
             tokens_per_step=total_tokens_per_step,

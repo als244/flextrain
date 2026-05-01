@@ -112,13 +112,12 @@ class MoESwiGLUSharedExpertFFN:
     once at the end (avoids double-counting).
     """
 
-    def __init__(self, cfg: MoESwiGLUSharedExpertConfig) -> None:
+    def __init__(
+        self, cfg: MoESwiGLUSharedExpertConfig,
+        *,
+        expert_compute=None,  # MoEExpertCompute | None
+    ) -> None:
         self.cfg = cfg
-        # Build the inner routed block from the routed-only fields. The
-        # shared block's grads + activations live alongside in the same
-        # weights/grads/slot dicts; the inner block only reads/writes
-        # routed-named keys (w_router, w_up, w_down, etc.) so there's
-        # no name collision.
         routed_cfg = MoESwiGLUConfig(
             d_model=cfg.d_model,
             expert_dim=cfg.expert_dim,
@@ -130,7 +129,7 @@ class MoESwiGLUSharedExpertFFN:
             master_dtype=cfg.master_dtype,
             grad_dtype=cfg.grad_dtype,
         )
-        self._routed_ffn = MoESwiGLUFFN(routed_cfg)
+        self._routed_ffn = MoESwiGLUFFN(routed_cfg, expert_compute=expert_compute)
 
     # ------------------------------------------------------------------
     # Declarations

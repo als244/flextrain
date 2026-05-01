@@ -128,6 +128,14 @@ class MoEExpertCompute(Protocol):
         — caller stashes it in ``slot.aux``."""
         ...
 
+    def expert_counts_gpu(self, slot: Any) -> torch.Tensor:
+        """Return the per-expert token-count tensor on GPU for this
+        layer's chunk. Backends store the same information in different
+        forms (flextrain: counts directly; scattermoe: cumulative
+        offsets); this is the unified accessor for the load-balance
+        bwd kernel that needs (E,) int32 counts."""
+        ...
+
     def bwd(
         self,
         dy: torch.Tensor,                      # (T, d_model)
@@ -232,6 +240,10 @@ class FlextrainMoEExpertCompute:
                 token_axis=None,
             ),
         )
+
+    def expert_counts_gpu(self, slot: Any) -> torch.Tensor:
+        """Flextrain stores per-expert token counts directly on the slot."""
+        return slot.expert_counts
 
     # ------------------------------------------------------------------
     # Pinned-host expert-counts helper. Stashed in ``chunk_extra`` keyed
@@ -537,6 +549,14 @@ class ScatterMoEExpertCompute:
                 tier=0,
             ),
         )
+
+    def expert_counts_gpu(self, slot: Any) -> torch.Tensor:
+        """ScatterMoE stores cumulative offsets; per-expert counts are
+        the first-difference. Returns (E,) int32."""
+        offsets = slot.scattermoe_expert_offsets  # (E,) cumsum int32
+        # counts[e] = offsets[e] - offsets[e-1]; offsets[-1] = 0.
+        prev = torch.zeros(1, dtype=offsets.dtype, device=offsets.device)
+        return torch.diff(offsets, prepend=prev)
 
     # ------------------------------------------------------------------
     # Compute

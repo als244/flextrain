@@ -89,7 +89,11 @@ class Qwen3MoEBlock:
     Qwen3-MoE's ``topk_then_softmax`` router by default.
     """
 
-    def __init__(self, layer_id: int, cfg: Qwen3MoEBlockConfig) -> None:
+    def __init__(
+        self, layer_id: int, cfg: Qwen3MoEBlockConfig,
+        *,
+        expert_compute=None,  # MoEExpertCompute | None
+    ) -> None:
         self.layer_id = layer_id
         self.cfg = cfg
         self._dims = cfg.dims()
@@ -137,7 +141,8 @@ class Qwen3MoEBlock:
                 compute_dtype=cfg.compute_dtype,
                 master_dtype=cfg.master_dtype,
                 grad_dtype=cfg.grad_dtype,
-            )
+            ),
+            expert_compute=expert_compute,
         )
 
         x_inp_field = ActivationField(

@@ -111,6 +111,9 @@ class BuildContext:
     lora_adapter_master_dtype: torch.dtype | None = None
     lora_adapter_grad_dtype: torch.dtype | None = None
     lora_adapter_opt_state_dtype: torch.dtype | None = None
+    # MoE expert-compute backend instance (FlextrainMoEExpertCompute,
+    # ScatterMoEExpertCompute, etc). None = use the layer's default.
+    moe_backend: object | None = None
 
 
 BlockBuilder = Callable[[int, BuildContext], object]
@@ -216,6 +219,7 @@ def from_pretrained(
     verbose: bool = False,
     min_chunk_size: int | None = None,
     max_chunk_size: int | None = None,
+    moe_backend: object | None = None,
 ) -> ActiveModel:
     """Build a configured :class:`ActiveModel` for an HF model directory.
 
@@ -333,6 +337,7 @@ def from_pretrained(
         lora_adapter_master_dtype=lora_adapter_master_dtype,
         lora_adapter_grad_dtype=lora_adapter_grad_dtype,
         lora_adapter_opt_state_dtype=lora_adapter_opt_state_dtype,
+        moe_backend=moe_backend,
     )
     backbone = [build_block(i, ctx) for i in range(n_layers)]
 
