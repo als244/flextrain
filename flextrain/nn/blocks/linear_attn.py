@@ -968,10 +968,12 @@ class GatedDeltaNetBlock:
             chunk_indices=chunk_indices,
             use_gate_in_kernel=True, A_log=A_log, dt_bias=dt_bias,
         )
-        # FLA returns ``(g_post, o, A_int, h_kv_state, dh_init, final_state)``.
-        # ``final_state`` is shape ``(N_packed, HV, K, V)``.
+        # FLA returns ``(g, o, A, final_state, initial_state_echo, g_input)``.
+        # ``final_state`` (index 3) is shape ``(N_packed, HV, K, V)`` when
+        # ``output_final_state=True``. We don't use the initial_state echo
+        # or g_input here.
         g_post, o, A_int = out[0], out[1], out[2]
-        final_state = out[5]
+        final_state = out[3]
 
         o = o.squeeze(0)
         slot.lin_g_post.copy_(g_post.squeeze(0))

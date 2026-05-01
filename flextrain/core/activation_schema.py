@@ -158,6 +158,16 @@ class ActivationSchema:
             return ()
         return tuple(f for f in self.fields if f.tier <= level)
 
+    def has_field(self, name: str) -> bool:
+        """True iff this schema declares a field named ``name``.
+
+        Used by the engine to dispatch type-specific cross-chunk
+        machinery (e.g. ``has_field("xk")`` for dense KV-window
+        refresh, ``has_field("lin_final_state")`` for linear-attn
+        state-window refresh) without hardcoding layer-class checks.
+        """
+        return any(f.name == name for f in self.fields)
+
     def _field_tiers_cache(self) -> dict[str, int]:
         """Map field name → tier. Used by :meth:`ActivationSlot.has`
         to check field validity at the slot's save level. Computed

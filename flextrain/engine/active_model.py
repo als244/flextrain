@@ -75,6 +75,10 @@ from flextrain.optim.base import Optimizer
 
 from .buffers import BufferManager, ScratchPool
 from .host_memory import HostMemoryBackend
+from .linear_attn_state import (
+    LinearAttnRoundPlan,
+    build_linear_attn_round_plan,
+)
 from .schedule import (
     ChunkPolicy,
     PreparedRound,
@@ -1011,6 +1015,19 @@ class ActiveModel:
         """Allocate host activation slots for this round and run embed
         on every chunk (seeding the transition table).
         """
+        # 0. Build the linear-attn cross-chunk round plan (Item 3c).
+        #    Always built so that fwd/bwd can read it via ``ctx`` even
+        #    when the round is trivial — the layer's safety check
+        #    (``has_prior_chunks=False`` in all packed-seqs) drives the
+        #    no-op fall-through.
+        self._lin_attn_round_plan: LinearAttnRoundPlan = (
+            build_linear_attn_round_plan(prepared)
+        )
+        # Zero the global lin-state window at round entry. The fwd pass
+        # incrementally populates it; bwd refreshes it via the dispatcher.
+        if self.buffers.lin_state_window is not None:
+            self.buffers.lin_state_window.zero_()
+
         # 1. Reset host-act cursor; allocate a slot for each
         #    (layer, chunk) pair with a home level >= 0.
         self.buffers.reset_host_act_cursor()
@@ -1103,6 +1120,20 @@ class ActiveModel:
                 cur_weight_slot, layer.param_spec
             )
 
+            # Layer-boundary zero of lin-state windows (Item 3c).
+            # Different layers' recurrent state are independent, so
+            # the global window holding state for the previous layer
+            # is irrelevant when starting this layer's chunk loop.
+            # Only matters for backbones with linear-attn layers; the
+            # window is None on dense-only backbones so this is a
+            # no-op there.
+            if (
+                self.buffers.lin_state_window is not None
+                and layer.schema.has_field("lin_final_state")
+            ):
+                with torch.cuda.stream(self.streams.compute):
+                    self.buffers.lin_state_window.zero_()
+
             for chunk in prepared.chunks:
                 # Wait: ring slot safe to overwrite.
                 self.events.act_slot_ready.wait_on(
@@ -1113,6 +1144,26 @@ class ActiveModel:
                 computed_slot = self.buffers.gpu_act_slot(
                     cur_act_slot, layer.schema, num_tokens=chunk.meta.total_q
                 )
+
+                # Populate cross-chunk linear-attn ctx fields for this
+                # (layer, chunk). The block reads them in _fwd_fla; if
+                # any infos has has_prior/has_more, the block uses
+                # the window; otherwise falls through to legacy path.
+                if (
+                    self.buffers.lin_state_window is not None
+                    and layer.schema.has_field("lin_final_state")
+                ):
+                    ctx.lin_attn_chunk_seq_infos = (
+                        self._lin_attn_round_plan.per_chunk[chunk.id]
+                    )
+                    ctx.lin_attn_fwd_window = self.buffers.lin_state_window.fwd
+                    ctx.lin_attn_bwd_window = self.buffers.lin_state_window.bwd
+                else:
+                    # Dense layer (or homogeneous dense backbone) —
+                    # explicit None so the block's legacy path fires.
+                    ctx.lin_attn_chunk_seq_infos = None
+                    ctx.lin_attn_fwd_window = None
+                    ctx.lin_attn_bwd_window = None
 
                 # Forward on the compute stream.
                 torch.cuda.nvtx.range_push(f"Forward: Chunk {chunk.id}")
