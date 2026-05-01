@@ -69,6 +69,9 @@ def main() -> int:
                     help="If provided, load the LoRA A/B init from this "
                          "pickle. Otherwise capture this pass's init "
                          "and write it out (for the next pass to load).")
+    ap.add_argument("--force-saved-act-level", type=int, default=None,
+                    help="Force every pair to a fixed save tier "
+                         "(debug — bypasses save-level DP).")
     args = ap.parse_args()
 
     print(f"  inner: model={args.model}  T={args.target_tokens}  chunk={args.chunk_size}")
@@ -110,6 +113,7 @@ def main() -> int:
         min_chunk_size=args.chunk_size,
         lora_rank=8,
         lora_alpha=16.0,
+        force_saved_act_level=args.force_saved_act_level,
         strict=False, verbose=False,
     )
 

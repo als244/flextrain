@@ -448,8 +448,11 @@ class Qwen3_5LinearLayer:
         attn_norm_output = self.attn_norm.fwd(
             x, weights, slot.attn_norm_rstd, output=x_temp,
         )
-        lin_out = self.lin_attn.fwd(attn_norm_output, weights, slot, ctx, chunk)
-        attn_output_with_residual = x + lin_out
+        # lin_attn block writes ``xo = x + lin_out`` into ``slot.xo``
+        # via fused addmm (mirrors GQAAttentionBlock pattern).
+        attn_output_with_residual = self.lin_attn.fwd(
+            x, attn_norm_output, weights, slot, ctx, chunk,
+        )
         ffn_norm_output = self.ffn_norm.fwd(
             attn_output_with_residual.view(-1, self.cfg.d_model),
             weights, slot.ffn_norm_rstd, output=x_temp,
@@ -497,11 +500,16 @@ class Qwen3_5LinearLayer:
             self.lin_attn.fwd_recompute_fla(
                 q_n, k_n, v_h, weights, slot, chunk, ctx=ctx,
             )
+        # xo = x_inp + lin_out is the FFN-norm input. Saved at tier 2;
+        # recompute when missing, after lin_qkvz / lin_core_out are
+        # populated above. Mirrors GQAAttentionGatedBlock.fwd_recompute_o.
+        if not slot.has("xo"):
+            self.lin_attn.fwd_recompute_xo(slot.x_inp, weights, slot)
         recompute_x1 = not slot.has("x1")
         recompute_x3 = not slot.has("x3")
         if recompute_x1 or recompute_x3:
             ffn_norm_output = self.ffn_norm.fwd_from_rstd(
-                slot.x_inp, weights, slot.ffn_norm_rstd,
+                slot.xo.view(-1, cfg.d_model), weights, slot.ffn_norm_rstd,
             )
             self.ffn.fwd_recompute_x1x3(
                 ffn_norm_output, weights, slot,
@@ -541,9 +549,13 @@ class Qwen3_5LinearLayer:
         ffn_norm_fwd_output_hint = slot.aux.pop(
             "recompute_ffn_norm_output", None
         )
+        # FFN-norm input was xo = x_inp + lin_out (post-residual), NOT
+        # x_inp. Pass slot.xo (saved tier-2 by lin_attn block, or
+        # recomputed in forward_recompute when at tier <2). Mirrors
+        # the full-attn variant which also feeds slot.xo here.
         dx, ffn_norm_fwd_output = self.ffn_norm.bwd(
             dx_ffn_norm_up,
-            slot.x_inp.view(-1, cfg.d_model),
+            slot.xo.view(-1, cfg.d_model),
             weights, grads, slot.ffn_norm_rstd,
             dx_accumulator=dx,
             recompute_output=ffn_norm_fwd_output_hint is None,

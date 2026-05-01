@@ -218,10 +218,11 @@ class Qwen3NextLinearLayer:
         attn_norm_output = self.attn_norm.fwd(
             x, weights, slot.attn_norm_rstd, output=x_temp,
         )
-        # Linear attention is residual-aware via its caller. The block
-        # returns ``(T, d_model)`` un-residualed; we add the residual.
-        lin_out = self.lin_attn.fwd(attn_norm_output, weights, slot, ctx, chunk)
-        attn_output_with_residual = x + lin_out
+        # lin_attn block writes ``xo = x + lin_out`` into ``slot.xo``
+        # via fused addmm (mirrors GQAAttentionBlock pattern).
+        attn_output_with_residual = self.lin_attn.fwd(
+            x, attn_norm_output, weights, slot, ctx, chunk,
+        )
         ffn_norm_output = self.ffn_norm.fwd(
             attn_output_with_residual.view(-1, self.cfg.d_model),
             weights, slot.ffn_norm_rstd, output=x_temp,
@@ -289,10 +290,17 @@ class Qwen3NextLinearLayer:
                 q_n, k_n, v_h, weights, slot, chunk,
             )
 
+        # xo = x_inp + lin_out is the FFN-norm input. Saved at tier 2;
+        # recompute when missing, after lin_qkvz / lin_core_out are
+        # populated above. Mirrors GQAAttentionGatedBlock.fwd_recompute_o.
+        if not slot.has("xo"):
+            self.lin_attn.fwd_recompute_xo(slot.x_inp, weights, slot)
+
         # MoE tier-3 recompute (x_up).
         if not slot.has("x_up"):
             ffn_norm_output = self.ffn_norm.fwd_from_rstd(
-                slot.x_inp, weights, slot.ffn_norm_rstd,
+                slot.xo.view(-1, self.cfg.d_model),
+                weights, slot.ffn_norm_rstd,
             )
             self.ffn.fwd_recompute_x_up(
                 ffn_norm_output, weights, slot, chunk, ctx,
@@ -334,9 +342,13 @@ class Qwen3NextLinearLayer:
             if moe_callback is None:
                 skip_g_moe = frozenset()
 
+        # FFN-norm input is xo = x_inp + lin_out (post-residual), NOT
+        # x_inp. slot.xo is saved at tier 2 by lin_attn block, or
+        # recomputed in forward_recompute when at tier <2.
         if "recompute_ffn_norm_output" not in slot.aux:
             slot.aux["recompute_ffn_norm_output"] = self.ffn_norm.fwd_from_rstd(
-                slot.x_inp, weights, slot.ffn_norm_rstd,
+                slot.xo.view(-1, cfg.d_model),
+                weights, slot.ffn_norm_rstd,
             )
 
         ffn_norm_upstream = self.ffn.bwd(
@@ -348,7 +360,7 @@ class Qwen3NextLinearLayer:
         ffn_norm_fwd_output = slot.aux.pop("recompute_ffn_norm_output")
         dx, _ = self.ffn_norm.bwd(
             ffn_norm_upstream,
-            slot.x_inp.view(-1, cfg.d_model),
+            slot.xo.view(-1, cfg.d_model),
             weights, grads, slot.ffn_norm_rstd,
             dx_accumulator=dx,
             recompute_output=False,

@@ -145,8 +145,10 @@ def main():
     )
     slot.x_inp.copy_(x)
 
-    # Run fwd to populate slot.
-    y_ft = block.fwd(x, weights_ft, slot, ctx=None)
+    # Run fwd to populate slot. Pass zero residual so y_ft == lin_out
+    # (matches the autograd reference, which has no residual).
+    x_resid_zero = torch.zeros_like(x)
+    y_ft = block.fwd(x_resid_zero, x, weights_ft, slot, ctx=None)
     # Set up grad accumulators.
     grad_keys = [
         "g_lin_qkvz", "g_lin_ba", "g_lin_out", "g_lin_conv",

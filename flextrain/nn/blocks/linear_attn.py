@@ -681,6 +681,20 @@ class GatedDeltaNetBlock:
                 lambda n, d: (n, cfg.num_v_heads, cfg.head_v_dim),
                 bf, tier=2,
             ),
+            # xo: post-residual layer-internal output of the lin-attn
+            # block: ``xo = x_resid + gated_rmsnorm(core_out, z) @ w_lin_out``.
+            # Mirrors the ``xo`` slot in :class:`GQAAttentionGatedBlock`
+            # / :class:`GQAAttentionBlock` (also tier 2). The enclosing
+            # layer's FFN-norm consumes this as input; saving it lets
+            # the bwd-side ``ffn_norm.bwd`` and the recompute-side
+            # ``ffn.fwd_recompute_x1x3`` both feed the correct
+            # post-residual tensor (otherwise they'd see ``slot.x_inp``
+            # which is pre-residual and produces wrong grads).
+            ActivationField(
+                "xo",
+                lambda n, d: (n, cfg.d_model),
+                bf, tier=2,
+            ),
             # ==================================================
             # Tier 3: largest fields, recomputable from x_inp by re-
             # running the qkvz/ba matmuls + conv + l2norm.
@@ -1170,32 +1184,51 @@ class GatedDeltaNetBlock:
         return o
 
     def _fwd_norm_out(
-        self, core_out, z, weights: Mapping[str, torch.Tensor],
+        self,
+        core_out,
+        z,
+        x_resid: torch.Tensor,
+        weights: Mapping[str, torch.Tensor],
+        slot,
     ) -> torch.Tensor:
-        """Stage 6: gated RMSNorm + out projection. Returns ``y``
-        (T, d_model). Doesn't save into the slot (the layer-level
-        residual fold writes into the layer output)."""
+        """Stage 6: gated RMSNorm + fused (out projection + residual).
+
+        Writes ``slot.xo = x_resid + gated_rmsnorm(core_out, z) @ w_lin_out``
+        via a single fused ``addmm`` (mirrors :class:`GQAAttentionBlock` /
+        :class:`GQAAttentionGatedBlock` -- saves one DtoD residual add).
+        Returns ``slot.xo`` (T, d_model)."""
         cfg = self.cfg
         T = core_out.shape[0]
         o_normed = self._gated_rmsnorm_fwd(
             core_out, z, weights["w_lin_norm"], cfg.rms_norm_eps,
         )
-        return o_normed.reshape(T, cfg.value_dim) @ weights["w_lin_out"]
+        return torch.addmm(
+            x_resid,
+            o_normed.reshape(T, cfg.value_dim),
+            weights["w_lin_out"],
+            alpha=1.0, beta=1.0,
+            out=slot.xo,
+        )
 
     def fwd(
         self,
-        x: torch.Tensor,           # (T, d_model)
+        x_resid: torch.Tensor,           # (T, d_model) layer residual stream
+        attn_norm_output: torch.Tensor,  # (T, d_model) input to projections
         weights: Mapping[str, torch.Tensor],
-        slot,                      # ActivationSlot
+        slot,                            # ActivationSlot
         ctx: LayerContext,
         chunk: ChunkMeta | None = None,
     ) -> torch.Tensor:
-        """Forward pass. Saves activations into ``slot``; returns
-        the linear-attention output of shape ``(T, d_model)``.
+        """Forward pass. Saves activations into ``slot``; writes the
+        post-residual layer output ``xo = x_resid + lin_out`` into
+        ``slot.xo`` and returns it.
 
         Composed from the per-stage helpers
         (``_fwd_proj_split`` → ``_fwd_conv`` → ``_fwd_qkv_heads`` →
         ``_fwd_gate_and_beta`` → ``_fwd_fla`` → ``_fwd_norm_out``).
+        ``_fwd_norm_out`` fuses the out-projection with the residual add
+        via ``addmm(C=x_resid, A=o_normed, B=w_lin_out, out=slot.xo)`` --
+        same pattern as :class:`GQAAttentionBlock` / :class:`GQAAttentionGatedBlock`.
         :meth:`fwd_recompute_*` re-runs only the missing stages.
 
         ``chunk`` carries per-sequence offsets (``q_seq_offsets``)
@@ -1209,7 +1242,7 @@ class GatedDeltaNetBlock:
         chunk_indices = (
             chunk.fla_chunk_indices_64 if chunk is not None else None
         )
-        z, conv_in = self._fwd_proj_split(x, weights, slot)
+        z, conv_in = self._fwd_proj_split(attn_norm_output, weights, slot)
         post_conv = self._fwd_conv(conv_in, weights, ctx, slot)
         q_n, k_n, v_h, _q_rstd, _k_rstd = self._fwd_qkv_heads(post_conv, ctx)
         b, a = _split_ba_ft(slot.lin_ba, self.cfg)
@@ -1220,7 +1253,7 @@ class GatedDeltaNetBlock:
             cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
             ctx=ctx,
         )
-        return self._fwd_norm_out(core_out, z, weights)
+        return self._fwd_norm_out(core_out, z, x_resid, weights, slot)
 
     def _gated_rmsnorm_fwd(
         self,
@@ -1303,6 +1336,22 @@ class GatedDeltaNetBlock:
             weights["w_lin_A_log"], weights["w_lin_dt_bias"], slot,
             cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
             ctx=ctx,
+        )
+
+    def fwd_recompute_xo(
+        self,
+        x_resid: torch.Tensor,
+        weights: Mapping[str, torch.Tensor],
+        slot,
+    ) -> torch.Tensor:
+        """Tier<2 recompute: re-run gated_rmsnorm + fused (out_proj +
+        residual add) into ``slot.xo``. Reads saved ``slot.lin_core_out``
+        (FLA output) and the Z slice of ``slot.lin_qkvz``. Mirrors
+        :meth:`GQAAttentionGatedBlock.fwd_recompute_o`."""
+        cfg = self.cfg
+        _q_pre, _k_pre, _v_pre, z = _split_qkvz_ft(slot.lin_qkvz, cfg)
+        return self._fwd_norm_out(
+            slot.lin_core_out, z, x_resid, weights, slot,
         )
 
     def _gated_rmsnorm_bwd(

@@ -142,7 +142,9 @@ def main():
     slot = ActivationSlot(schema=schema, level=schema.max_tier, tensors=slot_tensors)
 
     # FT block fwd. Block doesn't use ctx (no kv_cache, no scratch).
-    y_ft = block.fwd(x, weights, slot, ctx=None)
+    # Pass zero residual so y_ft == lin_out (matches reference).
+    x_resid_zero = torch.zeros_like(x)
+    y_ft = block.fwd(x_resid_zero, x, weights, slot, ctx=None)
 
     # Reference fwd.
     y_ref = _hf_reference_fwd(cfg, x, weights)
