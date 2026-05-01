@@ -854,3 +854,456 @@ class ScatterMoEExpertCompute:
 
         return dx
 
+
+# ---------------------------------------------------------------------------
+# SonicMoE implementation
+# ---------------------------------------------------------------------------
+
+
+class SonicMoEExpertCompute:
+    """Drives the routed-MLP pipeline via sonic-moe's CUTLASS DSL kernels.
+
+    Lower-level kernel calls (no autograd, no Function.apply): we drive
+    ``general_routing_router_metadata_triton`` (routing bookkeeping),
+    ``gemm_gated`` (fused up-proj + activation), ``gemm`` (down-proj),
+    ``_router_forward`` (gather + weighted-sum) for fwd, and
+    ``_down_projection_backward_act`` (fused down-bwd + activation-bwd via
+    ``gemm_dgated``), ``_up_projection_backward_act`` (up-bwd dgrad),
+    ``gemm`` (×2 for wgrads), ``_token_broadcast_backward`` (K-reduction)
+    for bwd.
+
+    Backend-private slot fields (all tier 0):
+      * ``sonic_s_scatter_idx: (TK,) int32`` — scattered → token-major idx.
+      * ``sonic_s_reverse_scatter_idx: (TK,) int32`` — token-major → scattered idx.
+      * ``sonic_x_gather_idx: (TK,) int32`` — scattered → x token idx.
+      * ``sonic_expert_frequency: (E,) int32`` — per-expert counts.
+      * ``sonic_expert_frequency_offset: (E+1,) int32`` — cumsum w/ leading 0.
+      * ``sonic_num_activated_offset: (T+1,) int32`` — per-token expert-count cumsum.
+      * ``index_mapping: (T, K) int32`` — flextrain-shape, derived from
+        s_scatter_idx at fwd. Lets the unified
+        ``flextrain_moe_router_gate_bwd`` consume scattered dprobs the
+        same way both flextrain and sonic backends do.
+
+    Pre-act save: sonic's natural format. ``slot.x_up: (TK, 2F)`` is
+    populated by ``gemm_gated``'s ``preact_out=`` arg in fwd; bwd's
+    ``_down_projection_backward_act`` consumes it as ``PreAct=h``. No
+    deviation from sonic's convention required.
+
+    Limitations:
+      * supported_tiers = {3} only — bwd uses CUTLASS DSL kernels that
+        don't support a "drop x_up, recompute in bwd" path.
+      * No LoRA — no per-expert wgrad hook in sonic.
+      * No inline residual add in gather (caller adds it).
+      * Hopper (sm_90+) only — sonic's CUTLASS DSL targets sm_90.
+        Earlier archs hit "Gemm Sm80 is not implemented yet" at the
+        first kernel call. ``__init__`` checks compute capability and
+        raises with a clear message; set ``SONICMOE_FORCE=1`` to bypass.
+    """
+
+    name = "sonicmoe"
+
+    def __init__(self) -> None:
+        import os
+        cap = torch.cuda.get_device_capability()
+        force = os.environ.get("SONICMOE_FORCE", "0") == "1"
+        if cap < (9, 0) and not force:
+            raise RuntimeError(
+                f"SonicMoEExpertCompute requires sm_90+ (Hopper). "
+                f"Got sm_{cap[0]}{cap[1]}. Set SONICMOE_FORCE=1 to bypass."
+            )
+        # Try-import at construction so we fail fast if sonic / quack
+        # aren't installed. The CUTLASS DSL JIT compiles on first call,
+        # so the imports themselves don't run kernels — safe.
+        try:
+            from quack.gemm_interface import gemm, gemm_gated, gemm_dgated  # noqa: F401
+            from sonicmoe.functional.triton_kernels import (  # noqa: F401
+                general_routing_router_metadata_triton,
+            )
+            from sonicmoe.functional.forward import _router_forward  # noqa: F401
+            from sonicmoe.functional.backward import (  # noqa: F401
+                _down_projection_backward_act,
+                _up_projection_backward_act,
+                _token_broadcast_backward,
+            )
+        except ImportError as e:
+            raise RuntimeError(
+                "sonic-moe / quack-kernels not installed. Install with:\n"
+                "  pip install -e <flextrain>/external_moe_impl/sonic-moe[cu13]\n"
+                f"Original error: {e}"
+            ) from e
+
+    # ------------------------------------------------------------------
+    # Capability flags
+    # ------------------------------------------------------------------
+
+    @property
+    def supports_residual_in_gather(self) -> bool:
+        return False
+
+    @property
+    def supported_tiers(self) -> frozenset[int]:
+        return frozenset({3})
+
+    # ------------------------------------------------------------------
+    # Schema
+    # ------------------------------------------------------------------
+
+    def activation_fields(
+        self, num_experts: int, top_k: int, expert_dim: int, d_model: int,
+        compute_dtype: torch.dtype,
+    ) -> tuple[ActivationField, ...]:
+        return (
+            ActivationField(
+                "sonic_s_scatter_idx",
+                lambda n, d: (n * top_k,),
+                torch.int32,
+                tier=0,
+                token_axis=None,
+            ),
+            ActivationField(
+                "sonic_s_reverse_scatter_idx",
+                lambda n, d: (n * top_k,),
+                torch.int32,
+                tier=0,
+                token_axis=None,
+            ),
+            ActivationField(
+                "sonic_x_gather_idx",
+                lambda n, d: (n * top_k,),
+                torch.int32,
+                tier=0,
+                token_axis=None,
+            ),
+            ActivationField(
+                "sonic_expert_frequency",
+                lambda n, d: (num_experts,),
+                torch.int32,
+                tier=0,
+                token_axis=None,
+            ),
+            ActivationField(
+                "sonic_expert_frequency_offset",
+                lambda n, d: (num_experts + 1,),
+                torch.int32,
+                tier=0,
+                token_axis=None,
+            ),
+            # (T+1,) — num_activated_offset[t] = cumulative count of
+            # expert-slots through token t. Token-axis sized.
+            ActivationField(
+                "sonic_num_activated_offset",
+                lambda n, d: (n + 1,),
+                torch.int32,
+                tier=0,
+                # token_axis defaults to 0; +1 elements is fine since
+                # the schema sizes by num_tokens and we only need
+                # num_tokens entries plus a sentinel. Engine accepts
+                # token_axis=0 with shape (n+1,); narrow returns
+                # the (n+1,) for the chunk's actual num_tokens.
+            ),
+            # Flextrain-shape index_mapping for unified router-gate-bwd.
+            ActivationField(
+                "index_mapping",
+                lambda n, d: (n, top_k),
+                torch.int32,
+                tier=0,
+            ),
+        )
+
+    def expert_counts_gpu(self, slot: Any) -> torch.Tensor:
+        """Sonic stores per-expert counts directly in expert_frequency."""
+        return slot.sonic_expert_frequency
+
+    # ------------------------------------------------------------------
+    # Compute
+    # ------------------------------------------------------------------
+
+    def fwd(
+        self,
+        x: torch.Tensor,
+        router_weights: torch.Tensor,
+        chosen_experts: torch.Tensor,
+        weights: Mapping[str, torch.Tensor],
+        *,
+        out: torch.Tensor,
+        residual: torch.Tensor | None,
+        slot: Any,
+        chunk_extra: MutableMapping[str, Any],
+        layer_id: int,
+        primary_stream: torch.cuda.Stream,
+        secondary_stream: torch.cuda.Stream | None,
+        scratch_fn: Callable[[tuple[int, ...], torch.dtype], torch.Tensor],
+    ) -> None:
+        if residual is not None:
+            raise ValueError(
+                "SonicMoEExpertCompute does not support inline residual "
+                "in the gather; caller must add it after fwd returns."
+            )
+        from quack.gemm_interface import gemm, gemm_gated
+        from sonicmoe.functional.triton_kernels import (
+            general_routing_router_metadata_triton,
+        )
+        from sonicmoe.functional.forward import _router_forward
+
+        # Dimensions.
+        num_experts = weights["w_up"].shape[0]
+        d_model = weights["w_up"].shape[1]
+        F = weights["w_down"].shape[1]
+        T = x.shape[0]
+        K = router_weights.shape[1]
+        TK = T * K
+
+        # 1. Build sonic-shape (TK,) flat routing inputs.
+        # token_indices_flat: [0,0,...,1,1,...] sorted by token (sonic
+        # requires sorted_selected_T input, and arange.repeat_interleave
+        # produces this naturally).
+        # expert_indices_flat: chosen_experts viewed as (TK,) int32.
+        # router_scores_flat: router_weights viewed as (TK,) float32
+        # (sonic's gemm_dgated needs fp32 for the scaling; we cast here).
+        token_indices_flat = (
+            torch.arange(T, device=x.device, dtype=torch.int32)
+            .repeat_interleave(K)
+        )
+        expert_indices_flat = chosen_experts.view(-1).contiguous().to(torch.int32)
+        router_scores_flat = router_weights.view(-1).float().contiguous()
+
+        # 2. Build all routing bookkeeping (6 tensors) into slot fields.
+        general_routing_router_metadata_triton(
+            token_indices_flat,
+            expert_indices_flat,
+            T,
+            num_experts,
+            slot.sonic_expert_frequency,
+            slot.sonic_expert_frequency_offset,
+            slot.sonic_x_gather_idx,
+            slot.sonic_s_scatter_idx,
+            slot.sonic_s_reverse_scatter_idx,
+            slot.sonic_num_activated_offset,
+        )
+
+        # 3. Build flextrain-shape index_mapping (T, K) for unified
+        # router-gate-bwd. s_scatter_idx[i] = j means scattered position
+        # i was originally at token-major flat position j. So:
+        #   index_mapping.flatten()[s_scatter_idx[i]] = i
+        # produces the inverse permutation.
+        slot.index_mapping.view(-1).index_copy_(
+            0,
+            slot.sonic_s_scatter_idx.long(),
+            torch.arange(TK, device=x.device, dtype=torch.int32),
+        )
+
+        # 4. Up-projection via gemm_gated. Produces pre-act (TK, 2F)
+        # into slot.x_up and post-act (TK, F) into a scratch buffer.
+        # Sonic's gemm_gated expects w1 in (I=2F, H=d, E) layout; our
+        # weights["w_up"] is (E, d, 2F), so permute(2, 1, 0).
+        a_post = scratch_fn((TK, F), x.dtype)
+        gemm_gated(
+            x,
+            weights["w_up"].permute(2, 1, 0),
+            activation="swiglu",
+            cu_seqlens_m=slot.sonic_expert_frequency_offset,
+            A_idx=slot.sonic_x_gather_idx,
+            preact_out=slot.x_up,
+            postact_out=a_post,
+            store_preact=True,
+            bias=None,
+        )
+
+        # 5. Down-projection: y = a_post @ w_down (scattered → scattered
+        # token-major). Sonic's gemm expects w2 in (H=d, I=F, E) layout;
+        # our weights["w_down"] is (E, F, d), permute(2, 1, 0).
+        y = scratch_fn((TK, d_model), x.dtype)
+        gemm(
+            a_post,
+            weights["w_down"].permute(2, 1, 0),
+            out=y,
+            cu_seqlens_m=slot.sonic_expert_frequency_offset,
+            bias=None,
+        )
+
+        # 6. Gather + weighted-sum: out (T, d) = sum over K of
+        # y[scatter_pos(t, k)] * router_scores[t, k]. Fixed-K routing.
+        _router_forward(
+            y=y,
+            o=out,
+            topk_scores=router_scores_flat,
+            s_reverse_scatter_idx=slot.sonic_s_reverse_scatter_idx,
+            num_activated_expert_per_token_offset=slot.sonic_num_activated_offset,
+            varlen_K_max=K,
+            H=d_model,
+            is_varlen_K=False,
+        )
+
+    def fwd_recompute(
+        self,
+        x: torch.Tensor,
+        weights: Mapping[str, torch.Tensor],
+        *,
+        slot: Any,
+        chunk_extra: MutableMapping[str, Any],
+        layer_id: int,
+        primary_stream: torch.cuda.Stream,
+        secondary_stream: torch.cuda.Stream | None,
+        scratch_fn: Callable[[tuple[int, ...], torch.dtype], torch.Tensor],
+    ) -> Any:
+        raise NotImplementedError(
+            "SonicMoEExpertCompute supports only tier 3; fwd_recompute "
+            "should never be called. supported_tiers={3}."
+        )
+
+    def bwd(
+        self,
+        dy: torch.Tensor,
+        x: torch.Tensor,
+        weights: Mapping[str, torch.Tensor],
+        grads: MutableMapping[str, torch.Tensor],
+        *,
+        slot: Any,
+        chunk_extra: MutableMapping[str, Any],
+        layer_id: int,
+        primary_stream: torch.cuda.Stream,
+        secondary_stream: torch.cuda.Stream | None,
+        scratch_fn: Callable[[tuple[int, ...], torch.dtype], torch.Tensor],
+        dx: torch.Tensor | None = None,
+        recompute_handoff: Any = None,
+        # Reject LoRA kwargs explicitly.
+        skip_grads: frozenset[str] = frozenset(),
+        lora_per_expert_callback: object | None = None,
+    ) -> torch.Tensor:
+        if skip_grads or lora_per_expert_callback is not None:
+            raise NotImplementedError(
+                "SonicMoEExpertCompute does not support LoRA per-expert "
+                "callbacks. Use FlextrainMoEExpertCompute for LoRA."
+            )
+        if recompute_handoff is not None:
+            raise NotImplementedError(
+                "SonicMoEExpertCompute does not support tier <3 recompute."
+            )
+        from quack.gemm_interface import gemm
+        from sonicmoe.functional.backward import (
+            _down_projection_backward_act,
+            _up_projection_backward_act,
+            _token_broadcast_backward,
+        )
+        from flextrain.ops import flextrain_moe_scatter_routing_weights
+
+        # Dimensions.
+        num_experts = weights["w_up"].shape[0]
+        d_model = weights["w_up"].shape[1]
+        F = weights["w_down"].shape[1]
+        T = dy.shape[0]
+        K = slot.index_mapping.shape[1]
+        TK = T * K
+
+        # router_scores in fp32 (sonic's down-bwd kernel uses fp32 for
+        # the gradient scaling chain).
+        router_scores_flat = slot.router_weights.view(-1).float().contiguous()
+
+        # 1. Down-projection bwd + activation bwd, fused via gemm_dgated.
+        #    - dh: (TK, 2F) — gradient at the pre-SwiGLU activation.
+        #    - a_prime: (TK, F) — recomputed post-act, used as X for dw_down.
+        #    - ds: (TK,) token-major — d/d-router-score per slot.
+        dh = scratch_fn((TK, 2 * F), dy.dtype)
+        a_prime = scratch_fn((TK, F), dy.dtype)
+        ds = torch.empty(TK, dtype=router_scores_flat.dtype, device=dy.device)
+
+        _down_projection_backward_act(
+            dout=dy,
+            h=slot.x_up,
+            w2=weights["w_down"],
+            dh=dh,
+            ds=ds,
+            b2=None,
+            db2=None,
+            a_prime=a_prime,
+            topk_scores=router_scores_flat,
+            expert_frequency_offset=slot.sonic_expert_frequency_offset,
+            x_gather_idx=slot.sonic_x_gather_idx,
+            s_scatter_idx=slot.sonic_s_scatter_idx,
+            activation_type="swiglu",
+        )
+
+        # 2. dw_down = gemm(dy.T, a_prime). Sonic's reference allocates
+        # dw2 like w2 (= (d, F, E)), then writes via permute(2, 0, 1) →
+        # (E, d, F) layout. Our g_down is (E, F, d) so we accumulate
+        # via .add_(dw2_buf.permute(2, 1, 0)) which converts (d, F, E)
+        # → (E, F, d).
+        if grads.get("g_down") is not None:
+            dw_down_buf = torch.empty(
+                d_model, F, num_experts,
+                dtype=weights["w_down"].dtype, device=dy.device,
+            )
+            gemm(
+                dy.T,
+                a_prime,
+                out=dw_down_buf.permute(2, 0, 1),  # (E, d, F)
+                cu_seqlens_k=slot.sonic_expert_frequency_offset,
+                A_idx=slot.sonic_x_gather_idx,
+                batch_idx_permute=None,
+                dynamic_scheduler=False,
+            )
+            # (d, F, E) → (E, F, d) for our storage layout.
+            grads["g_down"].add_(dw_down_buf.permute(2, 1, 0))
+
+        # 3. Up-projection dgrad: dx_expanded (TK, d) = dh @ w_up^T.
+        # _up_projection_backward_act handles the gemm internally
+        # (it's a thin wrapper that calls gemm with the right perms).
+        dx_expanded = scratch_fn((TK, d_model), dy.dtype)
+        _up_projection_backward_act(
+            w1=weights["w_up"],
+            dx_expanded=dx_expanded,
+            dh=dh,
+            db1=None,
+            expert_frequency_offset=slot.sonic_expert_frequency_offset,
+            is_glu_activation=True,
+            concat_layout=False,
+        )
+
+        # 4. dw_up = gemm(x.T, dh). Sonic's reference allocates dw1 like
+        # w1 (= (2F, d, E)), writes via permute(2, 1, 0) → (E, d, 2F).
+        # Our g_up is (E, d, 2F) → matches sonic's permute output exactly.
+        if grads.get("g_up") is not None:
+            dw_up_buf = torch.empty(
+                2 * F, d_model, num_experts,
+                dtype=weights["w_up"].dtype, device=dy.device,
+            )
+            gemm(
+                x.T,
+                dh,
+                out=dw_up_buf.permute(2, 1, 0),  # (E, d, 2F)
+                cu_seqlens_k=slot.sonic_expert_frequency_offset,
+                A_idx=slot.sonic_x_gather_idx,
+                batch_idx_permute=None,
+                dynamic_scheduler=False,
+            )
+            # (2F, d, E) → (E, d, 2F) for our storage layout. The
+            # permute output IS already (E, d, 2F), so add_ directly.
+            grads["g_up"].add_(dw_up_buf.permute(2, 1, 0))
+
+        # 5. dx_reduced = sum_k dx_expanded[scatter_pos(t, k)]: K-dim
+        # reduction back to per-token dx.
+        if dx is None:
+            dx = torch.empty_like(dy)
+        _token_broadcast_backward(
+            dx_reduced=dx,
+            dx_expanded=dx_expanded,
+            s_reverse_scatter_idx=slot.sonic_s_reverse_scatter_idx,
+            num_activated_expert_per_token_offset=slot.sonic_num_activated_offset,
+            varlen_K_max=K,
+            H=d_model,
+            is_varlen_K=False,
+        )
+
+        # 6. dprobs for the unified router-gate-bwd: ds is (TK,)
+        # token-major fp32. Cast to compute dtype, view as (T, K),
+        # scatter to (TK,) scattered, expose as (TK, 1).
+        dprobs_flat = scratch_fn((TK,), dy.dtype)
+        flextrain_moe_scatter_routing_weights(
+            ds.view(T, K).to(dy.dtype).contiguous(),
+            slot.index_mapping,
+            out=dprobs_flat,
+        )
+        slot.aux["moe_dprobs"] = dprobs_flat.unsqueeze(-1)
+
+        return dx
+

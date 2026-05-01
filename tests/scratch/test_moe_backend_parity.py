@@ -110,8 +110,11 @@ def naive_moe_fwd_bwd(
 
 
 def _make_fake_slot(T, K, E, F, d_model, dtype, device):
+    """Union of all backend-private slot fields. Each backend reads
+    only the subset relevant to it; the others are unused empties."""
     TK = T * K
     return types.SimpleNamespace(
+        # Shared block fields.
         x_router=torch.empty(T, E, device=device, dtype=dtype),
         router_weights=torch.empty(T, K, device=device, dtype=dtype),
         chosen_experts=torch.empty(T, K, device=device, dtype=torch.int32),
@@ -124,6 +127,13 @@ def _make_fake_slot(T, K, E, F, d_model, dtype, device):
         scattermoe_sorted_expert_idxs=torch.empty(TK, device=device, dtype=torch.int32),
         scattermoe_sorted_scattered_idxs=torch.empty(TK, device=device, dtype=torch.int32),
         scattermoe_expert_offsets=torch.empty(E, device=device, dtype=torch.int32),
+        # Sonic backend's private fields.
+        sonic_s_scatter_idx=torch.empty(TK, device=device, dtype=torch.int32),
+        sonic_s_reverse_scatter_idx=torch.empty(TK, device=device, dtype=torch.int32),
+        sonic_x_gather_idx=torch.empty(TK, device=device, dtype=torch.int32),
+        sonic_expert_frequency=torch.empty(E, device=device, dtype=torch.int32),
+        sonic_expert_frequency_offset=torch.empty(E + 1, device=device, dtype=torch.int32),
+        sonic_num_activated_offset=torch.empty(T + 1, device=device, dtype=torch.int32),
         aux={},
     )
 
@@ -280,6 +290,26 @@ def main():
         T, K, E, F, d_model, dtype, device,
     )
 
+    # ---- SonicMoE backend (skip if unavailable) ----
+    son_out = son_dx = son_g_up = son_g_down = son_d_p = None
+    son_skip_reason: str | None = None
+    try:
+        from flextrain.ops.moe_backend import SonicMoEExpertCompute
+        cap = torch.cuda.get_device_capability()
+        if cap < (9, 0):
+            son_skip_reason = (
+                f"requires sm_90+ (got sm_{cap[0]}{cap[1]}); skipping"
+            )
+        else:
+            son_backend = SonicMoEExpertCompute()
+            print("\n=== SonicMoEExpertCompute ===")
+            son_out, son_dx, son_g_up, son_g_down, son_d_p = run_backend(
+                son_backend, x, expert_p, expert_idxs, weights, dy,
+                T, K, E, F, d_model, dtype, device,
+            )
+    except (ImportError, RuntimeError) as e:
+        son_skip_reason = f"backend construction failed ({e})"
+
     # Cosine-similarity tolerance: bf16 GEMM with fp32 accum produces
     # near-perfect cosine alignment with the fp32 reference; 0.999 is
     # a comfortable margin while still catching real bugs (any kernel
@@ -310,14 +340,35 @@ def main():
         if not _report(label, a, b, cos_tol=cos_tol):
             fail_sm = True
 
+    fail_son = False
+    if son_skip_reason is None:
+        print("\n=== SonicMoE vs naive reference ===")
+        for label, a, b in [
+            ("out (T, d)",       son_out,    out_ref),
+            ("dx (T, d)",        son_dx,     dx_ref),
+            ("d_expert_p (T, K)", son_d_p,    d_p_ref),
+            ("g_up (E, d, 2F)",  son_g_up,   dw_up_ref),
+            ("g_down (E, F, d)", son_g_down, dw_down_ref),
+        ]:
+            if not _report(label, a, b, cos_tol=cos_tol):
+                fail_son = True
+    else:
+        print(f"\n=== SonicMoE: SKIP ({son_skip_reason}) ===")
+
     print()
-    if fail_ft or fail_sm:
+    if fail_ft or fail_sm or fail_son:
         if fail_ft:
             print("FAIL — flextrain backend diverges from reference.")
         if fail_sm:
             print("FAIL — scattermoe backend diverges from reference.")
+        if fail_son:
+            print("FAIL — sonicmoe backend diverges from reference.")
         sys.exit(1)
-    print("PASS — both backends agree with naive reference within bf16 tol.")
+    msg = "PASS — flextrain and scattermoe agree with naive reference"
+    if son_skip_reason is None:
+        msg += "; sonic also passed"
+    msg += "."
+    print(msg)
 
 
 if __name__ == "__main__":

@@ -458,13 +458,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--moe-backend",
         type=str,
         default="flextrain",
-        choices=["flextrain", "scattermoe"],
+        choices=["flextrain", "scattermoe", "sonicmoe"],
         help=(
             "MoE expert-compute backend. 'flextrain' (default) uses our "
             "dispatch_scatter + per-expert dispatcher loop + combine_gather "
             "and supports LoRA. 'scattermoe' calls scattermoe's Triton "
-            "scatter2scatter / group_bwd_W kernels — no LoRA support, "
-            "tier 3 only. No-op for non-MoE models."
+            "scatter2scatter / group_bwd_W kernels — no LoRA, tier 3 only. "
+            "'sonicmoe' calls sonic-moe's CUTLASS DSL kernels (gemm_gated / "
+            "gemm_dgated / fused gather) — no LoRA, tier 3 only, "
+            "sm_90+ only. No-op for non-MoE models."
         ),
     )
     p.add_argument(
@@ -761,6 +763,9 @@ def main(argv: list[str] | None = None) -> int:
     elif args.moe_backend == "scattermoe":
         from flextrain.ops.moe_backend import ScatterMoEExpertCompute
         moe_backend_obj = ScatterMoEExpertCompute()
+    elif args.moe_backend == "sonicmoe":
+        from flextrain.ops.moe_backend import SonicMoEExpertCompute
+        moe_backend_obj = SonicMoEExpertCompute()
     else:
         moe_backend_obj = None
 
