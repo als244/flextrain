@@ -1,17 +1,19 @@
 """Parity check: Qwen3.5-9B full finetune + Qwen3.5-35B-A3B LoRA, 5 steps.
 
-Two reference loss curves recorded at master 2026-04-30 in
-``tests/chunk_variance_logs/baseline_9b_full.log`` and
-``baseline_35b_lora.log``. Run this script after engine changes that
-might affect either model's bwd path; expected per-step losses must
-match within bf16 noise (~5e-3 abs / 1% rel).
+Two reference loss curves recorded at master cf71e81 (pre-C8/C9) in
+``tests/parity_baselines/baseline_qwen3_5_9b_full.log`` and
+``baseline_qwen3_5_35b_a3b_lora.log``. Run this script after engine
+changes that might affect either model's bwd path; expected per-step
+losses must match within bf16 noise (~5e-3 abs / 1% rel).
 
 Both runs use the standard ``train.py`` CLI with mathinstruct.jsonl
 and the default LRs (3e-5 for full, 1e-4 for lora). Sequences run
 back-to-back so we can refer back to one log per session.
 
 Hardware budget (matches the recorded baselines): 22.5 GiB GPU,
-110.0 GiB host. Designed for an RTX 3090 (24 GiB).
+110.0 GiB host, 2.0 GiB GPU leeway. Designed for an RTX 3090
+(24 GiB). The 2 GiB leeway (vs train.py's 5 GiB default) is REQUIRED
+to fit these workloads — the script sets this automatically.
 
 Usage:
   python tests/parity_qwen3_5_9b_35b_5step.py
@@ -39,13 +41,13 @@ REFERENCE = {
         "model": "models/Qwen3.5-9B",
         "mode": "full",
         "expected_losses": [0.7442, 0.5176, 0.4892, 0.4714, 0.4547],
-        "log_path": "tests/chunk_variance_logs/baseline_9b_full.log",
+        "log_path": "tests/parity_baselines/baseline_qwen3_5_9b_full.log",
     },
     "35b_lora": {
         "model": "models/Qwen3.5-35B-A3B",
         "mode": "lora",
         "expected_losses": [0.7432, 0.6866, 0.6452, 0.5855, 0.5407],
-        "log_path": "tests/chunk_variance_logs/baseline_35b_lora.log",
+        "log_path": "tests/parity_baselines/baseline_qwen3_5_35b_a3b_lora.log",
     },
 }
 
@@ -80,7 +82,8 @@ def _parse_losses(stdout: str) -> list[float]:
 
 
 def _run(label: str, model: str, mode: str, *, dataset: str,
-         gpu_gib: float, host_gib: float, log_path: str) -> tuple[int, list[float]]:
+         gpu_gib: float, host_gib: float, leeway_gpu_gib: float,
+         log_path: str) -> tuple[int, list[float]]:
     print(f"\n{'='*72}")
     print(f"=== {label}: model={model} mode={mode} ===")
     print(f"{'='*72}")
@@ -94,6 +97,7 @@ def _run(label: str, model: str, mode: str, *, dataset: str,
         "--dataset", dataset,
         "--max-gpu-mem-gib", str(gpu_gib),
         "--max-host-mem-gib", str(host_gib),
+        "--leeway-gpu-mem-gib", str(leeway_gpu_gib),
     ]
     print(f"  cmd: {' '.join(shlex.quote(c) for c in cmd)}")
     t0 = time.time()
@@ -136,6 +140,10 @@ def main() -> int:
     ap.add_argument("--dataset", default="datasets/mathinstruct.jsonl")
     ap.add_argument("--gpu-gib", type=float, default=22.5)
     ap.add_argument("--host-gib", type=float, default=110.0)
+    ap.add_argument("--leeway-gpu-gib", type=float, default=2.0,
+                    help="GPU memory leeway. Baselines used 2.0; the "
+                         "default 5.0 in train.py is too tight to fit "
+                         "the 9B/35B parity workloads on a 24 GiB card.")
     ap.add_argument("--tol", type=float, default=DEFAULT_TOL,
                     help=f"Per-step abs loss tolerance. Default {DEFAULT_TOL}.")
     ap.add_argument("--skip-9b", action="store_true")
@@ -159,6 +167,7 @@ def main() -> int:
             spec["model"], spec["mode"],
             dataset=args.dataset,
             gpu_gib=args.gpu_gib, host_gib=args.host_gib,
+            leeway_gpu_gib=args.leeway_gpu_gib,
             log_path=os.path.join(out_dir, "parity_9b_full.log"),
         )
         if rc != 0:
@@ -177,6 +186,7 @@ def main() -> int:
             spec["model"], spec["mode"],
             dataset=args.dataset,
             gpu_gib=args.gpu_gib, host_gib=args.host_gib,
+            leeway_gpu_gib=args.leeway_gpu_gib,
             log_path=os.path.join(out_dir, "parity_35b_lora.log"),
         )
         if rc != 0:
