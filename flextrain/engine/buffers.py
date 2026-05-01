@@ -98,6 +98,59 @@ class KVContextWindow:
         return self
 
 
+@dataclass
+class LinAttnStateWindow:
+    """Per-layer global recurrent-state window for linear attention
+    (Item 3c — cross-chunk linear-attn correctness).
+
+    Mirror of :class:`KVContextWindow` but for FLA's recurrent state
+    instead of K/V values. Two tensors:
+
+    * ``fwd``: the per-(layer, seq) state at chunk N's INPUT, used as
+      FLA's ``initial_state`` argument for chunk N's fwd AND for
+      chunk N's bwd. Refreshed during bwd from
+      ``slot[L, N - 1].lin_final_state`` (saved during fwd).
+
+    * ``bwd``: the dh0 chain accumulator. Chunk N's bwd writes ``dh0``
+      into this buffer; chunk N-1's bwd reads it as its ``dht`` input.
+      Same compute stream as bwd; no cross-stream sync required.
+
+    Single tensor per buffer (shape ``(HV, K, V) fp32``) — not row-
+    indexed, since ``flextrain/engine/schedule.py:_emit_large``
+    guarantees that any chunk participating in a multi-chunk seq is a
+    dedicated single-packed-seq chunk.
+
+    Allocated once at engine init iff any backbone layer's schema
+    declares ``lin_final_state``. Reused across all rounds and all
+    linear-attn layers via per-layer-boundary refresh, exactly like
+    :class:`KVContextWindow`.
+    """
+
+    fwd: torch.Tensor   # (HV, K, V) fp32 — initial_state for FLA fwd / bwd
+    bwd: torch.Tensor   # (HV, K, V) fp32 — dh0 chain accumulator
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        num_v_heads: int,
+        head_k_dim: int,
+        head_v_dim: int,
+        device: torch.device | str,
+        dtype: torch.dtype = torch.float32,
+    ) -> "LinAttnStateWindow":
+        shape = (num_v_heads, head_k_dim, head_v_dim)
+        return cls(
+            fwd=torch.zeros(shape, dtype=dtype, device=device),
+            bwd=torch.zeros(shape, dtype=dtype, device=device),
+        )
+
+    def zero_(self) -> "LinAttnStateWindow":
+        self.fwd.zero_()
+        self.bwd.zero_()
+        return self
+
+
 # ---------------------------------------------------------------------------
 # Scratch pool.
 # ---------------------------------------------------------------------------
@@ -419,6 +472,12 @@ class BufferManager:
     kv_bwd_dk: torch.Tensor
     kv_bwd_dv: torch.Tensor
 
+    # === Linear-attn cross-chunk state window (Item 3c) ===
+    # Reused across linear-attn layers; lifetime = engine. ``None``
+    # when the backbone has no linear-attn layer (so dense models pay
+    # zero memory).
+    lin_state_window: "LinAttnStateWindow | None"
+
     # === transition table (residual-stream holder, one tensor per chunk) ===
     # Chunks are materialized on demand during fwd_bwd; we don't pre-
     # allocate a fixed (num_chunks, d_model) tensor because chunk count
@@ -724,6 +783,52 @@ class BufferManager:
         # Back-compat alias for layers that read dk / dv as separate tensors.
         self.kv_bwd_dk = self.kv_fwd.dk
         self.kv_bwd_dv = self.kv_fwd.dv
+
+        # ---- Linear-attn cross-chunk state window (Item 3c) ----
+        # Allocate iff any backbone layer's schema declares
+        # ``lin_final_state``. Probe by scanning layer_schemas for the
+        # field name. Zero-cost on dense backbones.
+        self.lin_state_window = None
+        has_lin_attn = any(
+            any(f.name == "lin_final_state" for f in s.fields)
+            for s in layer_schemas
+        )
+        if has_lin_attn:
+            # Window shape comes from model_dims. For Qwen3.5-MoE / 2B / 9B /
+            # 27B these are (num_v_heads, head_k_dim, head_v_dim).
+            num_v_heads = (
+                dims.get("num_v_heads")
+                or dims.get("linear_num_v_heads")
+            )
+            head_k_dim = (
+                dims.get("head_k_dim")
+                or dims.get("linear_head_k_dim")
+            )
+            head_v_dim = (
+                dims.get("head_v_dim")
+                or dims.get("linear_head_v_dim")
+            )
+            if not (num_v_heads and head_k_dim and head_v_dim):
+                raise ValueError(
+                    "Backbone has linear-attn layers but model_dims is "
+                    "missing one of num_v_heads / head_k_dim / head_v_dim "
+                    "(or their ``linear_*`` aliases). Cannot size the "
+                    "lin_state_window."
+                )
+            if verbose:
+                import sys
+                print(
+                    f"[BufferManager] Allocating LinAttnStateWindow "
+                    f"(HV={num_v_heads} K={head_k_dim} V={head_v_dim} fp32)",
+                    flush=True, file=sys.stderr,
+                )
+            self.lin_state_window = LinAttnStateWindow.create(
+                num_v_heads=num_v_heads,
+                head_k_dim=head_k_dim,
+                head_v_dim=head_v_dim,
+                device=self.device,
+            )
+
         if verbose:
             import sys
             print(
