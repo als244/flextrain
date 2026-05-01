@@ -548,6 +548,24 @@ def _baseline_gpu_activation_memory(
     resid_workspace = chunk_size * d * sz_act
 
     bytes_used += resid_workspace + max(attn_workspace, mlp_workspace)
+
+    # Linear-attn cross-chunk state windows (Item 3c). One global
+    # ``LinAttnStateWindow`` (fwd + bwd) per engine, allocated by
+    # ``BufferManager`` iff any backbone layer has ``lin_final_state``
+    # in its schema. Reused across all linear-attn layers.
+    #
+    # Shape: ``(HV, K, V) fp32`` × 2 buffers. For Qwen3.5: 32 × 128 ×
+    # 128 × 4 × 2 = 4 MiB. Tiny but worth accounting for so the
+    # planner doesn't over-commit GPU at the margin.
+    #
+    # Heterogeneous backbones: same ``num_v_heads / head_k_dim /
+    # head_v_dim`` checks as in :class:`BufferManager`'s allocator
+    # (see ``flextrain/engine/buffers.py``).
+    if num_v_heads and head_k_dim and head_v_dim:
+        # 2 buffers × HV × K × V × fp32(4 bytes)
+        lin_state_window_bytes = 2 * num_v_heads * head_k_dim * head_v_dim * 4
+        bytes_used += lin_state_window_bytes
+
     return bytes_used
 
 
