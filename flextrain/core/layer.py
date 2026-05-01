@@ -597,6 +597,15 @@ class LayerContext:
     lin_attn_chunk_seq_infos: Any = None         # list[MultiChunkSeqInfo] | None
     lin_attn_fwd_window: torch.Tensor | None = None
     lin_attn_bwd_window: torch.Tensor | None = None
+    # During ``forward_recompute`` (called from bwd), the engine has
+    # already populated ``lin_attn_fwd_window`` with state[N-1] for
+    # chunk N's bwd. The recompute should READ the window for FLA's
+    # ``initial_state`` but MUST NOT WRITE to it — otherwise it
+    # overwrites state[N-1] with state[N] (the recomputed final
+    # state) and the bwd that follows will see the wrong initial_state.
+    # The engine sets this flag True around forward_recompute() calls
+    # in ``_backward_pass`` and False everywhere else.
+    lin_attn_recompute_only: bool = False
 
 
 # ---------------------------------------------------------------------------

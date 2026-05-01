@@ -986,9 +986,22 @@ class GatedDeltaNetBlock:
             # ``has_more_chunks=True``; there is at most one such
             # row (multi-chunk seqs are dedicated single-packed-seq
             # chunks).
+            recompute_only = (
+                ctx is not None
+                and getattr(ctx, "lin_attn_recompute_only", False)
+            )
             for i, info in enumerate(infos):
                 if info.has_more_chunks:
-                    fwd_window.copy_(final_state[i])
+                    if not recompute_only:
+                        # Forward path: write the global window so
+                        # the next chunk's fwd reads it as
+                        # ``initial_state``.
+                        fwd_window.copy_(final_state[i])
+                    # Always write the slot field on a real fwd so
+                    # bwd can read it later. Skip on recompute since
+                    # the slot already has the value from the
+                    # original fwd (or will be re-written here
+                    # idempotently — same input → same output).
                     if slot.has("lin_final_state"):
                         slot.lin_final_state.copy_(final_state[i])
                     break

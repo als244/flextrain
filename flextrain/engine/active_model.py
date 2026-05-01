@@ -1469,9 +1469,17 @@ class ActiveModel:
                         torch.cuda.nvtx.range_push(
                             f"Recompute: Chunk {chunk.id}"
                         )
+                        # Recompute MUST NOT advance the lin-state
+                        # window — the dispatcher just populated it
+                        # with state[N-1] for this chunk's bwd. If
+                        # recompute writes final_state into the
+                        # window it clobbers state[N-1] with state[N]
+                        # and the subsequent bwd reads garbage.
+                        ctx.lin_attn_recompute_only = True
                         layer.forward_recompute(
                             dev_slot, chunk.meta, weights, ctx
                         )
+                        ctx.lin_attn_recompute_only = False
                         torch.cuda.nvtx.range_pop()
                         torch.cuda.nvtx.range_push(
                             f"Backward: Chunk {chunk.id}"
