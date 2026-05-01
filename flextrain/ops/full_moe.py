@@ -573,6 +573,20 @@ def swiglu_expert_loop_bwd(
         X_temp_odd = X_temp_even
         secondary_stream_ptr = primary_stream_ptr
 
+    # LoRA scratch: per-stream (max_T_e, r) buffers for the dY_B and X_A
+    # rank-r intermediates. Untracked, tiny (~MiB), keeps the per-expert
+    # callback free of allocator/dispatcher hops.
+    if lora_per_expert_callback is not None:
+        max_rank = getattr(lora_per_expert_callback, "max_rank", 0)
+        lora_dY_B_even = torch.empty(max_exp_tokens, max_rank, dtype=bf, device=device)
+        lora_X_A_even  = torch.empty(max_exp_tokens, max_rank, dtype=bf, device=device)
+        if use_secondary:
+            lora_dY_B_odd = torch.empty(max_exp_tokens, max_rank, dtype=bf, device=device)
+            lora_X_A_odd  = torch.empty(max_exp_tokens, max_rank, dtype=bf, device=device)
+        else:
+            lora_dY_B_odd = lora_dY_B_even
+            lora_X_A_odd  = lora_X_A_even
+
     cur_offset = 0
     for eid in range(num_experts):
         n_exp_tokens = int(expert_counts_cpu[eid].item())
@@ -594,11 +608,15 @@ def swiglu_expert_loop_bwd(
             cur_stream_ptr = secondary_stream_ptr
             cur_stream = secondary_stream
             X_temp = X_temp_odd
+            lora_dY_B = lora_dY_B_odd if lora_per_expert_callback is not None else None
+            lora_X_A  = lora_X_A_odd  if lora_per_expert_callback is not None else None
         else:
             cur_dispatcher = dispatcher
             cur_stream_ptr = primary_stream_ptr
             cur_stream = primary_stream
             X_temp = X_temp_even
+            lora_dY_B = lora_dY_B_even if lora_per_expert_callback is not None else None
+            lora_X_A  = lora_X_A_even  if lora_per_expert_callback is not None else None
 
         toff = 0
         dx_act_up = X_temp[toff : toff + n_exp_tokens * expert_dim].view(
@@ -628,6 +646,8 @@ def swiglu_expert_loop_bwd(
                 if lora_per_expert_callback is not None:
                     lora_per_expert_callback(
                         "g_down", eid, fwd_act, exp_upstream,
+                        cur_dispatcher, cur_stream_ptr,
+                        lora_dY_B, lora_X_A,
                     )
             elif grads.get("g_down") is not None:
                 g_down_e = grads["g_down"][eid, :, :]
@@ -647,6 +667,8 @@ def swiglu_expert_loop_bwd(
                 if lora_per_expert_callback is not None:
                     lora_per_expert_callback(
                         "g_up", eid, exp_inp, dx_up_up,
+                        cur_dispatcher, cur_stream_ptr,
+                        lora_dY_B, lora_X_A,
                     )
             elif grads.get("g_up") is not None:
                 g_up_e = grads["g_up"][eid, :, :]

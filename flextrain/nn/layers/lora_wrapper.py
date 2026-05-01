@@ -630,11 +630,14 @@ class LoRAWrapperLayer:
         weights: Mapping[str, torch.Tensor],
         grads: MutableMapping[str, torch.Tensor],
     ):
-        """Construct a closure ``(g_name, eid, X, dY) -> None`` that
-        ``ffn_moe.bwd`` calls per-expert (or once for router) for
+        """Construct a closure
+        ``(g_name, eid, X, dY, dispatcher, stream_ptr, dY_B_buf, X_A_buf) -> None``
+        that ``ffn_moe.bwd`` calls per-expert (or once for router) for
         each LoRA-targeted projection. The closure does the rank-r
-        matmul into the LoRA A/B grad accumulators directly, so we
-        never materialize the full per-expert ``dW``.
+        matmul into the LoRA A/B grad accumulators directly via the
+        caller's cuBLASLt dispatcher, so we never materialize the full
+        per-expert ``dW`` and never trip through PyTorch's matmul
+        dispatcher (~3x cheaper per call vs. eager ``@`` + ``.add_()``).
 
         Math (per expert e, projection name with stored ``W: (E, in,
         out)``, ``A: (E, in, r)``, ``B: (E, r, out)``):
@@ -647,6 +650,14 @@ class LoRAWrapperLayer:
 
             dA = X^T @ (dY @ B^T) * scale
             dB = (X @ A)^T @ dY * scale
+
+        ``dispatcher`` / ``stream_ptr`` come from the expert-loop's
+        per-iteration choice (primary or secondary stream — different
+        cuBLASLt contexts so workspaces don't race). ``dY_B_buf`` /
+        ``X_A_buf`` are caller-owned ``(max_T_e, max_rank)`` scratch
+        tensors on the same stream; we view a ``(T_e, r)`` slice of
+        each call. The callback exposes ``.max_rank`` so the expert
+        loop knows how to size them.
         """
         # Index targets by g_* name for fast lookup inside the loop.
         cfg_by_g = {
@@ -654,34 +665,69 @@ class LoRAWrapperLayer:
             for cfg in self.targets
             if cfg.target_name in moe_targets
         }
+        # Pre-pull A/B/ga/gb tensors and per-target scale once — the
+        # callback fires hundreds of times per layer; dict lookups in
+        # the hot loop dominate at this scale.
+        per_target = {}
+        for g_name, cfg in cfg_by_g.items():
+            per_target[g_name] = (
+                weights[cfg.a_name],
+                weights[cfg.b_name],
+                grads["g_" + cfg.a_name[2:]],
+                grads["g_" + cfg.b_name[2:]],
+                cfg.rank,
+                float(cfg.scale),
+            )
 
         def _cb(g_name: str, eid: int,
-                X: torch.Tensor, dY: torch.Tensor) -> None:
-            cfg = cfg_by_g.get(g_name)
-            if cfg is None:
+                X: torch.Tensor, dY: torch.Tensor,
+                dispatcher=None, stream_ptr: int = 0,
+                dY_B_buf: torch.Tensor | None = None,
+                X_A_buf: torch.Tensor | None = None) -> None:
+            tup = per_target.get(g_name)
+            if tup is None:
                 return
-            A_full = weights[cfg.a_name]
-            B_full = weights[cfg.b_name]
-            ga_full = grads["g_" + cfg.a_name[2:]]
-            gb_full = grads["g_" + cfg.b_name[2:]]
-            scale = cfg.scale
+            A_full, B_full, ga_full, gb_full, r, scale = tup
             if eid >= 0:
-                # 3-D MoE per-expert: pick the e-th slice.
                 A = A_full[eid]                             # (in, r)
                 B = B_full[eid]                             # (r, out)
                 ga = ga_full[eid]                           # (in, r)
                 gb = gb_full[eid]                           # (r, out)
             else:
-                # 2-D router: full tensors.
                 A, B, ga, gb = A_full, B_full, ga_full, gb_full
-            # Rank-r matmuls -- never materialize dW = X^T @ dY.
-            dY_B = dY @ B.transpose(-1, -2)                 # (T_e, r)
-            dA = (X.transpose(-1, -2) @ dY_B) * scale       # (in, r)
-            X_A = X @ A                                     # (T_e, r)
-            dB = (X_A.transpose(-1, -2) @ dY) * scale       # (r, out)
-            ga.add_(dA.to(ga.dtype))
-            gb.add_(dB.to(gb.dtype))
 
+            if dispatcher is None:
+                # Slow path (router callback, called once per layer):
+                # plain PyTorch @ + .add_(). Simpler; not on hot path.
+                dY_B = dY @ B.transpose(-1, -2)
+                dA = (X.transpose(-1, -2) @ dY_B) * scale
+                X_A = X @ A
+                dB = (X_A.transpose(-1, -2) @ dY) * scale
+                ga.add_(dA.to(ga.dtype))
+                gb.add_(dB.to(gb.dtype))
+                return
+
+            T_e = X.shape[0]
+            dY_B = dY_B_buf[:T_e, :r]                       # (T_e, r)
+            X_A  = X_A_buf[:T_e, :r]                        # (T_e, r)
+            # 1) dY_B = dY @ B^T          (T_e, out) x (out, r) -> (T_e, r)
+            dispatcher.matmul(stream_ptr, A=dY, B=B.T, D=dY_B)
+            # 2) X_A  = X @ A             (T_e, in)  x (in, r)  -> (T_e, r)
+            dispatcher.matmul(stream_ptr, A=X,  B=A,   D=X_A)
+            # 3) ga += scale * X^T @ dY_B   (in, T_e) x (T_e, r) -> (in, r)
+            dispatcher.matmul(
+                stream_ptr, A=X.T, B=dY_B,
+                C=ga, D=ga, alpha=scale, beta=1.0,
+            )
+            # 4) gb += scale * X_A^T @ dY   (r, T_e) x (T_e, out) -> (r, out)
+            dispatcher.matmul(
+                stream_ptr, A=X_A.T, B=dY,
+                C=gb, D=gb, alpha=scale, beta=1.0,
+            )
+
+        # Expose max_rank so the expert loop can pre-allocate (T, r)
+        # scratch buffers per stream.
+        _cb.max_rank = max(t[4] for t in per_target.values())
         return _cb
 
     def backward_wgrad(
