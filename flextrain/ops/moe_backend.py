@@ -488,11 +488,7 @@ class ScatterMoEExpertCompute:
         unified ``flextrain_moe_router_gate_bwd`` so both backends
         produce dprobs in scattered layout for the router-gate-bwd.
 
-    Limitations (Stage 2):
-      * ``supported_tiers = {3}`` only — scattermoe's bwd uses kernel
-        primitives that don't naturally support a "drop x_up, recompute
-        in bwd" pathway. If you need lower tiers, use the flextrain
-        backend or extend ``fwd_recompute`` later.
+    Limitations:
       * No LoRA support: scattermoe doesn't expose a per-expert wgrad
         hook, so ``skip_grads`` and ``lora_per_expert_callback`` are
         rejected. Use the flextrain backend for LoRA.
@@ -507,7 +503,7 @@ class ScatterMoEExpertCompute:
 
     @property
     def supported_tiers(self) -> frozenset[int]:
-        return frozenset({3})
+        return frozenset({0, 1, 2, 3})
 
     # ------------------------------------------------------------------
     # Schema
@@ -602,15 +598,15 @@ class ScatterMoEExpertCompute:
         TK = T * K
 
         # 1. Sort + count. flatten_sort_count is a torch.compile'd
-        # routine that returns three tensors. We re-allocate (the
-        # @torch.compile cache holds, but the result tensors are fresh
-        # each call) and copy into our pre-allocated slot fields so
-        # bwd has stable per-(layer, chunk) views.
+        # routine that returns three tensors sized to the actual
+        # chunk's TK. Slot fields are allocated for max-TK (max
+        # num_tokens * top_k), so we copy into the [:TK] prefix and
+        # downstream code slices accordingly. Same pattern as sonic.
         sorted_expert_idxs, sorted_scattered_idxs, expert_offsets = (
             flatten_sort_count(chosen_experts, num_experts=num_experts)
         )
-        slot.scattermoe_sorted_expert_idxs.copy_(sorted_expert_idxs)
-        slot.scattermoe_sorted_scattered_idxs.copy_(sorted_scattered_idxs)
+        slot.scattermoe_sorted_expert_idxs[:TK].copy_(sorted_expert_idxs)
+        slot.scattermoe_sorted_scattered_idxs[:TK].copy_(sorted_scattered_idxs)
         slot.scattermoe_expert_offsets.copy_(expert_offsets)
 
         # 2. Build flextrain-shaped index_mapping for the
@@ -621,31 +617,34 @@ class ScatterMoEExpertCompute:
         # We compute it on GPU via scatter: for each i in [0..TK),
         # index_mapping.flatten()[sorted_scattered_idxs[i]] = i.
         # PyTorch supports this via index_copy_ on a flattened view.
-        index_mapping_flat = slot.index_mapping.view(-1)
+        # Slice both the index_mapping target view and the source idxs
+        # to the actual TK (max-TK allocation, actual chunk smaller).
+        index_mapping_flat = slot.index_mapping.view(-1)[:TK]
         # Note: sorted_scattered_idxs is int32; index_copy_ wants int64.
         # The conversion here is ~µs.
         index_mapping_flat.index_copy_(
             0,
-            slot.scattermoe_sorted_scattered_idxs.long(),
+            slot.scattermoe_sorted_scattered_idxs[:TK].long(),
             torch.arange(TK, device=x.device, dtype=torch.int32),
         )
 
         # 3. Up-projection: scatter2scatter into pre-act.
         # x: (T, d), w_up: (E, 2F, d) → permute to (E, d, 2F) view.
-        # Output: (TK, 2F) into slot.x_up.
+        # Output: (TK, 2F) into slot.x_up. Slot fields and slot.x_up
+        # are allocated for max-TK; slice all to actual chunk TK.
         scm_kernels.ops.scatter2scatter(
             X=x, W=weights["w_up"].permute(0, 2, 1),
-            sorted_expert_idxs=slot.scattermoe_sorted_expert_idxs,
-            sorted_scattered_idxs=slot.scattermoe_sorted_scattered_idxs,
+            sorted_expert_idxs=slot.scattermoe_sorted_expert_idxs[:TK],
+            sorted_scattered_idxs=slot.scattermoe_sorted_scattered_idxs[:TK],
             k=K, x_grouped=False, y_grouped=True,
-            out=slot.x_up,
+            out=slot.x_up[:TK],
         )
 
         # 4. Activation: silu(gate) * value. slot.x_up packs as
         # [value || gate] (flextrain convention; first half value,
-        # second half gate).
+        # second half gate). Slice to actual TK.
         post_act = scratch_fn((TK, F), x.dtype)
-        value, gate = slot.x_up.chunk(2, dim=-1)
+        value, gate = slot.x_up[:TK].chunk(2, dim=-1)
         post_act.copy_(torch.nn.functional.silu(gate) * value)
 
         # 5. Down-projection with gate-weighting.
@@ -659,8 +658,8 @@ class ScatterMoEExpertCompute:
         # (K=F = post_act.size(-1), N=d = output's last dim).
         scm_kernels.ops.scatter2scatter(
             X=post_act, W=weights["w_down"].permute(0, 2, 1),
-            sorted_expert_idxs=slot.scattermoe_sorted_expert_idxs,
-            sorted_scattered_idxs=slot.scattermoe_sorted_scattered_idxs,
+            sorted_expert_idxs=slot.scattermoe_sorted_expert_idxs[:TK],
+            sorted_scattered_idxs=slot.scattermoe_sorted_scattered_idxs[:TK],
             k=1, x_grouped=True, y_grouped=False,
             out=out_expanded,
         )
@@ -676,26 +675,14 @@ class ScatterMoEExpertCompute:
             out=out.view(T, 1, d_model),
         )
 
-        # Save scattermoe's `out_expanded` (post-down, pre-gate) for
-        # bwd (needed to compute d_gates). Stash on slot.aux for the
-        # subsequent bwd of THIS chunk; survives because the engine
-        # treats slot.aux as per-(layer, chunk) within fwd→bwd.
-        # CAVEAT: for offloaded slots, slot.aux is rebuilt at
-        # fetch-back time. Since scattermoe backend's supported_tiers
-        # = {3} only, the engine never offloads a scattermoe layer's
-        # slot — supported_tiers caps the schema's max_tier, the DP
-        # planner only picks tier 3 (= save x_up locally on host) for
-        # this layer's fields, and bwd-time fetch only re-creates the
-        # slot at level 3 with x_up fetched. The extra "out_expanded"
-        # scratch needs another save path. For Stage 2 simplicity:
-        # save it in chunk_extra under a backend-namespaced key so it
-        # survives any slot rebuild.
-        chunk_extra.setdefault(
-            "scattermoe.moe.out_expanded", {}
-        )[layer_id] = out_expanded
-        chunk_extra.setdefault(
-            "scattermoe.moe.post_act", {}
-        )[layer_id] = post_act
+        # NOTE: ``out_expanded`` (post-down, pre-gate) and ``post_act``
+        # (post-SwiGLU activation) are NOT saved here. Both are
+        # recomputed in ``bwd`` from ``slot.x_up`` (saved at tier ≥3 or
+        # repopulated by ``fwd_recompute`` at lower tiers) plus a fresh
+        # down-projection scatter2scatter call. This keeps memory
+        # pressure bounded — chunk_extra only carried these as a
+        # stop-gap pre-stage-1 and bloated GPU memory by ~10GB / 40
+        # layers for 35B-A3B.
 
     def fwd_recompute(
         self,
@@ -709,10 +696,31 @@ class ScatterMoEExpertCompute:
         secondary_stream: torch.cuda.Stream | None,
         scratch_fn: Callable[[tuple[int, ...], torch.dtype], torch.Tensor],
     ) -> Any:
-        raise NotImplementedError(
-            "ScatterMoEExpertCompute supports only tier 3 (everything saved); "
-            "fwd_recompute should never be called. supported_tiers={3}."
+        """Re-run the up-projection scatter2scatter to repopulate
+        ``slot.x_up`` when the layer's save tier was < 3. Skips the
+        down-projection / activation / combine — bwd recomputes those
+        from slot.x_up.
+
+        All routing metadata (``scattermoe_*``, ``index_mapping``) is
+        tier 0 and already populated from fwd; we only re-run the
+        up-projection. Returns ``None`` (no handoff needed; bwd reads
+        slot fields the same way it does after a tier-3 fwd).
+        """
+        from scattermoe import kernels as scm_kernels
+
+        # Option-B layout: w_up (E, 2F, d), w_down (E, d, F).
+        T = x.shape[0]
+        K = slot.index_mapping.shape[1]
+        TK = T * K
+
+        scm_kernels.ops.scatter2scatter(
+            X=x, W=weights["w_up"].permute(0, 2, 1),
+            sorted_expert_idxs=slot.scattermoe_sorted_expert_idxs[:TK],
+            sorted_scattered_idxs=slot.scattermoe_sorted_scattered_idxs[:TK],
+            k=K, x_grouped=False, y_grouped=True,
+            out=slot.x_up[:TK],
         )
+        return None
 
     def bwd(
         self,
@@ -753,14 +761,35 @@ class ScatterMoEExpertCompute:
         K = slot.index_mapping.shape[1]
         TK = T * K
 
-        # Pull saved fwd state.
-        out_expanded = chunk_extra["scattermoe.moe.out_expanded"].pop(layer_id)
-        post_act = chunk_extra["scattermoe.moe.post_act"].pop(layer_id)
-        sorted_expert_idxs = slot.scattermoe_sorted_expert_idxs
-        sorted_scattered_idxs = slot.scattermoe_sorted_scattered_idxs
+        # Pull saved fwd state. Slot fields are allocated for max-TK;
+        # slice to actual chunk TK to match what the kernels iterate over.
+        sorted_expert_idxs = slot.scattermoe_sorted_expert_idxs[:TK]
+        sorted_scattered_idxs = slot.scattermoe_sorted_scattered_idxs[:TK]
         expert_offsets = slot.scattermoe_expert_offsets
         # Recover router_weights from the shared slot field.
-        router_weights = slot.router_weights  # (T, K) bf16
+        router_weights = slot.router_weights[:T]  # (T, K) bf16; slice off max-T padding
+
+        # Recompute ``post_act`` from saved ``slot.x_up`` (free — just a
+        # SwiGLU on the saved pre-act). Avoids stashing it in chunk_extra
+        # at fwd time (the v1 approach bloated GPU mem by ~|TK*F| bytes
+        # per layer for the entire fwd-bwd window).
+        value, gate = slot.x_up[:TK].chunk(2, dim=-1)
+        post_act = scratch_fn((TK, F), dy.dtype)
+        post_act.copy_(torch.nn.functional.silu(gate) * value)
+
+        # Recompute ``out_expanded`` (down-projection result) by re-
+        # running the down-projection scatter2scatter. One extra GEMM
+        # in bwd (vs none-recompute), but saves |TK*d| bytes per layer
+        # of held GPU memory across the fwd-bwd window. At 35B-A3B,
+        # 40 layers, TK=512K, d=2048, that's ~20GB saved.
+        out_expanded = scratch_fn((TK, d_model), dy.dtype)
+        scm_kernels.ops.scatter2scatter(
+            X=post_act, W=weights["w_down"].permute(0, 2, 1),
+            sorted_expert_idxs=sorted_expert_idxs,
+            sorted_scattered_idxs=sorted_scattered_idxs,
+            k=1, x_grouped=True, y_grouped=False,
+            out=out_expanded,
+        )
 
         # 1. d_gates: dy ⋅ out_expanded (token-major). Mirrors scattermoe
         # ParallelLinear.backward line 79.
@@ -809,8 +838,8 @@ class ScatterMoEExpertCompute:
 
         # 5. Activation bwd: post_act = silu(gate) * value. Need
         # d_pre_act = (d_post_act * d/d(silu*value)/d(pre_act)).
-        # value, gate = slot.x_up.chunk(2, dim=-1) (still valid).
-        value, gate = slot.x_up.chunk(2, dim=-1)
+        # slot.x_up is allocated for max-TK; slice to actual TK.
+        value, gate = slot.x_up[:TK].chunk(2, dim=-1)
         # silu_grad: derivative of silu. silu(x) = x * sigmoid(x).
         # d_silu/dx = sigmoid(x) + x * sigmoid(x) * (1 - sigmoid(x))
         sig_gate = torch.sigmoid(gate.float())
@@ -864,10 +893,11 @@ class ScatterMoEExpertCompute:
 
         # 8. dprobs: scatter d_gates (T, K) into (TK, 1) via slot.index_mapping.
         # The unified router-gate-bwd consumes scattered layout.
+        # Slice index_mapping to actual T (max-T allocation).
         from flextrain.ops import flextrain_moe_scatter_routing_weights
         dprobs_flat = scratch_fn((TK,), dy.dtype)
         flextrain_moe_scatter_routing_weights(
-            d_gates.contiguous(), slot.index_mapping, out=dprobs_flat,
+            d_gates.contiguous(), slot.index_mapping[:T], out=dprobs_flat,
         )
         # Router-gate-bwd expects (TK, 1).
         slot.aux["moe_dprobs"] = dprobs_flat.unsqueeze(-1)
@@ -909,8 +939,6 @@ class SonicMoEExpertCompute:
     deviation from sonic's convention required.
 
     Limitations:
-      * supported_tiers = {3} only — bwd uses CUTLASS DSL kernels that
-        don't support a "drop x_up, recompute in bwd" path.
       * No LoRA — no per-expert wgrad hook in sonic.
       * No inline residual add in gather (caller adds it).
       * Hopper (sm_90+) only — sonic's CUTLASS DSL targets sm_90.
@@ -961,7 +989,11 @@ class SonicMoEExpertCompute:
 
     @property
     def supported_tiers(self) -> frozenset[int]:
-        return frozenset({3})
+        # Tier 3 saves slot.x_up locally; tiers 0/1/2 drop x_up and
+        # rely on ``fwd_recompute`` to repopulate it via the up-proj
+        # gemm_gated. Routing metadata (sonic_*, index_mapping) is
+        # tier 0 in the schema and survives all tier choices.
+        return frozenset({0, 1, 2, 3})
 
     # ------------------------------------------------------------------
     # Schema
