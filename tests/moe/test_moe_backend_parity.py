@@ -67,31 +67,32 @@ def naive_moe_fwd_bwd(
     E = w_up.shape[0]
     F = w_down.shape[1]
 
-    # Compute pre-act per (t, k):  pre[t, k, :]  shape (T, K, 2F)
-    # via gathering w_up by expert id then bmm with x repeated.
-    # Simple & correct: use a Python loop over k. T*K iterations,
-    # cheap for the small shapes we test with.
-    pre_per_k = []
-    for k in range(K):
-        e = expert_idxs[:, k].long()                   # (T,)
-        w = w_up[e]                                    # (T, d, 2F)
-        pre_k = torch.bmm(x.unsqueeze(1), w).squeeze(1)  # (T, 2F)
-        pre_per_k.append(pre_k)
-    pre = torch.stack(pre_per_k, dim=1)                # (T, K, 2F)
-
-    value, gate = pre.chunk(2, dim=-1)                 # (T, K, F) each
-    h = F_torch.silu(gate) * value                     # (T, K, F)
-
-    y_per_k = []
-    for k in range(K):
-        e = expert_idxs[:, k].long()
-        w = w_down[e]                                   # (T, F, d)
-        y_k = torch.bmm(h[:, k, :].unsqueeze(1), w).squeeze(1)  # (T, d)
-        y_per_k.append(y_k)
-    y = torch.stack(y_per_k, dim=1)                    # (T, K, d)
-
-    # Weighted sum over k
-    out = (expert_p.unsqueeze(-1) * y).sum(dim=1)      # (T, d)
+    # Per-expert reference: build out[t] = sum over (t, k) of
+    # expert_p[t, k] * (silu(gate) * value), where (gate, value) are
+    # halves of x[t] @ w_up[expert_idxs[t, k]] then projected through
+    # w_down[expert_idxs[t, k]].
+    #
+    # Naive per-token gather (w_up[expert_idxs[:, k]]) replicates
+    # w_up T times — at e2e dims that's 100s of GB. Instead loop over
+    # experts and accumulate contributions from tokens routed to that
+    # expert. Memory stays O(T * 2F) instead of O(T * d * 2F).
+    out = torch.zeros(T, d, device=x.device, dtype=x.dtype)
+    for e in range(E):
+        # Find every (token, k-slot) routed to this expert.
+        mask = expert_idxs == e            # (T, K) bool
+        if not mask.any():
+            continue
+        token_idx, k_idx = mask.nonzero(as_tuple=True)  # (n,), (n,)
+        n = token_idx.numel()
+        # Each (token_idx[i], k_idx[i]) contributes p * silu(g) * v * w_down
+        x_e = x[token_idx]                    # (n, d)
+        p_e = expert_p[token_idx, k_idx]      # (n,)
+        pre_e = x_e @ w_up[e]                 # (n, 2F)
+        value_e, gate_e = pre_e.chunk(2, dim=-1)  # (n, F) each
+        h_e = F_torch.silu(gate_e) * value_e  # (n, F)
+        y_e = h_e @ w_down[e]                 # (n, d)
+        contrib = p_e.unsqueeze(-1) * y_e     # (n, d)
+        out.index_add_(0, token_idx, contrib)
 
     # Backward via autograd
     grads = torch.autograd.grad(
@@ -246,12 +247,25 @@ def run_backend(backend, x, expert_p, expert_idxs, weights, dy, T, K, E, F, d_mo
 
 
 def main():
-    torch.manual_seed(0)
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("-T", type=int, default=128, help="num tokens")
+    ap.add_argument("-K", type=int, default=2, help="top-k")
+    ap.add_argument("-E", type=int, default=8, help="num experts")
+    ap.add_argument("-F", type=int, default=64, help="expert intermediate dim")
+    ap.add_argument("--d-model", type=int, default=128)
+    ap.add_argument("--cos-tol", type=float, default=0.999)
+    ap.add_argument("--seed", type=int, default=0)
+    args = ap.parse_args()
+
+    T, K, E, F, d_model = args.T, args.K, args.E, args.F, args.d_model
+    torch.manual_seed(args.seed)
     torch.cuda.set_device(0)
     device = torch.device("cuda:0")
     dtype = torch.bfloat16
 
-    T, K, E, F, d_model = 128, 2, 8, 64, 128
+    print(f"=== test_moe_backend_parity: T={T} K={K} E={E} F={F} d={d_model} "
+          f"cos_tol={args.cos_tol} seed={args.seed} ===")
 
     x = torch.randn(T, d_model, device=device, dtype=dtype)
     logits = torch.randn(T, E, device=device, dtype=torch.float32)
