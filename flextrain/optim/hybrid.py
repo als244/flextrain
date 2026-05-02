@@ -64,7 +64,7 @@ def infer_optimizer_for_param(spec: TensorSpec, dims: Mapping[str, int]) -> str:
 
     1. Explicit ``spec.optimizer`` setting always wins.
     2. 2-D tensors that look like dense projections → ``"muon"``.
-    3. 3-D MoE expert stacks (``(E, d, 2F)`` / ``(E, F, d)``) →
+    3. 3-D MoE expert stacks (``(E, 2F, d)`` / ``(E, d, F)``) →
        ``"muon"``. The step() loop applies Newton-Schulz per expert
        slice (each slice is a 2-D matrix).
     4. Everything else → ``"adamw"`` (1-D biases/norms, embeddings,

@@ -294,9 +294,9 @@ class FlextrainMoEExpertCompute:
             combine_gather,
         )
 
-        # w_up: (E, d, 2F), w_down: (E, F, d). Pull dims from weights.
+        # w_up: (E, 2F, d), w_down: (E, d, F). Pull dims from weights.
         num_experts = weights["w_up"].shape[0]
-        expert_dim = weights["w_down"].shape[1]
+        expert_dim = weights["w_down"].shape[2]
         num_tokens, d_model = x.shape
         TK = num_tokens * router_weights.shape[1]
 
@@ -412,7 +412,8 @@ class FlextrainMoEExpertCompute:
         top_k = slot.index_mapping.shape[1]
         TK = num_tokens * top_k
         num_experts = weights["w_up"].shape[0]
-        expert_dim = weights["w_down"].shape[1]
+        # w_down: (E, d, F). expert_dim (F) is now the last axis.
+        expert_dim = weights["w_down"].shape[2]
         expert_counts_cpu = self._host_counts(chunk_extra, layer_id, num_experts)
 
         # 1. Scatter dy.

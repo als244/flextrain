@@ -393,8 +393,8 @@ def routed_swiglu_moe_recompute_x_up(
 def swiglu_expert_loop_fwd(
     scattered_x: torch.Tensor,         # (TK, d_model) bf16; scatter input → expert output, in-place
     x_preact_buf: torch.Tensor,        # (TK, 2 * F) bf16; per-slot pre-SwiGLU (saved for bwd)
-    w_up: torch.Tensor,                # (E, d_model, 2 * F) bf16
-    w_down: torch.Tensor,              # (E, F, d_model) bf16
+    w_up: torch.Tensor,                # (E, 2 * F, d_model) bf16
+    w_down: torch.Tensor,              # (E, d_model, F) bf16
     expert_counts_cpu: torch.Tensor,   # (E,) int (host, pinned) — count per expert
     *,
     primary_stream: torch.cuda.Stream,
@@ -404,10 +404,11 @@ def swiglu_expert_loop_fwd(
 ) -> None:
     """SwiGLU expert-compute fwd loop.
 
-    For each expert ``e`` with ``T_e = expert_counts_cpu[e]`` slots:
-      1. ``x_preact[start:end] = scattered_x[start:end] @ w_up[e]``
+    For each expert ``e`` with ``T_e = expert_counts_cpu[e]`` slots
+    (option-B layout: ``w_up[e]: (2F, d)``, ``w_down[e]: (d, F)``):
+      1. ``x_preact[start:end] = scattered_x[start:end] @ w_up[e].T``
       2. ``x_act = SwiGLU(x_preact[start:end])`` (Triton fused, no fp32 promote)
-      3. ``scattered_x[start:end] = x_act @ w_down[e]`` (overwrites input)
+      3. ``scattered_x[start:end] = x_act @ w_down[e].T`` (overwrites input)
 
     When ``secondary_stream`` is not None, alternate odd/even experts
     across the two streams to overlap their cuBLAS matmuls. The two
@@ -435,8 +436,8 @@ def swiglu_expert_loop_fwd(
 
         x_inp = scattered_x[start:end, :]
         x_preact = x_preact_buf[start:end, :]
-        w_up_e = w_up[eid, :, :]
-        w_down_e = w_down[eid, :, :]
+        w_up_e = w_up[eid, :, :]            # (2F, d)
+        w_down_e = w_down[eid, :, :]        # (d, F)
 
         if use_secondary and (eid % 2 == 1):
             cur_dispatcher = dispatcher_secondary
@@ -450,12 +451,15 @@ def swiglu_expert_loop_fwd(
             x_act = x_act_even[:n_exp_tokens, :]
 
         with torch.cuda.stream(cur_stream):
+            # (T_e, d) @ (d, 2F) → (T_e, 2F). w_up_e.T is a free view;
+            # cuBLASLt sees the strides and sets the transpose flag.
             cur_dispatcher.matmul(
-                cur_stream_ptr, A=x_inp, B=w_up_e, D=x_preact,
+                cur_stream_ptr, A=x_inp, B=w_up_e.T, D=x_preact,
             )
             flextrain_swiglu_moe_fwd(x_preact, out=x_act)
+            # (T_e, F) @ (F, d) → (T_e, d).
             cur_dispatcher.matmul(
-                cur_stream_ptr, A=x_act, B=w_down_e, D=x_inp,
+                cur_stream_ptr, A=x_act, B=w_down_e.T, D=x_inp,
             )
 
     if use_secondary:
@@ -468,8 +472,8 @@ def swiglu_expert_loop_bwd(
     x_preact_buf: torch.Tensor,          # (TK, 2F) bf16; saved fwd pre-SwiGLU
     srw: torch.Tensor,                   # (TK, 1) bf16; saved scattered router weights
     dprobs: torch.Tensor,                # (TK, 1) bf16; OUTPUT: per-slot d_router_weight
-    w_up: torch.Tensor,                  # (E, d_model, 2F) bf16
-    w_down: torch.Tensor,                # (E, F, d_model) bf16
+    w_up: torch.Tensor,                  # (E, 2F, d_model) bf16
+    w_down: torch.Tensor,                # (E, d_model, F) bf16
     grads: MutableMapping[str, torch.Tensor],  # accumulator dict
     expert_counts_cpu: torch.Tensor,     # (E,) int host — count per expert
     *,
@@ -481,17 +485,28 @@ def swiglu_expert_loop_bwd(
 ) -> None:
     """SwiGLU expert-compute bwd loop.
 
+    Option-B weight layout: ``w_up[e]: (2F, d)``, ``w_down[e]: (d, F)``.
+    Grad accumulators inherit the same orientation:
+    ``g_up[e]: (2F, d)``, ``g_down[e]: (d, F)``.
+
     Steps per expert ``e`` (``T_e = expert_counts_cpu[e]``):
-      a) ``dx_act_up = scattered_upstream[start:end] @ w_down[e].T``
+      a) ``dx_act_up = scattered_upstream[start:end] @ w_down[e]``
+         (no .T — w_down[e] is already (d, F)).
       b) ``dx_up_up, dprobs[start:end] = swiglu_moe_bwd(...)`` — Triton
          fused; rescales by saved ``srw[start:end]`` and computes
          per-slot d_router_weight (dot product with recomputed
          post-SwiGLU activation).
-      c) Optionally accumulate ``g_down[e] += fwd_act.T @ scattered_upstream[start:end]``
-         (cuBLAS addmm). Skipped when ``"g_down" in skip_grads`` —
-         the LoRA wrapper handles the rank-r path via callback.
-      d) Overwrite ``scattered_upstream[start:end] = dx_up_up @ w_up[e].T``.
-      e) Optionally accumulate ``g_up[e] += scattered_x[start:end].T @ dx_up_up``.
+      c) Optionally accumulate
+         ``g_down[e] += scattered_upstream[start:end].T @ fwd_act``
+         (shape (d, T_e) @ (T_e, F) = (d, F)). Skipped when
+         ``"g_down" in skip_grads`` — the LoRA wrapper handles the
+         rank-r path via callback.
+      d) Overwrite ``scattered_upstream[start:end] = dx_up_up @ w_up[e]``
+         (no .T — w_up[e] is already (2F, d), and the dgrad is
+         (T_e, 2F) @ (2F, d) = (T_e, d)).
+      e) Optionally accumulate
+         ``g_up[e] += dx_up_up.T @ scattered_x[start:end]``
+         (shape (2F, T_e) @ (T_e, d) = (2F, d)).
 
     Steps a/d are dgrads (always run). Steps c/e are wgrads and may be
     skipped via ``skip_grads``; in that case ``lora_per_expert_callback``
@@ -580,18 +595,23 @@ def swiglu_expert_loop_bwd(
         )
 
         with torch.cuda.stream(cur_stream):
-            # a) dx_act_up = exp_upstream @ w_down.T
+            # a) dx_act_up = exp_upstream @ w_down[e]
+            #    (T_e, d) @ (d, F) → (T_e, F). w_down[e] is (d, F), no .T.
             cur_dispatcher.matmul_fast(
-                cur_stream_ptr, A=exp_upstream, B=w_down_e.T, D=dx_act_up,
+                cur_stream_ptr, A=exp_upstream, B=w_down_e, D=dx_act_up,
             )
             # b) SwiGLU bwd: rescale + d_router_weight + recomputed fwd_act
             dx_up_up, exp_dprobs = flextrain_swiglu_moe_bwd(
                 dx_act_up, x_preact, exp_probs,
                 dx=dx_up_up, dw=exp_dprobs, fwd_act=fwd_act,
             )
-            # c) g_down[e] += fwd_act.T @ exp_upstream  (or LoRA callback)
+            # c) g_down[e] += exp_upstream.T @ fwd_act  (or LoRA callback)
+            #    (d, T_e) @ (T_e, F) → (d, F). g_down[e] is (d, F).
             if "g_down" in skip_grads:
                 if lora_per_expert_callback is not None:
+                    # Callback X/dY contract is layout-independent: X is the
+                    # forward input to the projection (fwd_act), dY is the
+                    # upstream grad at its output (exp_upstream).
                     lora_per_expert_callback(
                         "g_down", eid, fwd_act, exp_upstream,
                         cur_dispatcher, cur_stream_ptr,
@@ -601,18 +621,22 @@ def swiglu_expert_loop_bwd(
                 g_down_e = grads["g_down"][eid, :, :]
                 cur_dispatcher.matmul_fast(
                     cur_stream_ptr,
-                    A=fwd_act.T, B=exp_upstream,
+                    A=exp_upstream.T, B=fwd_act,
                     C=g_down_e, D=g_down_e,
                     beta=1.0, alpha=1.0,
                 )
-            # d) dx_pre = dx_up_up @ w_up.T (overwrites exp_upstream)
+            # d) dx_pre = dx_up_up @ w_up[e] (overwrites exp_upstream)
+            #    (T_e, 2F) @ (2F, d) → (T_e, d). w_up[e] is (2F, d), no .T.
             cur_dispatcher.matmul_fast(
-                cur_stream_ptr, A=dx_up_up, B=w_up_e.T, D=exp_upstream,
+                cur_stream_ptr, A=dx_up_up, B=w_up_e, D=exp_upstream,
             )
-            # e) g_up[e] += scattered_x[start:end].T @ dx_up_up  (or LoRA callback)
+            # e) g_up[e] += dx_up_up.T @ scattered_x[start:end] (or LoRA callback)
+            #    (2F, T_e) @ (T_e, d) → (2F, d). g_up[e] is (2F, d).
             exp_inp = scattered_x[start:end, :]
             if "g_up" in skip_grads:
                 if lora_per_expert_callback is not None:
+                    # Callback X/dY contract: X = exp_inp (fwd input to up),
+                    # dY = dx_up_up (upstream grad at the (2F) output).
                     lora_per_expert_callback(
                         "g_up", eid, exp_inp, dx_up_up,
                         cur_dispatcher, cur_stream_ptr,
@@ -622,7 +646,7 @@ def swiglu_expert_loop_bwd(
                 g_up_e = grads["g_up"][eid, :, :]
                 cur_dispatcher.matmul_fast(
                     cur_stream_ptr,
-                    A=exp_inp.T, B=dx_up_up,
+                    A=dx_up_up.T, B=exp_inp,
                     C=g_up_e, D=g_up_e,
                     beta=1.0, alpha=1.0,
                 )
@@ -634,7 +658,7 @@ def swiglu_expert_loop_bwd(
 def swiglu_expert_loop_recompute_x_up(
     scattered_x: torch.Tensor,         # (TK, d_model) bf16; saved fwd input
     x_preact_buf: torch.Tensor,        # (TK, 2F) bf16; OUTPUT: per-slot pre-SwiGLU refilled
-    w_up: torch.Tensor,                # (E, d_model, 2F)
+    w_up: torch.Tensor,                # (E, 2F, d_model) bf16
     expert_counts_cpu: torch.Tensor,   # (E,) int host
     *,
     primary_stream: torch.cuda.Stream,
@@ -667,7 +691,7 @@ def swiglu_expert_loop_recompute_x_up(
         end = cur_offset + n_exp_tokens
         cur_offset = end
         x_inp = scattered_x[start:end, :]
-        w_up_e = w_up[eid, :, :]
+        w_up_e = w_up[eid, :, :]            # (2F, d) — option-B layout
         x_preact = x_preact_buf[start:end, :]
         if use_secondary and (eid % 2 == 1):
             cur_dispatcher = dispatcher_secondary
@@ -675,8 +699,9 @@ def swiglu_expert_loop_recompute_x_up(
         else:
             cur_dispatcher = dispatcher
             cur_stream_ptr = primary_stream_ptr
+        # (T_e, d) @ (d, 2F) → (T_e, 2F). w_up_e.T is a free view.
         cur_dispatcher.matmul(
-            cur_stream_ptr, A=x_inp, B=w_up_e, D=x_preact,
+            cur_stream_ptr, A=x_inp, B=w_up_e.T, D=x_preact,
         )
 
     if use_secondary:
