@@ -65,7 +65,37 @@ part of the schema.
 # with ``storage_offset() must be divisible by 4`` once a prior slot
 # ends with a bf16/int16 field at an odd ``num_tokens``. fp32 is the
 # largest field dtype in any current schema, so 4 bytes is sufficient.
-_SLOT_ALIGN_BYTES = 4
+# Per-slot alignment: end-of-slot is rounded to this so the next slot's
+# first field starts cleanly. 256 covers (a) TMA on Hopper (128B), (b)
+# 16-byte vectorized loads in Hopper-class kernels (quack, fbgemm),
+# and (c) L1/L2 cache-line alignment. Cheap — wastes at most 255 bytes
+# per slot.
+_SLOT_ALIGN_BYTES = 256
+
+# Per-field alignment: each field's storage_offset (within the slot's
+# uint8 buffer) is rounded up to this. Same reasoning as _SLOT_ALIGN_BYTES;
+# Hopper kernels (e.g. quack's gemm_gated) reject misaligned tensor data
+# with `Misaligned Tensor data ... expected data alignment=16 bytes`.
+# Wastes at most (FIELD_ALIGN - 1) bytes per field; a slot with ~10
+# fields wastes ~2.5KB which is negligible vs typical slot size (MB).
+_FIELD_ALIGN_BYTES = 256
+
+
+def _padded_layout_bytes(
+    fields,
+    num_tokens: int,
+    dims: Mapping[str, int],
+) -> int:
+    """Return the slot's actual byte size after per-field + end-of-slot
+    padding. Mirrors the layout in :meth:`ActivationSlot.from_buffer`
+    so size calculations match what's actually consumed."""
+    offset = 0
+    for f in fields:
+        align = max(_FIELD_ALIGN_BYTES, f.dtype.itemsize)
+        if offset % align != 0:
+            offset = _round_up(offset, align)
+        offset += f.byte_size(num_tokens, dims)
+    return _round_up(offset, _SLOT_ALIGN_BYTES)
 
 
 def _round_up(n: int, align: int) -> int:
@@ -207,11 +237,9 @@ class ActivationSchema:
         ``buffer.view(torch.float32)`` blows up at line 334's
         ``view().reshape()``.
         """
-        raw = sum(
-            f.byte_size(num_tokens, dims)
-            for f in self.persistent_fields_at_level(level)
+        return _padded_layout_bytes(
+            self.persistent_fields_at_level(level), num_tokens, dims,
         )
-        return _round_up(raw, _SLOT_ALIGN_BYTES)
 
     def device_size_bytes(self, num_tokens: int, dims: Mapping[str, int]) -> int:
         """Bytes this layer/chunk needs in the GPU activation slot. ALL fields
@@ -223,8 +251,7 @@ class ActivationSchema:
         back-to-back at ``i * max_act_slot_bytes``, so if the per-slot
         size isn't dtype-aligned, slot 1 onward gets misaligned views.
         """
-        raw = sum(f.byte_size(num_tokens, dims) for f in self.fields)
-        return _round_up(raw, _SLOT_ALIGN_BYTES)
+        return _padded_layout_bytes(self.fields, num_tokens, dims)
 
     def offloaded_bytes_at_level(
         self, num_tokens: int, dims: Mapping[str, int], level: int
@@ -368,13 +395,12 @@ class ActivationSlot:
             shape = f.shape(num_tokens, dims)
             nbytes = f.byte_size(num_tokens, dims)
             # Each field's view requires storage_offset divisible by its
-            # dtype itemsize. Within-slot fields are usually naturally
-            # aligned (bf16 fields have nbytes = 2 * T * even = 4 * T *
-            # half_even for even non-token dims), but for robustness pad
-            # explicitly: a future schema with an odd-aligned bf16 field
-            # followed by an fp32 field would otherwise crash. Cheap; no
-            # perf impact since alignment padding is at most 3 bytes.
-            align = f.dtype.itemsize
+            # dtype itemsize for the typed view to work. We over-align to
+            # _FIELD_ALIGN_BYTES (256) so Hopper-class kernels (quack
+            # gemm_gated etc.) get the 16-byte alignment they require —
+            # individual fields' first rows must sit on 16-byte boundaries
+            # for vectorized loads.
+            align = max(_FIELD_ALIGN_BYTES, f.dtype.itemsize)
             if offset % align != 0:
                 offset = _round_up(offset, align)
             if offset + nbytes > buffer.numel():

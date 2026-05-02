@@ -811,6 +811,32 @@ def main(argv: list[str] | None = None) -> int:
         strict=False,
         verbose=True,
     )
+    # Optional: re-randomize ALL host-master weights (post-HF-load)
+    # for diagnostic parity comparisons that need a stronger gradient
+    # signal than a converged checkpoint provides. Env-var-gated to
+    # keep the CLI clean — this is a debug knob, not a feature.
+    # Set FLEXTRAIN_RANDOMIZE_WEIGHTS=1 (optionally _STD=0.02, _SEED=N).
+    if os.environ.get("FLEXTRAIN_RANDOMIZE_WEIGHTS", "0").lower() in ("1", "true", "yes"):
+        std = float(os.environ.get("FLEXTRAIN_RANDOMIZE_STD", "0.02"))
+        seed = int(os.environ.get("FLEXTRAIN_RANDOMIZE_SEED", "0"))
+        gen = torch.Generator(device="cpu").manual_seed(seed)
+        n_tensors = 0
+        n_bytes = 0
+        for d in (am.buffers.host_embed_params, am.buffers.host_head_params):
+            for t in d.values():
+                t.normal_(mean=0.0, std=std, generator=gen)
+                n_tensors += 1
+                n_bytes += t.numel() * t.element_size()
+        for layer_dict in am.buffers.host_params:
+            for t in layer_dict.values():
+                t.normal_(mean=0.0, std=std, generator=gen)
+                n_tensors += 1
+                n_bytes += t.numel() * t.element_size()
+        print(
+            f"[FLEXTRAIN_RANDOMIZE_WEIGHTS] re-initialized {n_tensors} tensors "
+            f"({n_bytes / (1 << 30):.2f} GiB) from N(0, {std:.4f}) seed={seed}",
+            flush=True,
+        )
     if args.data_source == "synthetic":
         synthetic_seq_len = args.synthetic_seq_len or args.max_seq_len
         print(

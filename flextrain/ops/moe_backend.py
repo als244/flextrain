@@ -878,7 +878,6 @@ class SonicMoEExpertCompute:
       * ``sonic_x_gather_idx: (TK,) int32`` — scattered → x token idx.
       * ``sonic_expert_frequency: (E,) int32`` — per-expert counts.
       * ``sonic_expert_frequency_offset: (E+1,) int32`` — cumsum w/ leading 0.
-      * ``sonic_num_activated_offset: (T+1,) int32`` — per-token expert-count cumsum.
       * ``index_mapping: (T, K) int32`` — flextrain-shape, derived from
         s_scatter_idx at fwd. Lets the unified
         ``flextrain_moe_router_gate_bwd`` consume scattered dprobs the
@@ -988,19 +987,6 @@ class SonicMoEExpertCompute:
                 tier=0,
                 token_axis=None,
             ),
-            # (T+1,) — num_activated_offset[t] = cumulative count of
-            # expert-slots through token t. Token-axis sized.
-            ActivationField(
-                "sonic_num_activated_offset",
-                lambda n, d: (n + 1,),
-                torch.int32,
-                tier=0,
-                # token_axis defaults to 0; +1 elements is fine since
-                # the schema sizes by num_tokens and we only need
-                # num_tokens entries plus a sentinel. Engine accepts
-                # token_axis=0 with shape (n+1,); narrow returns
-                # the (n+1,) for the chunk's actual num_tokens.
-            ),
             # Flextrain-shape index_mapping for unified router-gate-bwd.
             ActivationField(
                 "index_mapping",
@@ -1075,9 +1061,14 @@ class SonicMoEExpertCompute:
         # i was originally at token-major flat position j. So:
         #   index_mapping.flatten()[s_scatter_idx[i]] = i
         # produces the inverse permutation.
-        slot.index_mapping.view(-1).index_copy_(
+        #
+        # NOTE — slot.sonic_s_scatter_idx and slot.index_mapping are
+        # both allocated for the MAX (T*K); the metadata kernel only
+        # writes the first actual-TK entries. Slice both to the
+        # current-chunk TK before scattering.
+        slot.index_mapping.view(-1)[:TK].index_copy_(
             0,
-            slot.sonic_s_scatter_idx.long(),
+            slot.sonic_s_scatter_idx[:TK].long(),
             torch.arange(TK, device=x.device, dtype=torch.int32),
         )
 
@@ -1107,6 +1098,9 @@ class SonicMoEExpertCompute:
         # (functional/__init__.py:114). MoE.forward passes
         # `c_fc.weight.permute(1, 2, 0)` as w1, and _UpProjection.forward
         # calls `gemm_gated(.., w1.permute(2, 1, 0), ..)`. We replicate.
+        # NOTE — slot.x_up is allocated for max TK; quack's gemm_gated
+        # asserts preact_out.shape[0] == postact_out.shape[0], so slice
+        # to the current chunk's TK.
         a_post = scratch_fn((TK, F), x.dtype)
         w1_view = w_up_native.permute(1, 2, 0)            # (2F, d, E) — sonicmoe's saved w1
         gemm_gated(
@@ -1114,8 +1108,8 @@ class SonicMoEExpertCompute:
             w1_view.permute(2, 1, 0),                     # (E, d, 2F)
             activation="swiglu",
             cu_seqlens_m=slot.sonic_expert_frequency_offset,
-            A_idx=slot.sonic_x_gather_idx,
-            preact_out=slot.x_up,
+            A_idx=slot.sonic_x_gather_idx[:TK],
+            preact_out=slot.x_up[:TK],
             postact_out=a_post,
             store_preact=True,
             bias=None,
@@ -1143,7 +1137,7 @@ class SonicMoEExpertCompute:
             y=y,
             o=out,
             topk_scores=router_scores_flat,
-            s_reverse_scatter_idx=slot.sonic_s_reverse_scatter_idx,
+            s_reverse_scatter_idx=slot.sonic_s_reverse_scatter_idx[:TK],
             num_activated_expert_per_token_offset=None,
             varlen_K_max=K,
             H=d_model,
@@ -1162,10 +1156,47 @@ class SonicMoEExpertCompute:
         secondary_stream: torch.cuda.Stream | None,
         scratch_fn: Callable[[tuple[int, ...], torch.dtype], torch.Tensor],
     ) -> Any:
-        raise NotImplementedError(
-            "SonicMoEExpertCompute supports only tier 3; fwd_recompute "
-            "should never be called. supported_tiers={3}."
+        """Re-run the up-projection part of fwd to repopulate
+        ``slot.x_up`` when the layer's save tier was < 3. Skips the
+        down-projection and combine — bwd doesn't need ``y`` or ``out``.
+
+        All routing metadata fields (sonic_*, index_mapping) are tier 0
+        and already populated from fwd; we only re-run the up-proj
+        ``gemm_gated``. Returns ``None`` (no handoff needed; bwd reads
+        slot fields the same way it does after a tier-3 fwd).
+        """
+        from quack.gemm_interface import gemm_gated
+
+        num_experts = weights["w_up"].shape[0]
+        d_model = weights["w_up"].shape[1]
+        F = weights["w_down"].shape[1]
+        T = x.shape[0]
+        K = slot.chosen_experts.shape[1]
+        TK = T * K
+
+        # Materialize sonicmoe-layout w_up (interleaved gate/up).
+        up, gate = weights["w_up"].chunk(2, dim=-1)
+        w_up_interleaved = torch.stack([gate, up], dim=-1).reshape(
+            num_experts, d_model, 2 * F,
         )
+        w_up_native = w_up_interleaved.transpose(1, 2).contiguous()
+
+        # Up-projection only — repopulates slot.x_up. Throwaway
+        # postact_out scratch since we don't need a_post here.
+        a_post_scratch = scratch_fn((TK, F), x.dtype)
+        w1_view = w_up_native.permute(1, 2, 0)
+        gemm_gated(
+            x,
+            w1_view.permute(2, 1, 0),
+            activation="swiglu",
+            cu_seqlens_m=slot.sonic_expert_frequency_offset,
+            A_idx=slot.sonic_x_gather_idx[:TK],
+            preact_out=slot.x_up[:TK],
+            postact_out=a_post_scratch,
+            store_preact=True,
+            bias=None,
+        )
+        return None
 
     def bwd(
         self,
@@ -1212,8 +1243,11 @@ class SonicMoEExpertCompute:
         TK = T * K
 
         # router_scores in fp32 (sonic's down-bwd kernel uses fp32 for
-        # the gradient scaling chain).
-        router_scores_flat = slot.router_weights.view(-1).float().contiguous()
+        # the gradient scaling chain). slot.router_weights is allocated
+        # for max-T; slice to actual T.
+        router_scores_flat = (
+            slot.router_weights[:T].reshape(-1).float().contiguous()
+        )
 
         # Convert flextrain's (E, in, out) layout to sonicmoe's
         # (E, out, in) contiguous storage (see fwd comment for the
@@ -1241,7 +1275,7 @@ class SonicMoEExpertCompute:
 
         _down_projection_backward_act(
             dout=dy,
-            h=slot.x_up,
+            h=slot.x_up[:TK],
             w2=w2_sonic,
             dh=dh,
             ds=ds,
@@ -1250,8 +1284,8 @@ class SonicMoEExpertCompute:
             a_prime=a_prime,
             topk_scores=router_scores_flat,
             expert_frequency_offset=slot.sonic_expert_frequency_offset,
-            x_gather_idx=slot.sonic_x_gather_idx,
-            s_scatter_idx=slot.sonic_s_scatter_idx,
+            x_gather_idx=slot.sonic_x_gather_idx[:TK],
+            s_scatter_idx=slot.sonic_s_scatter_idx[:TK],
             activation_type="swiglu",
         )
 
@@ -1275,7 +1309,7 @@ class SonicMoEExpertCompute:
                 a_prime,
                 out=dw2.permute(2, 0, 1),                     # (E, d, F)
                 cu_seqlens_k=slot.sonic_expert_frequency_offset,
-                A_idx=slot.sonic_x_gather_idx,
+                A_idx=slot.sonic_x_gather_idx[:TK],
                 batch_idx_permute=None,
                 dynamic_scheduler=False,
             )
@@ -1312,7 +1346,7 @@ class SonicMoEExpertCompute:
                 dh,
                 out=dw1.permute(2, 1, 0),                     # (E, d, 2F)
                 cu_seqlens_k=slot.sonic_expert_frequency_offset,
-                A_idx=slot.sonic_x_gather_idx,
+                A_idx=slot.sonic_x_gather_idx[:TK],
                 batch_idx_permute=None,
                 dynamic_scheduler=False,
             )
@@ -1333,7 +1367,7 @@ class SonicMoEExpertCompute:
         _token_broadcast_backward(
             dx_reduced=dx,
             dx_expanded=dx_expanded,
-            s_reverse_scatter_idx=slot.sonic_s_reverse_scatter_idx,
+            s_reverse_scatter_idx=slot.sonic_s_reverse_scatter_idx[:TK],
             num_activated_expert_per_token_offset=None,
             varlen_K_max=K,
             H=d_model,
@@ -1346,7 +1380,7 @@ class SonicMoEExpertCompute:
         dprobs_flat = scratch_fn((TK,), dy.dtype)
         flextrain_moe_scatter_routing_weights(
             ds.view(T, K).to(dy.dtype).contiguous(),
-            slot.index_mapping,
+            slot.index_mapping[:T],
             out=dprobs_flat,
         )
         slot.aux["moe_dprobs"] = dprobs_flat.unsqueeze(-1)

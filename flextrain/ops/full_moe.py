@@ -208,6 +208,14 @@ def routed_swiglu_moe_fwd(
         topk_weights_out=slot.router_weights,
     )
 
+    # Backend-parity diagnostic dump (env-var-gated; no-op otherwise).
+    # Captures router state + fwd input; out is dumped after step 2.
+    from flextrain.ops._moe_dump import dump_tensor
+    dump_tensor("ffn_norm_output", ffn_norm_output, layer_id=layer_id, phase="fwd")
+    dump_tensor("x_router", slot.x_router, layer_id=layer_id, phase="fwd")
+    dump_tensor("chosen_experts", slot.chosen_experts, layer_id=layer_id, phase="fwd")
+    dump_tensor("router_weights", slot.router_weights, layer_id=layer_id, phase="fwd")
+
     # 2) Backend-owned MoE block (scatter + experts + gather).
     expert_compute.fwd(
         ffn_norm_output, router_weights, topk_ids, weights,
@@ -222,6 +230,10 @@ def routed_swiglu_moe_fwd(
     )
     if not expert_compute.supports_residual_in_gather and residual is not None:
         out_tensor.add_(residual.view(-1, ffn_norm_output.shape[-1]))
+
+    # Dump the MoE block's output (with residual added) — this is the
+    # transition into the next layer.
+    dump_tensor("out", out_tensor, layer_id=layer_id, phase="fwd")
 
 
 def routed_swiglu_moe_bwd(
@@ -264,6 +276,10 @@ def routed_swiglu_moe_bwd(
     """
     num_tokens, d_model = dy_resid.shape
     primary_stream_ptr = primary_stream.cuda_stream
+
+    # Backend-parity diagnostic dump (env-var-gated; no-op otherwise).
+    from flextrain.ops._moe_dump import dump_tensor
+    dump_tensor("dy", dy_resid, layer_id=layer_id, phase="bwd")
 
     # 1-4) Backend-owned MoE block bwd (scatter + experts + gather).
     # Returns dx (the gradient at the FFN-norm output); writes scattered
@@ -334,6 +350,14 @@ def routed_swiglu_moe_bwd(
             beta=1.0, alpha=1.0,
         )
     # else: w_router frozen (LoRA on attn only). No wgrad to write.
+
+    # Diagnostic dump of post-bwd grad accumulators (env-var-gated).
+    if grads.get("g_up") is not None:
+        dump_tensor("g_up", grads["g_up"], layer_id=layer_id, phase="bwd")
+    if grads.get("g_down") is not None:
+        dump_tensor("g_down", grads["g_down"], layer_id=layer_id, phase="bwd")
+    if grads.get("g_router") is not None:
+        dump_tensor("g_router", grads["g_router"], layer_id=layer_id, phase="bwd")
 
     return ffn_norm_upstream
 
