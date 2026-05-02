@@ -180,16 +180,16 @@ class MoEExpertCompute(Protocol):
             by expert. Source for ``dY`` in w_down's LoRA wgrad.
             (Backend MUST NOT in-place-overwrite this with dx_pre
             when capturing.)
+          * ``"x_up_grouped"`` (TK, 2*F) bf16 — saved per-slot pre-
+            SwiGLU activation, sliced to actual TK. The finalize
+            recomputes ``fwd_act = silu(gate) * value`` from this as
+            the ``X`` for w_down's LoRA wgrad. Reference to
+            ``slot.x_up[:TK]`` — no new alloc.
           * ``"expert_offsets"`` (E,) int32 — cumulative ending
             offsets, ``offs[-1] == TK``. Used as ``offs`` for
             ``torch.nn.functional.grouped_mm``.
           * ``"TK"`` int — actual token-slot count this chunk
             (≤ TK_max). All staged tensors are sliced to this count.
-
-        ``slot.x_up`` (already saved at tier ≥3 or repopulated by
-        ``fwd_recompute``) provides the per-slot pre-SwiGLU activation
-        from which ``fwd_act = silu(gate)*value`` is recomputed by the
-        finalize as the ``X`` for w_down's LoRA wgrad.
 
         When ``lora_capture is None`` (default), backend behaves
         exactly as before — no staging, no extra allocations beyond
@@ -511,6 +511,7 @@ class FlextrainMoEExpertCompute:
             lora_capture["scattered_x_grouped"] = scattered_x
             lora_capture["dx_up_up_grouped"] = dx_up_up_grouped
             lora_capture["scattered_upstream_grouped"] = scattered_upstream
+            lora_capture["x_up_grouped"] = slot.x_up[:TK]
             lora_capture["expert_offsets"] = expert_offsets
             lora_capture["TK"] = TK
 
@@ -949,6 +950,7 @@ class ScatterMoEExpertCompute:
             lora_capture["scattered_x_grouped"] = grouped_x
             lora_capture["dx_up_up_grouped"] = d_pre_act
             lora_capture["scattered_upstream_grouped"] = grouped_grad_out
+            lora_capture["x_up_grouped"] = slot.x_up[:TK]
             lora_capture["expert_offsets"] = expert_offsets  # (E,) int32 cumsum
             lora_capture["TK"] = TK
 
@@ -1486,6 +1488,7 @@ class SonicMoEExpertCompute:
             lora_capture["scattered_x_grouped"] = scattered_x_grouped
             lora_capture["dx_up_up_grouped"] = dh
             lora_capture["scattered_upstream_grouped"] = scattered_upstream_grouped
+            lora_capture["x_up_grouped"] = slot.x_up[:TK]
             lora_capture["expert_offsets"] = (
                 slot.sonic_expert_frequency_offset[1:]
             )

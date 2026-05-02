@@ -736,6 +736,145 @@ class LoRAWrapperLayer:
         _cb.max_rank = max(t[4] for t in per_target.values())
         return _cb
 
+    def _accumulate_moe_lora_grads_from_capture(
+        self,
+        capture: dict[str, torch.Tensor],
+        weights: Mapping[str, torch.Tensor],
+        grads: MutableMapping[str, torch.Tensor],
+    ) -> None:
+        """Generic deferred LoRA wgrad finalize for MoE expert weights.
+
+        Consumes the per-expert grouped intermediates that the backend
+        staged in ``capture`` and accumulates ``dA``, ``dB`` into the
+        LoRA factor grad buffers. Backend-agnostic: same code path runs
+        regardless of which backend produced ``capture``.
+
+        Math (per LoRA target — w_up or w_down — under option-B
+        layout; see design memory ``moe_lora_integration_design_2026_05_02``):
+
+            X         (TK, in)   X_grouped — fwd input to the projection
+            dY        (TK, out)  upstream grad at the projection output
+            A         (E, in, r) LoRA down-projection factor
+            B         (E, r, out) LoRA up-projection factor
+
+        Per-expert (with offs partitioning the TK axis):
+            dY_B  = dY  @ B^T          (TK, r)
+            dA   += X^T @ dY_B  * scale shape (E, in, r)
+            X_A   = X   @ A             (TK, r)
+            dB   += X_A^T @ dY  * scale shape (E, r, out)
+
+        Realized via four ``torch.nn.functional.grouped_mm`` calls per
+        target — no python expert loop. The grouped GEMM kernels are
+        purpose-built for MoE wgrad on Hopper (sm_90+; bf16-only at
+        time of writing). Caller responsibility to ensure inputs are
+        bf16 and CUDA.
+
+        For w_down's ``X = fwd_act``, recompute via SwiGLU on the
+        saved ``slot.x_up`` (free; just a fused activation). The
+        capture dict supplies ``dx_up_up_grouped`` directly as w_up's
+        dY, ``scattered_upstream_grouped`` as w_down's dY.
+
+        Args:
+            capture: dict populated by ``MoEExpertCompute.bwd``.
+                Required keys (see protocol docstring):
+                ``scattered_x_grouped``, ``dx_up_up_grouped``,
+                ``scattered_upstream_grouped``, ``expert_offsets``,
+                ``TK``.
+            weights: full weights dict — used to read A/B/scale per
+                LoRA target. (Effective W is irrelevant here; the
+                base's wgrad math doesn't run on these targets.)
+            grads: full grads dict — accumulators for dA/dB.
+
+        No-op when no LoRA target is in ``_MOE_CALLBACK_TARGETS``.
+        """
+        from torch.nn.functional import grouped_mm
+
+        moe_targets = self._target_set & self._MOE_CALLBACK_TARGETS
+        # Filter to MoE-expert targets only (w_up, w_down,
+        # w_shared_up, w_shared_down). Router targets (w_router,
+        # w_shared_expert_gate) go through the 2-D path.
+        moe_expert_targets = moe_targets & frozenset(
+            ("w_up", "w_down", "w_shared_up", "w_shared_down"),
+        )
+        if not moe_expert_targets:
+            return
+
+        TK = capture["TK"]
+        offs = capture["expert_offsets"]  # (E,) int32 cumulative ending in TK
+
+        # Per-target X / dY mapping. Both X and dY must be bf16 for
+        # grouped_mm; capture stages full TK so explicit [:TK] is a
+        # no-op when backend already sliced.
+        scattered_x_grouped = capture["scattered_x_grouped"][:TK]
+        dx_up_up_grouped = capture["dx_up_up_grouped"][:TK]
+        scattered_upstream_grouped = capture["scattered_upstream_grouped"][:TK]
+        x_up_grouped = capture["x_up_grouped"][:TK]   # (TK, 2F) saved pre-SwiGLU
+
+        # Recompute fwd_act = silu(gate) * value (option-B chunked
+        # convention: x_up_grouped packs [up_F, gate_F] along last dim).
+        # Done lazily below only if w_down is targeted, since the
+        # SwiGLU forward is non-trivial bandwidth even at TK*F.
+        fwd_act_grouped: torch.Tensor | None = None
+
+        def _ensure_fwd_act() -> torch.Tensor:
+            nonlocal fwd_act_grouped
+            if fwd_act_grouped is None:
+                value, gate = x_up_grouped.chunk(2, dim=-1)
+                fwd_act_grouped = (
+                    torch.nn.functional.silu(gate) * value
+                ).contiguous()
+            return fwd_act_grouped
+
+        for cfg in self.targets:
+            if cfg.target_name not in moe_expert_targets:
+                continue
+            A = weights[cfg.a_name]   # (E, in, r) — PEFT convention
+            B = weights[cfg.b_name]   # (E, r, out)
+            ga = grads.get(f"g_{cfg.a_name[2:]}")
+            gb = grads.get(f"g_{cfg.b_name[2:]}")
+            if ga is None or gb is None:
+                # User froze the LoRA factors entirely (degenerate).
+                continue
+
+            # X / dY routing per target. Names follow the same
+            # X/dY-contract semantics across all backends.
+            if cfg.target_name == "w_up":
+                X = scattered_x_grouped              # (TK, d=in)
+                dY = dx_up_up_grouped                # (TK, 2F=out)
+            elif cfg.target_name == "w_down":
+                X = _ensure_fwd_act()                # (TK, F=in)
+                dY = scattered_upstream_grouped      # (TK, d=out)
+            elif cfg.target_name in ("w_shared_up", "w_shared_down"):
+                # Shared experts not yet wired — they have a separate
+                # capture path through MoESharedFFN. Will be added if
+                # we ever migrate shared experts to option-B.
+                continue
+            else:
+                continue
+
+            r = cfg.rank
+            scale = float(cfg.scale)
+
+            # 1. dY_B = dY @ B^T per-expert. 2D × 3D forward-style.
+            #    dY: (TK, out), B^T: (E, out, r) → (TK, r)
+            dY_B = grouped_mm(dY, B.transpose(-1, -2), offs=offs)
+
+            # 2. dA = X^T @ dY_B per-expert. 2D × 2D wgrad-style.
+            #    X^T: (in, TK), dY_B: (TK, r) → (E, in, r)
+            dA = grouped_mm(X.transpose(-1, -2), dY_B, offs=offs)
+
+            # 3. X_A = X @ A per-expert. 2D × 3D forward-style.
+            #    X: (TK, in), A: (E, in, r) → (TK, r)
+            X_A = grouped_mm(X, A, offs=offs)
+
+            # 4. dB = X_A^T @ dY per-expert. 2D × 2D wgrad-style.
+            #    X_A^T: (r, TK), dY: (TK, out) → (E, r, out)
+            dB = grouped_mm(X_A.transpose(-1, -2), dY, offs=offs)
+
+            # 5. Accumulate.
+            ga.add_((dA * scale).to(ga.dtype))
+            gb.add_((dB * scale).to(gb.dtype))
+
     def backward_wgrad(
         self, intermediates: BackwardIntermediates,
         weights: Mapping[str, torch.Tensor],
