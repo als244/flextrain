@@ -533,13 +533,28 @@ def _baseline_gpu_activation_memory(
     top_k = model_dims["top_k"]
     num_routed = model_dims["num_routed_experts"]
     if num_routed > 0:
-        # attn norm output, scattered X, scattered upstream
+        # MoE bwd workspace at TK = chunk_size * top_k slots:
+        #   * attn norm output: (chunk_size, d) — fwd input ref
+        #   * scattered_x:         (TK, d) bf16
+        #   * scattered_upstream:  (TK, d) bf16 — read-only across loop
+        #     (post-Phase-3c flextrain refactor; was overwritten in-place
+        #     pre-deferred-LoRA but the accounting term is the same).
+        #   * dx_up_up_grouped:    (TK, 2F) bf16 — always-on scratch since
+        #     Phase 3c (was per-expert in X_temp before the refactor).
+        #   * dx_pre_grouped:      (TK, d) bf16 — always-on scratch since
+        #     Phase 3c (was the in-place dx_pre over scattered_upstream).
+        # = chunk_size * d (attn norm) + TK * (d + d + 2F + d)
+        # = chunk_size * d + chunk_size * top_k * (3*d + 2F)
         mlp_workspace = (
-            chunk_size * (d + 2 * top_k * d) * sz_act
+            chunk_size * d * sz_act
+            + chunk_size * top_k * (3 * d + 2 * expert_dim) * sz_act
         )
-        # intra-expert backprop scratch (avg tokens per expert estimate)
+        # Intra-expert backprop scratch: per-stream X_temp carries
+        # dx_act_up (T_e, F) + fwd_act (T_e, F) = (T_e, 2F) per stream.
+        # Pre-Phase-3c also carried dx_up_up (T_e, 2F) → 4F total; that
+        # tensor is now in the TK-sized dx_up_up_grouped above.
         avg_tokens = int(chunk_size * top_k / num_routed)
-        mlp_workspace += 2 * avg_tokens * 4 * expert_dim * sz_act
+        mlp_workspace += 2 * avg_tokens * 2 * expert_dim * sz_act
     else:
         # dense bwd: (d_act_upstream, fwd_act, dx1_up, dx3_up)
         mlp_workspace = chunk_size * 4 * expert_dim * sz_act
