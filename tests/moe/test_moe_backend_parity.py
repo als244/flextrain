@@ -46,18 +46,18 @@ def naive_moe_fwd_bwd(
     x: torch.Tensor,           # (T, d) — requires_grad
     expert_p: torch.Tensor,    # (T, K) — requires_grad
     expert_idxs: torch.Tensor, # (T, K) int
-    w_up: torch.Tensor,        # (E, d, 2F) — requires_grad
-    w_down: torch.Tensor,      # (E, F, d) — requires_grad
+    w_up: torch.Tensor,        # (E, 2F, d) — requires_grad (option-B layout)
+    w_down: torch.Tensor,      # (E, d, F) — requires_grad
     dy: torch.Tensor,          # (T, d) — upstream
 ):
     """Compute out, dx, dw_up, dw_down, d_expert_p via PyTorch autograd.
 
     Forward:
         For each (t, k): expert e = expert_idxs[t,k]
-            pre  = x[t] @ w_up[e]                   # (2F,)
+            pre  = x[t] @ w_up[e].T                 # (2F,)
             value, gate = pre.chunk(2)              # (F,), (F,)
             h    = silu(gate) * value               # (F,)
-            y_e  = h @ w_down[e]                    # (d,)
+            y_e  = h @ w_down[e].T                  # (d,)
         out[t] = sum_k expert_p[t,k] * y_e
 
     Backward: autograd.
@@ -65,7 +65,7 @@ def naive_moe_fwd_bwd(
     T, d = x.shape
     K = expert_p.shape[1]
     E = w_up.shape[0]
-    F = w_down.shape[1]
+    F = w_down.shape[2]
 
     # Per-expert reference: build out[t] = sum over (t, k) of
     # expert_p[t, k] * (silu(gate) * value), where (gate, value) are
@@ -87,10 +87,12 @@ def naive_moe_fwd_bwd(
         # Each (token_idx[i], k_idx[i]) contributes p * silu(g) * v * w_down
         x_e = x[token_idx]                    # (n, d)
         p_e = expert_p[token_idx, k_idx]      # (n,)
-        pre_e = x_e @ w_up[e]                 # (n, 2F)
+        # w_up[e]: (2F, d). pre = x_e @ w_up[e].T → (n, 2F).
+        pre_e = x_e @ w_up[e].T               # (n, 2F)
         value_e, gate_e = pre_e.chunk(2, dim=-1)  # (n, F) each
         h_e = F_torch.silu(gate_e) * value_e  # (n, F)
-        y_e = h_e @ w_down[e]                 # (n, d)
+        # w_down[e]: (d, F). y = h_e @ w_down[e].T → (n, d).
+        y_e = h_e @ w_down[e].T               # (n, d)
         contrib = p_e.unsqueeze(-1) * y_e     # (n, d)
         out.index_add_(0, token_idx, contrib)
 
@@ -275,8 +277,9 @@ def main():
     expert_idxs = expert_idxs.to(torch.int32)
 
     weights = {
-        "w_up": torch.randn(E, d_model, 2 * F, device=device, dtype=dtype) / (d_model ** 0.5),
-        "w_down": torch.randn(E, F, d_model, device=device, dtype=dtype) / (F ** 0.5),
+        # Option-B layout: w_up (E, 2F, d), w_down (E, d, F).
+        "w_up": torch.randn(E, 2 * F, d_model, device=device, dtype=dtype) / (d_model ** 0.5),
+        "w_down": torch.randn(E, d_model, F, device=device, dtype=dtype) / (F ** 0.5),
     }
     dy = torch.randn(T, d_model, device=device, dtype=dtype)
 
@@ -336,8 +339,8 @@ def main():
         ("out (T, d)",       ft_out,    out_ref),
         ("dx (T, d)",        ft_dx,     dx_ref),
         ("d_expert_p (T, K)", ft_d_p,    d_p_ref),
-        ("g_up (E, d, 2F)",  ft_g_up,   dw_up_ref),
-        ("g_down (E, F, d)", ft_g_down, dw_down_ref),
+        ("g_up (E, 2F, d)",  ft_g_up,   dw_up_ref),
+        ("g_down (E, d, F)", ft_g_down, dw_down_ref),
     ]:
         if not _report(label, a, b, cos_tol=cos_tol):
             fail_ft = True
@@ -348,8 +351,8 @@ def main():
         ("out (T, d)",       sm_out,    out_ref),
         ("dx (T, d)",        sm_dx,     dx_ref),
         ("d_expert_p (T, K)", sm_d_p,    d_p_ref),
-        ("g_up (E, d, 2F)",  sm_g_up,   dw_up_ref),
-        ("g_down (E, F, d)", sm_g_down, dw_down_ref),
+        ("g_up (E, 2F, d)",  sm_g_up,   dw_up_ref),
+        ("g_down (E, d, F)", sm_g_down, dw_down_ref),
     ]:
         if not _report(label, a, b, cos_tol=cos_tol):
             fail_sm = True
@@ -361,8 +364,8 @@ def main():
             ("out (T, d)",       son_out,    out_ref),
             ("dx (T, d)",        son_dx,     dx_ref),
             ("d_expert_p (T, K)", son_d_p,    d_p_ref),
-            ("g_up (E, d, 2F)",  son_g_up,   dw_up_ref),
-            ("g_down (E, F, d)", son_g_down, dw_down_ref),
+            ("g_up (E, 2F, d)",  son_g_up,   dw_up_ref),
+            ("g_down (E, d, F)", son_g_down, dw_down_ref),
         ]:
             if not _report(label, a, b, cos_tol=cos_tol):
                 fail_son = True

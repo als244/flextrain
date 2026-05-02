@@ -68,10 +68,13 @@ def _make_fake_slot(T, K, E, F, d_model, dtype, device):
 
 def naive_full_layer_fwd(x, w_router, w_up, w_down, residual, top_k):
     """Full-layer reference: route → scatter → per-expert MLP → gather
-    + residual-add, all in fp32 then downcast at the end."""
+    + residual-add, all in fp32 then downcast at the end.
+
+    Option-B layout: w_up[e]: (2F, d), w_down[e]: (d, F).
+    """
     T, d = x.shape
     E = w_router.shape[1]
-    F = w_down.shape[1]
+    F = w_down.shape[2]
 
     # Router (fp32). w_router stored (d, E); x @ w_router → (T, E).
     router_logits = x.float() @ w_router.float()  # (T, E)
@@ -88,10 +91,12 @@ def naive_full_layer_fwd(x, w_router, w_up, w_down, residual, top_k):
         token_idx, k_idx = mask.nonzero(as_tuple=True)
         x_e = x[token_idx].float()
         p_e = expert_p[token_idx, k_idx]
-        pre_e = x_e @ w_up[e].float()
+        # w_up[e]: (2F, d) → x_e @ w_up[e].T = (n, 2F).
+        pre_e = x_e @ w_up[e].float().T
         value_e, gate_e = pre_e.chunk(2, dim=-1)
         h_e = F_torch.silu(gate_e) * value_e
-        y_e = h_e @ w_down[e].float()
+        # w_down[e]: (d, F) → h_e @ w_down[e].T = (n, d).
+        y_e = h_e @ w_down[e].float().T
         contrib = p_e.unsqueeze(-1) * y_e
         out_unscaled.index_add_(0, token_idx, contrib)
 
@@ -131,7 +136,8 @@ def run_backend_fwd(backend, x, w_router, w_up, w_down, residual,
                     top_k, num_experts, dtype, device):
     """Run a single fwd through routed_swiglu_moe_fwd. Returns out tensor."""
     T, d = x.shape
-    F = w_down.shape[1]
+    # w_down: (E, d, F) under option-B layout.
+    F = w_down.shape[2]
     slot = _make_fake_slot(T, top_k, num_experts, F, d, dtype, device)
     weights = {"w_router": w_router, "w_up": w_up, "w_down": w_down}
     out = torch.empty(T, d, device=device, dtype=dtype)
@@ -190,8 +196,9 @@ def main():
     x = torch.randn(T, d, device=device, dtype=dtype)
     # w_router: (d, E) so that x @ w_router → (T, E) router logits.
     w_router = torch.randn(d, E, device=device, dtype=dtype) / (d ** 0.5)
-    w_up = torch.randn(E, d, 2 * F, device=device, dtype=dtype) / (d ** 0.5)
-    w_down = torch.randn(E, F, d, device=device, dtype=dtype) / (F ** 0.5)
+    # Option-B layout: w_up (E, 2F, d), w_down (E, d, F).
+    w_up = torch.randn(E, 2 * F, d, device=device, dtype=dtype) / (d ** 0.5)
+    w_down = torch.randn(E, d, F, device=device, dtype=dtype) / (F ** 0.5)
     residual = torch.randn(T, d, device=device, dtype=dtype) * args.residual_scale
 
     # Reference
