@@ -9,10 +9,11 @@ compute pattern.
 Param spec
 ----------
 * ``w_router`` -- ``(d_model, num_experts)`` gating linear
-* ``w_up``     -- ``(num_experts, d_model, 2 * expert_dim)`` -- stacked
-                  per-expert SwiGLU up (gate+value concatenated)
-* ``w_down``   -- ``(num_experts, expert_dim, d_model)`` -- stacked
-                  per-expert SwiGLU down
+* ``w_up``     -- ``(num_experts, 2 * expert_dim, d_model)`` -- stacked
+                  per-expert SwiGLU up (out, in) order. The 2F axis is
+                  CHUNKED ``[up_first_F, gate_second_F]``.
+* ``w_down``   -- ``(num_experts, d_model, expert_dim)`` -- stacked
+                  per-expert SwiGLU down (out, in) order.
 
 Activation schema
 -----------------
@@ -234,14 +235,25 @@ class MoESwiGLUFFN:
                 ),
                 TensorSpec(
                     "w_up",
-                    lambda d: (cfg.num_experts, cfg.d_model, 2 * cfg.expert_dim),
+                    # (E, out=2F, in=d) — matches HF gate_up_proj shape and
+                    # Megatron TEGroupedMLP / vLLM fused_moe / scattermoe
+                    # convention. Allows sonic to drop its per-call axis
+                    # transpose and scattermoe to drop its bwd
+                    # `.permute(0, 2, 1).contiguous()`. Per-expert dispatcher
+                    # in flextrain backend uses cuBLAS transpose-on-fly via
+                    # `w_up_e.T`. Gate/up packing within the 2F axis is
+                    # CHUNKED [up_first_F, gate_second_F] (matches HF +
+                    # ecosystem). Sonic does an interleave at its boundary.
+                    lambda d: (cfg.num_experts, 2 * cfg.expert_dim, cfg.d_model),
                     compute_dtype=cfg.compute_dtype,
                     master_dtype=cfg.master_dtype,
                     grad_dtype=cfg.grad_dtype,
                 ),
                 TensorSpec(
                     "w_down",
-                    lambda d: (cfg.num_experts, cfg.expert_dim, cfg.d_model),
+                    # (E, out=d, in=F) — matches HF down_proj. No transpose
+                    # needed at load.
+                    lambda d: (cfg.num_experts, cfg.d_model, cfg.expert_dim),
                     compute_dtype=cfg.compute_dtype,
                     master_dtype=cfg.master_dtype,
                     grad_dtype=cfg.grad_dtype,

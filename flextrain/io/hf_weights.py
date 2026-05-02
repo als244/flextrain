@@ -146,8 +146,8 @@ class ArchSpec:
         by architectures whose HF weights don't map 1:1 to a single
         FlexTrain tensor — e.g. MoE models where each expert has
         separate ``experts.{e}.gate_proj``/``up_proj``/``down_proj``
-        tensors that we need to STACK into ``w_up (E, d, 2*F)`` and
-        ``w_down (E, F, d)``. The hook receives the HF path and the
+        tensors that we need to STACK into ``w_up (E, 2*F, d)`` and
+        ``w_down (E, d, F)``. The hook receives the HF path and the
         full ``dest`` mapping ``{(scope, name): host Tensor}`` and may
         read additional raw HF tensors via ``safe_open`` to populate
         the stacked FlexTrain tensors. Signature:

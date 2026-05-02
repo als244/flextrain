@@ -32,8 +32,9 @@ Architectural recap (verified by reading the HF safetensors index of
 * **Batched expert weights** — HF stores
   ``mlp.experts.gate_up_proj: (E, 2F, D)`` and
   ``mlp.experts.down_proj: (E, D, F)`` in the fused (newer) format.
-  FT expects ``w_up: (E, D, 2F)`` ([up | gate] concat) and
-  ``w_down: (E, F, D)``.
+  FT expects ``w_up: (E, 2F, D)`` ([up; gate] cat along the 2F axis) and
+  ``w_down: (E, D, F)`` — same axis order as HF, just gate/up halves
+  swapped.
 * **Tied word embeddings**: NOT TIED for the 35B (config:
   ``tie_word_embeddings: False``); ``lm_head.weight`` ships as a
   separate tensor.
@@ -247,7 +248,8 @@ def _qwen3_5_moe_post_load_hook(
     sample_w_up = dest.get(("layer_0", "w_up"))
     if sample_w_up is None:
         return  # No MoE at all.
-    E, D, TwoF = sample_w_up.shape
+    # FT layout (post option-B migration): w_up is (E, 2F, D), w_down (E, D, F).
+    E, TwoF, D = sample_w_up.shape
     Fmid = TwoF // 2
 
     for L in range(num_layers):
@@ -273,14 +275,13 @@ def _qwen3_5_moe_post_load_hook(
             ) as f:
                 hf_down = f.get_tensor(fused_down_name)        # (E, D, F)
             # HF stores gate first, up second along the 2F axis.
+            # FT: (E, 2F, D) with [up_first_F, gate_second_F] along dim=1.
+            # Same axis order as HF; just swap halves.
             gate_part = hf_gate_up[:, :Fmid, :]                # (E, F, D)
             up_part = hf_gate_up[:, Fmid:, :]                  # (E, F, D)
-            up_T = up_part.transpose(-2, -1).contiguous().to(dtype)
-            gate_T = gate_part.transpose(-2, -1).contiguous().to(dtype)
-            # FT layout: w_up[e] = (D, 2F) with [up | gate] concat.
-            w_up_ft.copy_(torch.cat([up_T, gate_T], dim=-1))
-            # FT down[e] = (F, D); HF is (D, F).
-            w_down_ft.copy_(hf_down.transpose(-2, -1).contiguous().to(dtype))
+            w_up_ft.copy_(torch.cat([up_part, gate_part], dim=1).to(dtype))
+            # FT down[e]: (D, F) — same orientation as HF.
+            w_down_ft.copy_(hf_down.to(dtype))
             continue
 
         # Per-expert fallback (older saves).
@@ -294,17 +295,17 @@ def _qwen3_5_moe_post_load_hook(
                 continue
             per_expert_present = True
             with safe_open(shard_g, framework="pt", device="cpu") as f:
-                gate = f.get_tensor(gate_name)
+                gate = f.get_tensor(gate_name)            # (F, D)
             with safe_open(_open_for(file_index, hf_path, up_name),
                            framework="pt", device="cpu") as f:
-                up = f.get_tensor(up_name)
+                up = f.get_tensor(up_name)                # (F, D)
             with safe_open(_open_for(file_index, hf_path, down_name),
                            framework="pt", device="cpu") as f:
-                down = f.get_tensor(down_name)
-            gate_t = gate.T.contiguous().to(dtype)
-            up_t = up.T.contiguous().to(dtype)
-            w_up_ft[e, :, :].copy_(torch.cat([up_t, gate_t], dim=1))
-            w_down_ft[e, :, :].copy_(down.T.contiguous().to(dtype))
+                down = f.get_tensor(down_name)            # (D, F)
+            # FT w_up[e]: (2F, D) with [up; gate] cat along dim=0.
+            # FT w_down[e]: (D, F) — same as HF.
+            w_up_ft[e, :, :].copy_(torch.cat([up.to(dtype), gate.to(dtype)], dim=0))
+            w_down_ft[e, :, :].copy_(down.to(dtype))
         if not per_expert_present:
             raise FileNotFoundError(
                 f"qwen3_5_moe loader: no expert weights found for "

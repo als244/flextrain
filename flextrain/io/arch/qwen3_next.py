@@ -122,7 +122,8 @@ def _qwen3_next_post_load_hook(
     sample_w_up = dest.get(("layer_0", "w_up"))
     if sample_w_up is None:
         return  # No MoE in this model (dense only).
-    E, D, TwoF = sample_w_up.shape
+    # FT layout (post option-B migration): w_up is (E, 2F, D), w_down (E, D, F).
+    E, TwoF, D = sample_w_up.shape
     Fmid = TwoF // 2  # avoid shadowing torch.nn.functional alias as ``F``
 
     idx_path = os.path.join(hf_path, "model.safetensors.index.json")
@@ -188,15 +189,13 @@ def _qwen3_next_post_load_hook(
             # HF: gate_up_proj[e] is (2F, D). After F.linear(x, gate_up_proj[e]):
             #   y = x @ gate_up_proj[e].T   → (T, 2F),   chunk → (gate, up).
             # So along dim=1 (the 2F dim), gate is FIRST half, up SECOND half.
+            # FT: (E, 2F, D) with [up_first_F, gate_second_F] along dim=1.
+            # Same axis order as HF; just swap halves.
             gate_part = hf_gate_up[:, :Fmid, :]                  # (E, F, D)
             up_part   = hf_gate_up[:, Fmid:, :]                  # (E, F, D)
-            # FT layout: w_up[e] = (d_model, 2F) with [up, gate] concat
-            # along the last dim. Transpose each part: (E, F, D) -> (E, D, F).
-            up_T   = up_part.transpose(-2, -1).contiguous().to(dtype)    # (E, D, F)
-            gate_T = gate_part.transpose(-2, -1).contiguous().to(dtype)  # (E, D, F)
-            w_up_ft.copy_(torch.cat([up_T, gate_T], dim=-1))             # (E, D, 2F)
-            # FT down: (E, F, D). HF: (E, D, F). Single transpose.
-            w_down_ft.copy_(hf_down.transpose(-2, -1).contiguous().to(dtype))
+            w_up_ft.copy_(torch.cat([up_part, gate_part], dim=1).to(dtype))  # (E, 2F, D)
+            # FT down: (E, D, F). HF: (E, D, F). Direct copy.
+            w_down_ft.copy_(hf_down.to(dtype))
             continue
 
         # Per-expert fallback (older saves).
@@ -210,15 +209,15 @@ def _qwen3_next_post_load_hook(
                 continue
             per_expert_present = True
             with safe_open(shard_g, framework="pt", device="cpu") as f:
-                gate = f.get_tensor(gate_name)
+                gate = f.get_tensor(gate_name)            # (F, D)
             with safe_open(_open_for(up_name), framework="pt", device="cpu") as f:
-                up = f.get_tensor(up_name)
+                up = f.get_tensor(up_name)                # (F, D)
             with safe_open(_open_for(down_name), framework="pt", device="cpu") as f:
-                down = f.get_tensor(down_name)
-            gate_t = gate.T.contiguous().to(dtype)
-            up_t = up.T.contiguous().to(dtype)
-            w_up_ft[e, :, :].copy_(torch.cat([up_t, gate_t], dim=1))
-            w_down_ft[e, :, :].copy_(down.T.contiguous().to(dtype))
+                down = f.get_tensor(down_name)            # (D, F)
+            # FT w_up[e]: (2F, D) with [up; gate] cat along dim=0.
+            # FT w_down[e]: (D, F) — same orientation as HF.
+            w_up_ft[e, :, :].copy_(torch.cat([up.to(dtype), gate.to(dtype)], dim=0))
+            w_down_ft[e, :, :].copy_(down.to(dtype))
         if not per_expert_present:
             # Layer expected MoE weights but found none in either format.
             # Don't silently zero out — the engine will run with zero

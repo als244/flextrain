@@ -6,9 +6,9 @@ dense SwiGLU FFN with a stacked-expert MoE FFN.
 
 HF expert layout: ``model.layers.{L}.mlp.experts.{e}.{gate,up,down}_proj.weight``
 with shapes (F, d), (F, d), (d, F) — identical to OLMoE. FlexTrain
-stacks these into ``w_up (E, d, 2F)`` (packed ``[up, gate]`` = ``[x3, x1]``)
-and ``w_down (E, F, d)``. Router is ``w_router (d, E)`` (HF's
-``mlp.gate.weight`` transposed).
+stacks these into ``w_up (E, 2F, d)`` (packed ``[up; gate]`` = ``[x3, x1]``
+along the 2F axis) and ``w_down (E, d, F)``. Router is ``w_router (d, E)``
+(HF's ``mlp.gate.weight`` transposed).
 """
 from __future__ import annotations
 
@@ -39,11 +39,12 @@ def _qwen3_moe_post_load_hook(
     sample_w_up = dest.get(("layer_0", "w_up"))
     if sample_w_up is None:
         return
-    E, D, TwoF = sample_w_up.shape
+    # FT layout (post option-B migration): w_up is (E, 2F, D), w_down (E, D, F).
+    E, TwoF, D = sample_w_up.shape
     F = TwoF // 2
     sample_w_down = dest[("layer_0", "w_down")]
-    assert sample_w_down.shape == (E, F, D), (
-        f"w_down shape mismatch: expected ({E}, {F}, {D}), "
+    assert sample_w_down.shape == (E, D, F), (
+        f"w_down shape mismatch: expected ({E}, {D}, {F}), "
         f"got {tuple(sample_w_down.shape)}"
     )
 
@@ -82,10 +83,13 @@ def _qwen3_moe_post_load_hook(
         w_up_ft = dest[(f"layer_{L}", "w_up")]
         w_down_ft = dest[(f"layer_{L}", "w_down")]
         dtype = w_up_ft.dtype
-        gate_t = slot["gate"].T.contiguous().to(dtype)
-        up_t = slot["up"].T.contiguous().to(dtype)
-        w_up_ft[e, :, :].copy_(torch.cat([up_t, gate_t], dim=1))  # [x3, x1]
-        w_down_ft[e, :, :].copy_(slot["down"].T.contiguous().to(dtype))
+        # HF: gate/up are (F, D), down is (D, F).
+        # FT w_up[e]: (2F, D) with [up; gate] cat along dim=0 = [x3, x1].
+        # FT w_down[e]: (D, F) — same orientation as HF.
+        w_up_ft[e, :, :].copy_(
+            torch.cat([slot["up"].to(dtype), slot["gate"].to(dtype)], dim=0)
+        )
+        w_down_ft[e, :, :].copy_(slot["down"].to(dtype))
         del pending[(L, e)]
 
     for shard_path, wanted in wanted_by_shard.items():

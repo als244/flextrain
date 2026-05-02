@@ -8,19 +8,19 @@ OLMoE (AllenAI) is a dense-attention + MoE-FFN architecture:
 * No tied embeddings (the small 1B variant has distinct embed and lm_head).
 * Load-balance aux loss coef = 0.01.
 
-HF MoE weight layout vs FlexTrain's stacked ``w_up (E, d, 2*F)`` /
-``w_down (E, F, d)``:
+HF MoE weight layout vs FlexTrain's stacked ``w_up (E, 2*F, d)`` /
+``w_down (E, d, F)`` (post option-B migration):
 
 * HF:   ``model.layers.{L}.mlp.gate.weight``           — (E, d)    router
         ``model.layers.{L}.mlp.experts.{E}.gate_proj`` — (F, d)    per-expert gate (x1)
         ``model.layers.{L}.mlp.experts.{E}.up_proj``   — (F, d)    per-expert value (x3)
         ``model.layers.{L}.mlp.experts.{E}.down_proj`` — (d, F)    per-expert down
 * FT:   ``w_router (d, E)``  — HF gate transposed.
-        ``w_up (E, d, 2F)``  — per expert the packed layout is [x3, x1]
-                              (value first, gate second) to match the
-                              orig swiglu_moe kernel convention:
-                              ``concat([up.T, gate.T], dim=1)``.
-        ``w_down (E, F, d)`` — per expert: down_proj.T.
+        ``w_up (E, 2F, d)``  — per expert the packed layout along dim=0 of
+                              the (2F, d) slice is ``[x3, x1]`` (value
+                              first, gate second). Same orientation as HF
+                              gate_proj/up_proj — just stacked.
+        ``w_down (E, d, F)`` — per expert: same as HF down_proj.
 
 The ``post_load_hook`` iterates experts, reads the four per-expert HF
 tensors, transposes+stacks them into FT's layout, and writes into
@@ -48,11 +48,12 @@ def _olmoe_post_load_hook(
     if sample_w_up is None:
         # Model has no MoE layers declared — nothing to do.
         return
-    E, D, TwoF = sample_w_up.shape
+    # FT layout (post option-B migration): w_up is (E, 2F, D), w_down (E, D, F).
+    E, TwoF, D = sample_w_up.shape
     F = TwoF // 2
     sample_w_down = dest[("layer_0", "w_down")]
-    assert sample_w_down.shape == (E, F, D), (
-        f"w_down shape mismatch: expected ({E}, {F}, {D}), "
+    assert sample_w_down.shape == (E, D, F), (
+        f"w_down shape mismatch: expected ({E}, {D}, {F}), "
         f"got {tuple(sample_w_down.shape)}"
     )
 
@@ -98,12 +99,13 @@ def _olmoe_post_load_hook(
         w_up_ft = dest[(f"layer_{L}", "w_up")]
         w_down_ft = dest[(f"layer_{L}", "w_down")]
         dtype = w_up_ft.dtype
-        # Orig swiglu_moe kernel expects packed [x3, x1] = [value, gate]
-        # → concat([up.T, gate.T], dim=1). x3 (value) first, x1 second.
-        gate_t = slot["gate"].T.contiguous().to(dtype)
-        up_t = slot["up"].T.contiguous().to(dtype)
-        w_up_ft[e, :, :].copy_(torch.cat([up_t, gate_t], dim=1))
-        w_down_ft[e, :, :].copy_(slot["down"].T.contiguous().to(dtype))
+        # HF: gate/up are (F, D), down is (D, F).
+        # FT w_up[e]: (2F, D) packed [x3, x1] = [up; gate] cat along dim=0.
+        # FT w_down[e]: (D, F) — same orientation as HF.
+        w_up_ft[e, :, :].copy_(
+            torch.cat([slot["up"].to(dtype), slot["gate"].to(dtype)], dim=0)
+        )
+        w_down_ft[e, :, :].copy_(slot["down"].to(dtype))
         del pending[(L, e)]
 
     for shard_path, wanted in wanted_by_shard.items():
