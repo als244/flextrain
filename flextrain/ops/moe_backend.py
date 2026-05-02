@@ -856,14 +856,15 @@ class ScatterMoEExpertCompute:
         )
 
         # 3. d_w_down = group_bwd_W(DY=grouped_grad_out, X=post_act,
-        # offsets=expert_offsets). Accumulates into grads["g_down"]
-        # via .add_().
-        d_w_down, _ = scm_kernels.ops.group_bwd_W(
-            DY=grouped_grad_out, X=post_act,
-            expert_offsets=expert_offsets,
-            E=num_experts, has_bias=False,
-        )
+        # offsets=expert_offsets). Gated on grads.get("g_down") so the
+        # full GEMM is skipped under frozen-base / LoRA-only training
+        # (where g_down isn't in the grads dict).
         if grads.get("g_down") is not None:
+            d_w_down, _ = scm_kernels.ops.group_bwd_W(
+                DY=grouped_grad_out, X=post_act,
+                expert_offsets=expert_offsets,
+                E=num_experts, has_bias=False,
+            )
             # group_bwd_W returns DW as a (E, X_dim=F, DY_dim=d) view
             # over storage that is physically (E, d, F). Under option-B
             # layout, g_down is (E, d, F) — matches the underlying
@@ -903,19 +904,26 @@ class ScatterMoEExpertCompute:
             (d_post_act.float() * value.float() * d_silu_d_gate).to(d_post_act.dtype)
         )
 
-        # 6. d_w_up = group_bwd_W(DY=d_pre_act, X=grouped_x, ...)
-        # Need grouped_x — compute via group(x, sorted_scattered_idxs,
-        # fan_out=K). Allocates (TK, d).
-        grouped_x = scratch_fn((TK, d_model), x.dtype)
-        scm_kernels.ops.group(
-            x, sorted_scattered_idxs, fan_out=K, out=grouped_x,
+        # 6. d_w_up = group_bwd_W(DY=d_pre_act, X=grouped_x, ...).
+        # ``grouped_x`` is needed if EITHER the base wgrad runs OR the
+        # LoRA capture path is active (it stages grouped_x as
+        # scattered_x_grouped). Skip both the group() and group_bwd_W()
+        # calls when neither path needs them.
+        need_grouped_x = (
+            grads.get("g_up") is not None or lora_capture is not None
         )
-        d_w_up, _ = scm_kernels.ops.group_bwd_W(
-            DY=d_pre_act, X=grouped_x,
-            expert_offsets=expert_offsets,
-            E=num_experts, has_bias=False,
-        )
+        grouped_x = None
+        if need_grouped_x:
+            grouped_x = scratch_fn((TK, d_model), x.dtype)
+            scm_kernels.ops.group(
+                x, sorted_scattered_idxs, fan_out=K, out=grouped_x,
+            )
         if grads.get("g_up") is not None:
+            d_w_up, _ = scm_kernels.ops.group_bwd_W(
+                DY=d_pre_act, X=grouped_x,
+                expert_offsets=expert_offsets,
+                E=num_experts, has_bias=False,
+            )
             # Same permute pattern as g_down above: returned DW view is
             # (E, d, 2F) over (E, 2F, d) physical storage. g_up is
             # (E, 2F, d), so permute the view before .add_().
