@@ -427,14 +427,9 @@ class FlextrainMoEExpertCompute:
         scratch_fn: Callable[[tuple[int, ...], torch.dtype], torch.Tensor],
         dx: torch.Tensor | None = None,
         recompute_handoff: Any = None,
-        # Flextrain-only optional kwargs (LoRA hook + skip_grads).
-        # Not part of the protocol; this backend's caller in
-        # routed_swiglu_moe_bwd forwards them through. Other backends
-        # do not accept these.
-        skip_grads: frozenset[str] = frozenset(),
-        lora_per_expert_callback: object | None = None,
-        # Generic LoRA capture (Phase 2 plumbing — no-op when None).
-        # See ``MoEExpertCompute.bwd`` docstring for the dict contract.
+        # Generic LoRA capture (when not None, backend stages per-expert
+        # grouped intermediates that the wrapper's backward_wgrad
+        # consumes via grouped_mm finalize). See protocol docstring.
         lora_capture: dict[str, Any] | None = None,
     ) -> torch.Tensor:
         from flextrain.ops.full_moe import (
@@ -468,9 +463,9 @@ class FlextrainMoEExpertCompute:
         # 3. Per-expert bwd loop. Writes per-slot dx_up_up into
         #    ``dx_up_up_grouped`` and per-slot dx_pre into
         #    ``dx_pre_grouped`` (caller-allocated TK-sized buffers).
-        #    Accumulates g_up/g_down per-expert (or fires legacy LoRA
-        #    callback / skips when the wrapper supplies a deferred
-        #    lora_capture). Writes dprobs.
+        #    Accumulates g_up/g_down per-expert when grads.get(...) is
+        #    not None; otherwise the inline addmm is skipped (frozen
+        #    base / LoRA-only training pattern). Writes dprobs.
         srw = slot.scattered_router_weights[:TK, :]
         dprobs = torch.zeros_like(srw)
         # TK-sized output buffers — survive the loop so LoRA finalize
@@ -492,8 +487,6 @@ class FlextrainMoEExpertCompute:
             expert_dim=expert_dim,
             primary_stream=primary_stream,
             secondary_stream=secondary_stream,
-            skip_grads=skip_grads,
-            lora_per_expert_callback=lora_per_expert_callback,
         )
 
         # 4. Stage per-expert grouped intermediates for downstream LoRA
@@ -554,9 +547,6 @@ class ScatterMoEExpertCompute:
         produce dprobs in scattered layout for the router-gate-bwd.
 
     Limitations:
-      * No LoRA support: scattermoe doesn't expose a per-expert wgrad
-        hook, so ``skip_grads`` and ``lora_per_expert_callback`` are
-        rejected. Use the flextrain backend for LoRA.
       * No inline residual add in gather. Caller adds residual after.
     """
 
@@ -802,19 +792,9 @@ class ScatterMoEExpertCompute:
         scratch_fn: Callable[[tuple[int, ...], torch.dtype], torch.Tensor],
         dx: torch.Tensor | None = None,
         recompute_handoff: Any = None,
-        # Reject legacy per-expert callback machinery — that path was
-        # flextrain-only. Generic deferred LoRA via ``lora_capture`` is
-        # supported (populated below when not None).
-        skip_grads: frozenset[str] = frozenset(),
-        lora_per_expert_callback: object | None = None,
+        # Generic LoRA capture (populated below when not None).
         lora_capture: dict[str, Any] | None = None,
     ) -> torch.Tensor:
-        if skip_grads or lora_per_expert_callback is not None:
-            raise NotImplementedError(
-                "ScatterMoEExpertCompute does not support LoRA per-expert "
-                "callbacks (skip_grads / lora_per_expert_callback). Use "
-                "FlextrainMoEExpertCompute for LoRA."
-            )
         if recompute_handoff is not None:
             raise NotImplementedError(
                 "ScatterMoEExpertCompute does not support tier <3 recompute."
@@ -1349,17 +1329,9 @@ class SonicMoEExpertCompute:
         scratch_fn: Callable[[tuple[int, ...], torch.dtype], torch.Tensor],
         dx: torch.Tensor | None = None,
         recompute_handoff: Any = None,
-        # Reject legacy per-expert callback. Generic deferred LoRA via
-        # ``lora_capture`` (populated below when not None) is supported.
-        skip_grads: frozenset[str] = frozenset(),
-        lora_per_expert_callback: object | None = None,
+        # Generic LoRA capture (populated below when not None).
         lora_capture: dict[str, Any] | None = None,
     ) -> torch.Tensor:
-        if skip_grads or lora_per_expert_callback is not None:
-            raise NotImplementedError(
-                "SonicMoEExpertCompute does not support LoRA per-expert "
-                "callbacks. Use FlextrainMoEExpertCompute for LoRA."
-            )
         if recompute_handoff is not None:
             raise NotImplementedError(
                 "SonicMoEExpertCompute does not support tier <3 recompute."

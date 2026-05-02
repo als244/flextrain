@@ -273,20 +273,12 @@ class Qwen3MoEBlock:
                 slot.xo.view(-1, cfg.d_model), weights, slot.ffn_norm_rstd,
             )
 
-        # Legacy MoE LoRA path retained until Phase 7 cleanup.
-        skip_g_moe: frozenset[str] = frozenset()
-        moe_callback = None
-
-        # Phase 5 deferred-LoRA-wgrad capture: wrapper installs an
-        # empty dict; backend populates during bwd; wrapper's
-        # backward_wgrad consumes via grouped_mm finalize.
+        # MoE LoRA capture (deferred-wgrad path).
         moe_capture = slot.aux.get("__lora_moe_capture__")
 
         ffn_norm_upstream = self.ffn.bwd(
             dx, weights, grads, slot, ctx, chunk,
             layer_id=self.layer_id,
-            skip_grads=skip_g_moe,
-            lora_per_expert_callback=moe_callback,
             lora_capture=moe_capture,
         )
 

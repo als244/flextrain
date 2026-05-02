@@ -574,8 +574,6 @@ class MoESwiGLUSharedExpertFFN:
         # ------------------------------------------------------------------
         dx_via_routed = self._routed_ffn.bwd(
             dy_resid, weights, grads, slot, ctx, chunk, layer_id=layer_id,
-            skip_grads=skip_grads,
-            lora_per_expert_callback=lora_per_expert_callback,
             lora_capture=lora_capture,
         )
 

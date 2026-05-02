@@ -231,6 +231,16 @@ def _discover_lora_eligible_names(
             continue
         if nm in ("w_lin_qkvz", "w_lin_ba"):
             continue
+        # Shared-expert weights (w_shared_up, w_shared_down): not yet
+        # migrated to the deferred-LoRA-wgrad capture path. Their
+        # ParamSpec is independent of the routed-expert option-B
+        # layout migration. Excluded from lora_targets="all" until we
+        # wire shared experts through. Users who explicitly name them
+        # will hit a clear "slow scratch-dW path" error in
+        # accumulate_lora_grads (better than silently leaving the
+        # adapter grads at zero).
+        if nm.startswith("w_shared_"):
+            continue
         out.append(t.name)
     return tuple(out)
 
@@ -634,119 +644,6 @@ class LoRAWrapperLayer:
             inter.aux["lora_slow_scratch_grads"] = scratch_grads
         return upstream_dx, inter
 
-    def _make_moe_callback(
-        self,
-        moe_targets: frozenset[str],
-        weights: Mapping[str, torch.Tensor],
-        grads: MutableMapping[str, torch.Tensor],
-    ):
-        """Construct a closure
-        ``(g_name, eid, X, dY, dispatcher, stream_ptr, dY_B_buf, X_A_buf) -> None``
-        that ``ffn_moe.bwd`` calls per-expert (or once for router) for
-        each LoRA-targeted projection. The closure does the rank-r
-        matmul into the LoRA A/B grad accumulators directly via the
-        caller's cuBLASLt dispatcher fast path (CPython ``matmul_fast``,
-        bypassing ctypes entirely), so we never materialize the full
-        per-expert ``dW`` and never trip through PyTorch's matmul
-        dispatcher (~3x cheaper per call vs. eager ``@`` + ``.add_()``).
-
-        Math (per expert e, option-B layout: ``W: (E, out, in)``,
-        ``A: (E, in, r)``, ``B: (E, r, out)`` — A/B oriented so that
-        the LoRA delta ``A @ B`` is ``(E, in, out)``, transposed
-        relative to ``W``):
-
-            dA[e] = X^T @ (dY @ B[e]^T) * scale       shape (in, r)
-            dB[e] = (X @ A[e])^T @ dY * scale         shape (r, out)
-
-        For the 2-D router (eid=-1, ``W: (in, out)``, ``A: (in, r)``,
-        ``B: (r, out)``):
-
-            dA = X^T @ (dY @ B^T) * scale
-            dB = (X @ A)^T @ dY * scale
-
-        Note: the X/dY contract is layout-independent — X is the fwd
-        input to the projection, dY is the upstream grad at its
-        output. So this math is identical for option-A and option-B
-        base layouts; only the A/B factor shapes change.
-
-        ``dispatcher`` / ``stream_ptr`` come from the expert-loop's
-        per-iteration choice (primary or secondary stream — different
-        cuBLASLt contexts so workspaces don't race). ``dY_B_buf`` /
-        ``X_A_buf`` are caller-owned ``(max_T_e, max_rank)`` scratch
-        tensors on the same stream; we view a ``(T_e, r)`` slice of
-        each call. The callback exposes ``.max_rank`` so the expert
-        loop knows how to size them.
-        """
-        # Index targets by g_* name for fast lookup inside the loop.
-        cfg_by_g = {
-            f"g_{cfg.target_name[2:]}": cfg
-            for cfg in self.targets
-            if cfg.target_name in moe_targets
-        }
-        # Pre-pull A/B/ga/gb tensors and per-target scale once — the
-        # callback fires hundreds of times per layer; dict lookups in
-        # the hot loop dominate at this scale.
-        per_target = {}
-        for g_name, cfg in cfg_by_g.items():
-            per_target[g_name] = (
-                weights[cfg.a_name],
-                weights[cfg.b_name],
-                grads["g_" + cfg.a_name[2:]],
-                grads["g_" + cfg.b_name[2:]],
-                cfg.rank,
-                float(cfg.scale),
-            )
-
-        def _cb(g_name: str, eid: int,
-                X: torch.Tensor, dY: torch.Tensor,
-                dispatcher=None, stream_ptr: int = 0,
-                dY_B_buf: torch.Tensor | None = None,
-                X_A_buf: torch.Tensor | None = None) -> None:
-            tup = per_target.get(g_name)
-            if tup is None:
-                return
-            A_full, B_full, ga_full, gb_full, r, scale = tup
-            if eid >= 0:
-                A = A_full[eid]                             # (in, r)
-                B = B_full[eid]                             # (r, out)
-                ga = ga_full[eid]                           # (in, r)
-                gb = gb_full[eid]                           # (r, out)
-            else:
-                A, B, ga, gb = A_full, B_full, ga_full, gb_full
-
-            if dispatcher is None:
-                # Slow path (router callback): plain PyTorch @ + .add_().
-                # Cold; called at most once per layer.
-                dY_B = dY @ B.transpose(-1, -2)
-                dA = (X.transpose(-1, -2) @ dY_B) * scale
-                X_A = X @ A
-                dB = (X_A.transpose(-1, -2) @ dY) * scale
-                ga.add_(dA.to(ga.dtype))
-                gb.add_(dB.to(gb.dtype))
-                return
-
-            # Fast path: 4x dispatcher.matmul_fast (CPython METH_FASTCALL,
-            # cached cuBLASLt + fused epilogue). Per-stream scratch
-            # avoids any allocator hits.
-            T_e = X.shape[0]
-            dY_B = dY_B_buf[:T_e, :r]
-            X_A  = X_A_buf[:T_e, :r]
-            dispatcher.matmul_fast(stream_ptr, A=dY, B=B.T, D=dY_B)
-            dispatcher.matmul_fast(stream_ptr, A=X,  B=A,   D=X_A)
-            dispatcher.matmul_fast(
-                stream_ptr, A=X.T, B=dY_B,
-                C=ga, D=ga, alpha=scale, beta=1.0,
-            )
-            dispatcher.matmul_fast(
-                stream_ptr, A=X_A.T, B=dY,
-                C=gb, D=gb, alpha=scale, beta=1.0,
-            )
-
-        # Expose max_rank so the expert loop can pre-allocate (T, r)
-        # scratch buffers per stream.
-        _cb.max_rank = max(t[4] for t in per_target.values())
-        return _cb
-
     def _accumulate_moe_lora_grads_from_capture(
         self,
         capture: dict[str, torch.Tensor],
@@ -940,12 +837,26 @@ class LoRAWrapperLayer:
     # accumulate_lora_grads: the actual LoRA Wgrad math.
     # ------------------------------------------------------------------
 
-    # Names that go through the MoE per-expert callback path (accumulated
-    # inline inside ffn_moe.bwd / ffn_moe_shared.bwd, not via
-    # accumulate_lora_grads).
+    # Names that go through the deferred-LoRA-wgrad capture path
+    # (accumulated by ``_accumulate_moe_lora_grads_from_capture`` from
+    # the ``slot.aux["__lora_moe_capture__"]`` dict the backend
+    # populated). MoE expert weights only — 3-D ``(E, out, in)``
+    # tensors that the backend processes per-expert.
+    #
+    # NOT in this set:
+    # * ``w_router`` (2-D, MoE router): historically went through the
+    #   per-expert callback at routed_swiglu_moe_bwd's router step,
+    #   firing with ``eid=-1``. That legacy path was removed in Phase 7.
+    #   Router LoRA is currently unsupported. If needed, add a small
+    #   dedicated path that captures ``(ffn_norm_output, dlogits)``
+    #   from routed_swiglu_moe_bwd into the capture dict.
+    # * ``w_shared_expert_gate`` (2-D, shared expert gate): same story.
+    # * ``w_shared_up``, ``w_shared_down`` (3-D shared experts): not
+    #   yet migrated to option-B. Stay on the legacy callback path
+    #   (which goes through ffn_moe_shared.bwd) until shared experts
+    #   are migrated.
     _MOE_CALLBACK_TARGETS = frozenset((
-        "w_up", "w_down", "w_router",
-        "w_shared_up", "w_shared_down", "w_shared_expert_gate",
+        "w_up", "w_down",
     ))
 
     # torch.compile of the rank-r dA/dB block. Set FLEXTRAIN_LORA_COMPILE=0

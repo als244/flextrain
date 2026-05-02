@@ -255,8 +255,6 @@ def routed_swiglu_moe_bwd(
     scratch_fn: Callable[[tuple[int, ...], torch.dtype], torch.Tensor],
     expert_compute,                        # MoEExpertCompute backend
     scattered_x_recompute: torch.Tensor | None = None,
-    skip_grads: frozenset[str] = frozenset(),
-    lora_per_expert_callback: Callable | None = None,
     lora_capture: dict[str, Any] | None = None,
 ) -> torch.Tensor:
     """End-to-end routed-SwiGLU MoE backward. Returns
@@ -271,15 +269,14 @@ def routed_swiglu_moe_bwd(
     that ran earlier in this bwd iter); ``None`` causes the backend
     to re-scatter from ``ffn_norm_output``.
 
-    LoRA, two paths (transitional — Phase 7 will drop the legacy):
-    * Legacy (flextrain-only): ``skip_grads`` + ``lora_per_expert_callback``.
-      Per-expert callback fires inside the expert loop; backend skips
-      the wgrad addmm for skipped projections.
-    * Generic (all backends, deferred): ``lora_capture`` dict that
-      the backend populates with per-expert grouped intermediates
-      (see ``MoEExpertCompute.bwd`` docstring for the contract).
-      The wrapper's ``backward_wgrad`` consumes this dict to run
-      grouped_mm-batched dA/dB accumulation.
+    LoRA: ``lora_capture`` dict (when not None) is populated by the
+    backend with per-expert grouped intermediates that the
+    LoRAWrapperLayer's ``backward_wgrad`` consumes via
+    grouped_mm-batched dA/dB accumulation. See
+    ``MoEExpertCompute.bwd`` docstring for the dict contract.
+    Frozen-base / LoRA-only training: simply leave ``g_up`` /
+    ``g_down`` / ``g_router`` out of the ``grads`` dict; backend
+    skips the inline addmm when ``grads.get(...) is None``.
     """
     num_tokens, d_model = dy_resid.shape
     primary_stream_ptr = primary_stream.cuda_stream
@@ -300,11 +297,6 @@ def routed_swiglu_moe_bwd(
         "scratch_fn": scratch_fn,
         "recompute_handoff": scattered_x_recompute,
     }
-    # LoRA-only (flextrain backend accepts these as extra kwargs).
-    if skip_grads or lora_per_expert_callback is not None:
-        backend_bwd_kwargs["skip_grads"] = skip_grads
-        backend_bwd_kwargs["lora_per_expert_callback"] = lora_per_expert_callback
-    # Generic deferred-LoRA capture (all backends).
     if lora_capture is not None:
         backend_bwd_kwargs["lora_capture"] = lora_capture
     ffn_norm_upstream = expert_compute.bwd(
@@ -340,26 +332,24 @@ def routed_swiglu_moe_bwd(
         )
 
     # 7) Router weight gradient + downstream FFN-norm-upstream
-    # accumulation. dgrad always runs; wgrad is skip-able under LoRA.
+    # accumulation. dgrad always runs; wgrad skipped when frozen
+    # (``grads.get("g_router") is None``).
     dispatcher.matmul(
         primary_stream_ptr,
         A=dlogits, B=weights["w_router"].T,
         C=ffn_norm_upstream, D=ffn_norm_upstream,
         beta=1.0, alpha=1.0,
     )
-    if "g_router" in skip_grads:
-        if lora_per_expert_callback is not None:
-            lora_per_expert_callback(
-                "g_router", -1, ffn_norm_output, dlogits,
-            )
-    elif grads.get("g_router") is not None:
+    if grads.get("g_router") is not None:
         dispatcher.matmul(
             primary_stream_ptr,
             A=ffn_norm_output.T, B=dlogits,
             C=grads["g_router"], D=grads["g_router"],
             beta=1.0, alpha=1.0,
         )
-    # else: w_router frozen (LoRA on attn only). No wgrad to write.
+    # else: w_router frozen. No wgrad to write. (Router LoRA is not
+    # currently supported under the deferred-wgrad path; would need a
+    # dedicated capture entry for (ffn_norm_output, dlogits).)
 
     # Diagnostic dump of post-bwd grad accumulators (env-var-gated).
     if grads.get("g_up") is not None:
@@ -492,8 +482,6 @@ def swiglu_expert_loop_bwd(
     expert_dim: int,
     primary_stream: torch.cuda.Stream,
     secondary_stream: torch.cuda.Stream | None,
-    skip_grads: frozenset[str] = frozenset(),
-    lora_per_expert_callback: Callable | None = None,
 ) -> None:
     """SwiGLU expert-compute bwd loop.
 
@@ -505,9 +493,7 @@ def swiglu_expert_loop_bwd(
       * ``scattered_upstream`` is READ-ONLY across the loop — it is the
         upstream gradient at the down-projection output, used as the X
         for steps (a) (dgrad through w_down) and (c) (g_down wgrad).
-        The deferred-LoRA path needs it preserved so caller must NOT
-        rely on in-place overwrite for dx_pre output (it now goes to
-        ``dx_pre_grouped``).
+        The deferred-LoRA path needs it preserved.
       * ``dx_up_up_grouped`` and ``dx_pre_grouped`` are caller-allocated
         ``(TK, ·)`` buffers. The loop writes per-expert into
         ``[start:end]`` slices. After the loop they hold the full
@@ -520,21 +506,18 @@ def swiglu_expert_loop_bwd(
       b) ``dx_up_up_grouped[start:end] = swiglu_moe_bwd(...)`` — Triton
          fused; rescales by saved ``srw[start:end]``, computes per-slot
          d_router_weight, recomputes ``fwd_act`` (per-expert scratch).
-      c) Optional g_down wgrad (when not skipped):
-         ``g_down[e] += scattered_upstream[start:end].T @ fwd_act``
-         shape (d, T_e) @ (T_e, F) = (d, F).
+      c) ``g_down[e] += scattered_upstream[start:end].T @ fwd_act``
+         (d, T_e) @ (T_e, F) → (d, F). Skipped when
+         ``grads.get("g_down") is None`` (frozen base or LoRA-only).
       d) ``dx_pre_grouped[start:end] = dx_up_up_grouped[start:end] @ w_up[e]``
-         (T_e, 2F) @ (2F, d) = (T_e, d) — the dgrad at the FFN input
-         for this expert's tokens, written into the dx_pre buffer that
-         the gather will source from.
-      e) Optional g_up wgrad:
-         ``g_up[e] += dx_up_up_grouped[start:end].T @ scattered_x[start:end]``
-         shape (2F, T_e) @ (T_e, d) = (2F, d).
+         (T_e, 2F) @ (2F, d) = (T_e, d).
+      e) ``g_up[e] += dx_up_up_grouped[start:end].T @ scattered_x[start:end]``
+         (2F, T_e) @ (T_e, d) → (2F, d). Same skip rule as (c).
 
-    Steps a/d are dgrads (always run). Steps c/e are wgrads and may be
-    skipped via ``skip_grads`` (legacy callback path) or by simply
-    leaving ``grads.get("g_*") is None`` (frozen base + LoRA capture
-    path — backend skips the wgrad addmm; LoRA finalize replaces it).
+    LoRA: the deferred-wgrad path is owned by the caller's downstream
+    LoRA finalize (which reads from a ``lora_capture`` dict the caller
+    populates AFTER this loop returns). This function has no LoRA
+    awareness.
     """
     num_experts = w_up.shape[0]
     max_exp_tokens = int(expert_counts_cpu.max())
@@ -558,20 +541,6 @@ def swiglu_expert_loop_bwd(
     else:
         X_temp_odd = X_temp_even
         secondary_stream_ptr = primary_stream_ptr
-
-    # LoRA scratch: per-stream (max_T_e, r) buffers for the dY_B and X_A
-    # rank-r intermediates. Untracked, tiny (~MiB), keeps the per-expert
-    # callback free of allocator/dispatcher hops.
-    if lora_per_expert_callback is not None:
-        max_rank = getattr(lora_per_expert_callback, "max_rank", 0)
-        lora_dY_B_even = torch.empty(max_exp_tokens, max_rank, dtype=bf, device=device)
-        lora_X_A_even  = torch.empty(max_exp_tokens, max_rank, dtype=bf, device=device)
-        if use_secondary:
-            lora_dY_B_odd = torch.empty(max_exp_tokens, max_rank, dtype=bf, device=device)
-            lora_X_A_odd  = torch.empty(max_exp_tokens, max_rank, dtype=bf, device=device)
-        else:
-            lora_dY_B_odd = lora_dY_B_even
-            lora_X_A_odd  = lora_X_A_even
 
     cur_offset = 0
     for eid in range(num_experts):
@@ -599,15 +568,11 @@ def swiglu_expert_loop_bwd(
             cur_stream_ptr = secondary_stream_ptr
             cur_stream = secondary_stream
             X_temp = X_temp_odd
-            lora_dY_B = lora_dY_B_odd if lora_per_expert_callback is not None else None
-            lora_X_A  = lora_X_A_odd  if lora_per_expert_callback is not None else None
         else:
             cur_dispatcher = dispatcher
             cur_stream_ptr = primary_stream_ptr
             cur_stream = primary_stream
             X_temp = X_temp_even
-            lora_dY_B = lora_dY_B_even if lora_per_expert_callback is not None else None
-            lora_X_A  = lora_X_A_even  if lora_per_expert_callback is not None else None
 
         toff = 0
         dx_act_up = X_temp[toff : toff + n_exp_tokens * expert_dim].view(
@@ -630,19 +595,9 @@ def swiglu_expert_loop_bwd(
                 dx_act_up, x_preact, exp_probs,
                 dx=dx_up_up, dw=exp_dprobs, fwd_act=fwd_act,
             )
-            # c) g_down[e] += exp_upstream.T @ fwd_act  (or LoRA callback)
+            # c) g_down[e] += exp_upstream.T @ fwd_act
             #    (d, T_e) @ (T_e, F) → (d, F). g_down[e] is (d, F).
-            if "g_down" in skip_grads:
-                if lora_per_expert_callback is not None:
-                    # Callback X/dY contract is layout-independent: X is the
-                    # forward input to the projection (fwd_act), dY is the
-                    # upstream grad at its output (exp_upstream).
-                    lora_per_expert_callback(
-                        "g_down", eid, fwd_act, exp_upstream,
-                        cur_dispatcher, cur_stream_ptr,
-                        lora_dY_B, lora_X_A,
-                    )
-            elif grads.get("g_down") is not None:
+            if grads.get("g_down") is not None:
                 g_down_e = grads["g_down"][eid, :, :]
                 cur_dispatcher.matmul_fast(
                     cur_stream_ptr,
@@ -655,19 +610,10 @@ def swiglu_expert_loop_bwd(
             cur_dispatcher.matmul_fast(
                 cur_stream_ptr, A=dx_up_up, B=w_up_e, D=exp_dx_pre,
             )
-            # e) g_up[e] += dx_up_up.T @ scattered_x[start:end] (or LoRA callback)
+            # e) g_up[e] += dx_up_up.T @ scattered_x[start:end]
             #    (2F, T_e) @ (T_e, d) → (2F, d). g_up[e] is (2F, d).
-            exp_inp = scattered_x[start:end, :]
-            if "g_up" in skip_grads:
-                if lora_per_expert_callback is not None:
-                    # Callback X/dY contract: X = exp_inp (fwd input to up),
-                    # dY = dx_up_up (upstream grad at the (2F) output).
-                    lora_per_expert_callback(
-                        "g_up", eid, exp_inp, dx_up_up,
-                        cur_dispatcher, cur_stream_ptr,
-                        lora_dY_B, lora_X_A,
-                    )
-            elif grads.get("g_up") is not None:
+            if grads.get("g_up") is not None:
+                exp_inp = scattered_x[start:end, :]
                 g_up_e = grads["g_up"][eid, :, :]
                 cur_dispatcher.matmul_fast(
                     cur_stream_ptr,

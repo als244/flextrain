@@ -333,17 +333,10 @@ class Qwen3NextLinearLayer:
         capture_xy: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = (
             {} if skip_g_inline else None
         )
-        # Legacy MoE LoRA path (skip_grads + per-expert callback).
-        # Currently inactive — Phase 5 of the LoRA refactor switched the
-        # wrapper to install ``__lora_moe_capture__`` instead. Code
-        # path retained until Phase 7 cleanup.
-        skip_g_moe: frozenset[str] = frozenset()
-        moe_callback = None
-
-        # New MoE LoRA path: wrapper installs an empty capture dict;
-        # backend populates it during bwd; wrapper's backward_wgrad
-        # consumes it via grouped_mm-batched finalize. ``.get`` (not
-        # ``.pop``) — wrapper's wgrad reads it back.
+        # MoE LoRA: wrapper installs an empty capture dict in
+        # backward_dgrad; backend populates it during bwd; wrapper's
+        # backward_wgrad consumes it via grouped_mm-batched finalize.
+        # ``.get`` (not ``.pop``) — wrapper's wgrad reads it back.
         moe_capture = slot.aux.get("__lora_moe_capture__")
 
         # FFN-norm input is xo = x_inp + lin_out (post-residual), NOT
@@ -358,8 +351,6 @@ class Qwen3NextLinearLayer:
         ffn_norm_upstream = self.ffn.bwd(
             dx, weights, grads, slot, ctx, chunk,
             layer_id=self.layer_id,
-            skip_grads=skip_g_moe,
-            lora_per_expert_callback=moe_callback,
             lora_capture=moe_capture,
         )
         ffn_norm_fwd_output = slot.aux.pop("recompute_ffn_norm_output")
@@ -631,11 +622,7 @@ class Qwen3NextFullLayer:
         capture_xy: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = (
             {} if skip_g_inline else None
         )
-        # Legacy path retained until Phase 7 cleanup.
-        skip_g_moe: frozenset[str] = frozenset()
-        moe_callback = None
-
-        # Phase 5 deferred-LoRA-wgrad capture (replaces legacy callback).
+        # MoE LoRA capture (deferred-wgrad path; see qwen3_next docs).
         moe_capture = slot.aux.get("__lora_moe_capture__")
 
         if "recompute_ffn_norm_output" not in slot.aux:
@@ -646,8 +633,6 @@ class Qwen3NextFullLayer:
         ffn_norm_upstream = self.ffn.bwd(
             dx, weights, grads, slot, ctx, chunk,
             layer_id=self.layer_id,
-            skip_grads=skip_g_moe,
-            lora_per_expert_callback=moe_callback,
             lora_capture=moe_capture,
         )
 

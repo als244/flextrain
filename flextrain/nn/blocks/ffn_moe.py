@@ -341,22 +341,17 @@ class MoESwiGLUFFN:
         chunk: ChunkMeta,
         *,
         layer_id: int,
-        skip_grads: frozenset[str] = frozenset(),
-        lora_per_expert_callback: object | None = None,
         lora_capture: dict | None = None,
     ) -> torch.Tensor:
         """MoE backward. Thin caller of
         :func:`flextrain.ops.full_moe.routed_swiglu_moe_bwd`.
 
-        Two LoRA paths (Phase 7 will drop the legacy):
-
-        * Legacy (flextrain-only): ``skip_grads`` +
-          ``lora_per_expert_callback``. Per-expert callback fires
-          inside the expert loop; ``g_router`` is fired with
-          ``eid=-1``. Only the flextrain backend supports these.
-        * Generic (all backends): ``lora_capture`` dict the backend
-          populates with per-expert grouped intermediates that the
-          LoRA wrapper's ``backward_wgrad`` consumes via grouped_mm.
+        ``lora_capture`` (when not None) is a caller-owned dict the
+        backend populates with per-expert grouped intermediates that
+        the LoRA wrapper's ``backward_wgrad`` consumes via
+        grouped_mm-batched dA/dB accumulation. See the
+        ``MoEExpertCompute.bwd`` protocol docstring for the dict
+        contract.
         """
         cfg = self.cfg
         ffn_norm_output = slot.aux.get("recompute_ffn_norm_output", None)
@@ -380,8 +375,6 @@ class MoESwiGLUFFN:
             scratch_fn=ctx.scratch,
             expert_compute=self.expert_compute,
             scattered_x_recompute=recompute_handoff,
-            skip_grads=skip_grads,
-            lora_per_expert_callback=lora_per_expert_callback,
             lora_capture=lora_capture,
         )
 
