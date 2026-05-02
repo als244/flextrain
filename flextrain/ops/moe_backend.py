@@ -587,10 +587,16 @@ class ScatterMoEExpertCompute:
         from scattermoe import kernels as scm_kernels
         from scattermoe.parallel_experts import flatten_sort_count
 
-        # Dimensions.
+        # Dimensions. Option-B layout: w_up (E, 2F, d), w_down (E, d, F).
+        # Note: scattermoe's own ``ParallelExperts.weight`` stores
+        # (num_experts, output_size, input_size) = (E, out, in), which is
+        # exactly our new layout — see external_moe_impl/scattermoe/
+        # scattermoe/parallel_experts.py:151. We pass W.permute(0, 2, 1)
+        # to the scatter2scatter kernel below, mirroring scattermoe's own
+        # ``ParallelExperts.forward`` (line 177).
         num_experts = weights["w_up"].shape[0]
-        d_model = weights["w_up"].shape[1]
-        F = weights["w_down"].shape[1]
+        d_model = weights["w_up"].shape[2]
+        F = weights["w_down"].shape[2]
         T = x.shape[0]
         K = router_weights.shape[1]
         TK = T * K
@@ -625,9 +631,10 @@ class ScatterMoEExpertCompute:
         )
 
         # 3. Up-projection: scatter2scatter into pre-act.
-        # x: (T, d), w_up: (E, d, 2F), out: (TK, 2F) into slot.x_up.
+        # x: (T, d), w_up: (E, 2F, d) → permute to (E, d, 2F) view.
+        # Output: (TK, 2F) into slot.x_up.
         scm_kernels.ops.scatter2scatter(
-            X=x, W=weights["w_up"],
+            X=x, W=weights["w_up"].permute(0, 2, 1),
             sorted_expert_idxs=slot.scattermoe_sorted_expert_idxs,
             sorted_scattered_idxs=slot.scattermoe_sorted_scattered_idxs,
             k=K, x_grouped=False, y_grouped=True,
@@ -648,8 +655,10 @@ class ScatterMoEExpertCompute:
         # sum below. Matches scattermoe's GLUMLP output_experts call
         # which uses (grouped_in=True, grouped_out=False).
         out_expanded = scratch_fn((TK, d_model), x.dtype)
+        # w_down: (E, d, F) → permute to (E, F, d) view for the kernel
+        # (K=F = post_act.size(-1), N=d = output's last dim).
         scm_kernels.ops.scatter2scatter(
-            X=post_act, W=weights["w_down"],
+            X=post_act, W=weights["w_down"].permute(0, 2, 1),
             sorted_expert_idxs=slot.scattermoe_sorted_expert_idxs,
             sorted_scattered_idxs=slot.scattermoe_sorted_scattered_idxs,
             k=1, x_grouped=True, y_grouped=False,
@@ -736,10 +745,10 @@ class ScatterMoEExpertCompute:
             )
         from scattermoe import kernels as scm_kernels
 
-        # Dimensions.
+        # Dimensions. Option-B layout: w_up (E, 2F, d), w_down (E, d, F).
         num_experts = weights["w_up"].shape[0]
-        d_model = weights["w_up"].shape[1]
-        F = weights["w_down"].shape[1]
+        d_model = weights["w_up"].shape[2]
+        F = weights["w_down"].shape[2]
         T = dy.shape[0]
         K = slot.index_mapping.shape[1]
         TK = T * K
@@ -778,15 +787,20 @@ class ScatterMoEExpertCompute:
             E=num_experts, has_bias=False,
         )
         if grads.get("g_down") is not None:
-            # group_bwd_W returns DW in shape (E, X_dim, DY_dim) =
-            # (E, F, d_model) — already matches g_down's storage layout.
-            grads["g_down"].add_(d_w_down)
+            # group_bwd_W returns DW as a (E, X_dim=F, DY_dim=d) view
+            # over storage that is physically (E, d, F). Under option-B
+            # layout, g_down is (E, d, F) — matches the underlying
+            # storage. Permute the returned view to add into g_down.
+            grads["g_down"].add_(d_w_down.permute(0, 2, 1))
 
-        # 4. d_post_act = scatter2scatter(grouped_grad_out, w_down.permute(0,2,1), k=1, ...)
-        # produces (TK, F).
+        # 4. d_post_act = scatter2scatter(grouped_grad_out, W=w_down, ...)
+        # produces (TK, F). Under option-B, w_down: (E, d, F) — already
+        # the right orientation for the dgrad's K=d, N=F (drop the permute
+        # that the old layout needed). Non-contiguous strided W is fine
+        # — scattermoe's kernel uses raw strides.
         d_post_act = scratch_fn((TK, F), dy.dtype)
         scm_kernels.ops.scatter2scatter(
-            X=grouped_grad_out, W=weights["w_down"].permute(0, 2, 1).contiguous(),
+            X=grouped_grad_out, W=weights["w_down"],
             sorted_expert_idxs=sorted_expert_idxs,
             sorted_scattered_idxs=sorted_scattered_idxs,
             k=1, x_grouped=True, y_grouped=True,
@@ -825,13 +839,18 @@ class ScatterMoEExpertCompute:
             E=num_experts, has_bias=False,
         )
         if grads.get("g_up") is not None:
-            grads["g_up"].add_(d_w_up)
+            # Same permute pattern as g_down above: returned DW view is
+            # (E, d, 2F) over (E, 2F, d) physical storage. g_up is
+            # (E, 2F, d), so permute the view before .add_().
+            grads["g_up"].add_(d_w_up.permute(0, 2, 1))
 
-        # 7. d_x = scatter2scatter(d_pre_act, w_up.T, k=1, x_grouped=True, y_grouped=False)
-        # then sum over K.
+        # 7. d_x = scatter2scatter(d_pre_act, W=w_up, k=1, ...)
+        # then sum over K. Under option-B, w_up: (E, 2F, d) — already the
+        # right orientation for the dgrad (K=2F, N=d). Drop the permute
+        # the old layout needed.
         d_expanded_input = scratch_fn((TK, d_model), x.dtype)
         scm_kernels.ops.scatter2scatter(
-            X=d_pre_act, W=weights["w_up"].permute(0, 2, 1).contiguous(),
+            X=d_pre_act, W=weights["w_up"],
             sorted_expert_idxs=sorted_expert_idxs,
             sorted_scattered_idxs=sorted_scattered_idxs,
             k=1, x_grouped=True, y_grouped=False,
@@ -1032,10 +1051,10 @@ class SonicMoEExpertCompute:
         )
         from sonicmoe.functional.forward import _router_forward
 
-        # Dimensions.
+        # Dimensions. Option-B layout: w_up (E, 2F, d), w_down (E, d, F).
         num_experts = weights["w_up"].shape[0]
-        d_model = weights["w_up"].shape[1]
-        F = weights["w_down"].shape[1]
+        d_model = weights["w_up"].shape[2]
+        F = weights["w_down"].shape[2]
         T = x.shape[0]
         K = router_weights.shape[1]
         TK = T * K
@@ -1073,27 +1092,28 @@ class SonicMoEExpertCompute:
             torch.arange(TK, device=x.device, dtype=torch.int32),
         )
 
-        # Convert flextrain's (E, in, out) layout to sonicmoe's
-        # (E, out, in) contiguous storage.
+        # Layout bridge to sonicmoe's (E, out, in) storage:
         #
-        # CRITICAL — gating convention for w_up:
+        # GATING CONVENTION for w_up (unchanged from old layout):
         #   flextrain (and the parity-test reference) chunk(2) the
         #   pre-activation as `value, gate = pre.chunk(2, dim=-1)`,
         #   then compute `silu(gate) * value`. So flextrain's chunked
-        #   layout is [up_0..up_{F-1}, gate_0..gate_{F-1}] — UP FIRST,
+        #   layout along the 2F axis is [up_F, gate_F] — UP FIRST,
         #   GATE SECOND.
         #   sonicmoe's _swiglu does `g = x[..., 0::2]; u = x[..., 1::2]`
-        #   then `u * silu(g)` — i.e. EVEN indices = gate, ODD = up,
-        #   with concat_layout=False (its default).
-        # To convert: split flextrain's (up_half, gate_half), interleave
-        # so that gate ends up at even indices and up at odd indices.
-        up, gate = weights["w_up"].chunk(2, dim=-1)       # each (E, d, F); flextrain order is [up; gate]
-        w_up_interleaved = torch.stack([gate, up], dim=-1).reshape(
-            num_experts, d_model, 2 * F,
-        )                                                  # (E, d, [g_0, u_0, g_1, u_1, ...])
-        w_up_native = w_up_interleaved.transpose(1, 2).contiguous()  # (E, 2F_interleaved, d)
-        # w_down has no gating, simple transpose suffices.
-        w_down_native = weights["w_down"].transpose(1, 2).contiguous()  # (E, d, F)
+        #   then `u * silu(g)` — EVEN=gate, ODD=up, concat_layout=False.
+        # Conversion: split flextrain's chunked (up, gate) along the 2F
+        # axis (now dim=1 under option-B), interleave gate at even
+        # positions, up at odd.
+        #
+        # Option-B layout makes w_down a free pass-through: flextrain
+        # stores (E, d, F) which matches sonicmoe's expected w_down_native
+        # exactly — no transpose, no copy.
+        up, gate = weights["w_up"].chunk(2, dim=1)        # each (E, F, d); flextrain [up; gate] along dim=1
+        w_up_native = torch.stack([gate, up], dim=2).reshape(
+            num_experts, 2 * F, d_model,
+        )                                                  # (E, 2F_interleaved, d) — even=gate, odd=up; contiguous (stack+reshape allocs fresh storage)
+        w_down_native = weights["w_down"]                  # (E, d, F) — direct, sonicmoe's native shape under option-B
 
         # 4. Up-projection via gemm_gated. Mirror sonicmoe verbatim
         # (functional/__init__.py:114). MoE.forward passes
@@ -1168,19 +1188,21 @@ class SonicMoEExpertCompute:
         """
         from quack.gemm_interface import gemm_gated
 
+        # Option-B layout: w_up (E, 2F, d), w_down (E, d, F).
         num_experts = weights["w_up"].shape[0]
-        d_model = weights["w_up"].shape[1]
-        F = weights["w_down"].shape[1]
+        d_model = weights["w_up"].shape[2]
+        F = weights["w_down"].shape[2]
         T = x.shape[0]
         K = slot.chosen_experts.shape[1]
         TK = T * K
 
-        # Materialize sonicmoe-layout w_up (interleaved gate/up).
-        up, gate = weights["w_up"].chunk(2, dim=-1)
-        w_up_interleaved = torch.stack([gate, up], dim=-1).reshape(
-            num_experts, d_model, 2 * F,
-        )
-        w_up_native = w_up_interleaved.transpose(1, 2).contiguous()
+        # Materialize sonicmoe-layout w_up (interleaved gate/up). See fwd
+        # for the full gating convention discussion. Under option-B the
+        # chunk happens along dim=1 (the 2F axis), no extra transpose.
+        up, gate = weights["w_up"].chunk(2, dim=1)        # (E, F, d) each
+        w_up_native = torch.stack([gate, up], dim=2).reshape(
+            num_experts, 2 * F, d_model,
+        )                                                  # (E, 2F_interleaved, d)
 
         # Up-projection only — repopulates slot.x_up. Throwaway
         # postact_out scratch since we don't need a_post here.
@@ -1235,10 +1257,10 @@ class SonicMoEExpertCompute:
         )
         from flextrain.ops import flextrain_moe_scatter_routing_weights
 
-        # Dimensions.
+        # Dimensions. Option-B layout: w_up (E, 2F, d), w_down (E, d, F).
         num_experts = weights["w_up"].shape[0]
-        d_model = weights["w_up"].shape[1]
-        F = weights["w_down"].shape[1]
+        d_model = weights["w_up"].shape[2]
+        F = weights["w_down"].shape[2]
         T = dy.shape[0]
         K = slot.index_mapping.shape[1]
         TK = T * K
@@ -1250,16 +1272,14 @@ class SonicMoEExpertCompute:
             slot.router_weights[:T].reshape(-1).float().contiguous()
         )
 
-        # Convert flextrain's (E, in, out) layout to sonicmoe's
-        # (E, out, in) contiguous storage (see fwd comment for the
-        # full gating convention discussion). flextrain chunked order
-        # is [up; gate]; sonicmoe interleaves with even=gate, odd=up.
-        up, gate = weights["w_up"].chunk(2, dim=-1)       # each (E, d, F); flextrain [up; gate]
-        w_up_interleaved = torch.stack([gate, up], dim=-1).reshape(
-            num_experts, d_model, 2 * F,
-        )
-        w_up_native = w_up_interleaved.transpose(1, 2).contiguous()    # (E, 2F_interleaved, d)
-        w_down_native = weights["w_down"].transpose(1, 2).contiguous()  # (E, d, F)
+        # Layout bridge — see fwd for full discussion. Same construction:
+        # gating-aware interleave for w_up; w_down passes through
+        # unchanged (option-B's (E, d, F) matches sonicmoe natively).
+        up, gate = weights["w_up"].chunk(2, dim=1)        # (E, F, d) each; flextrain [up; gate] along dim 1
+        w_up_native = torch.stack([gate, up], dim=2).reshape(
+            num_experts, 2 * F, d_model,
+        )                                                  # (E, 2F_interleaved, d) — even=gate, odd=up
+        w_down_native = weights["w_down"]                  # (E, d, F) — direct, no copy
 
         # sonicmoe's bwd helpers expect `w1`/`w2` in the form that
         # MoE.forward constructs: `Experts.weight.permute(1, 2, 0)`.
@@ -1314,8 +1334,9 @@ class SonicMoEExpertCompute:
                 batch_idx_permute=None,
                 dynamic_scheduler=False,
             )
-            # dw_down_storage is (E, d, F); flextrain g_down is (E, F, d).
-            grads["g_down"].add_(dw_down_storage.transpose(1, 2))
+            # Under option-B layout, g_down is (E, d, F) — identical to
+            # dw_down_storage. Direct add, no transpose needed.
+            grads["g_down"].add_(dw_down_storage)
 
         # 3. Up-projection dgrad: dx_expanded (TK, d) = dh @ w_up^T.
         # _up_projection_backward_act handles the gemm internally — it
@@ -1352,14 +1373,13 @@ class SonicMoEExpertCompute:
                 dynamic_scheduler=False,
             )
             # dw_up_storage is (E, 2F_interleaved, d) — sonicmoe layout
-            # with interleaved gate(even)/up(odd). flextrain g_up is
-            # (E, d, [up; gate]) chunked (up first half, gate second).
-            # Transpose, then de-interleave back to flextrain's chunked
-            # [up; gate] order.
-            dw_up_view = dw_up_storage.transpose(1, 2)         # (E, d, 2F_interleaved)
-            dw_gate = dw_up_view[..., 0::2]                    # (E, d, F) — gate
-            dw_up_part = dw_up_view[..., 1::2]                 # (E, d, F) — up
-            grads["g_up"].add_(torch.cat([dw_up_part, dw_gate], dim=-1))
+            # with interleaved gate(even)/up(odd) along dim 1. Under
+            # option-B, g_up is (E, 2F, d) chunked [up; gate] along dim 1.
+            # The 2F axis is dim 1 in both — de-interleave directly along
+            # dim 1 and concat as [up; gate].
+            dw_gate = dw_up_storage[:, 0::2, :]                # (E, F, d) — gate
+            dw_up_part = dw_up_storage[:, 1::2, :]             # (E, F, d) — up
+            grads["g_up"].add_(torch.cat([dw_up_part, dw_gate], dim=1))
 
         # 5. dx_reduced = sum_k dx_expanded[scatter_pos(t, k)]: K-dim
         # reduction back to per-token dx.

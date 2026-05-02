@@ -61,8 +61,9 @@ def main():
     expert_idxs = expert_idxs.to(torch.int32)
 
     weights = {
-        "w_up": torch.randn(E, d_model, 2 * F, device=device, dtype=dtype) / (d_model ** 0.5),
-        "w_down": torch.randn(E, F, d_model, device=device, dtype=dtype) / (F ** 0.5),
+        # Option-B layout: w_up (E, 2F, d), w_down (E, d, F).
+        "w_up": torch.randn(E, 2 * F, d_model, device=device, dtype=dtype) / (d_model ** 0.5),
+        "w_down": torch.randn(E, d_model, F, device=device, dtype=dtype) / (F ** 0.5),
     }
 
     backend = ScatterMoEExpertCompute()
