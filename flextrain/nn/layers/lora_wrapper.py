@@ -279,7 +279,15 @@ def _make_lora_specs(
         )
         return a, b
     if len(base_shape) == 3:
-        E, d_in, d_out = base_shape
+        # Option-B layout: 3-D MoE expert weights are stored as
+        # ``(E, out, in)`` (matching HF gate_up_proj / down_proj). LoRA
+        # convention (PEFT-compatible): ``A: (E, in, R)``, ``B: (E, R, out)``
+        # so that ``delta_W = A @ B`` is ``(E, in, out)``, which is the
+        # transpose of the underlying base weight orientation. The
+        # effective-weights builder accumulates this delta into ``W``
+        # by computing ``W + (B.T @ A.T) * scale`` per expert (= a
+        # transposed-delta view written into the (out, in) buffer).
+        E, d_out, d_in = base_shape
         a = TensorSpec(
             name=cfg.a_name,
             shape_fn=lambda d, EE=E, di=d_in, R=r: (EE, di, R),
@@ -406,29 +414,32 @@ class LoRAWrapperLayer:
         every LoRA target. Non-target weights pass through unchanged.
 
         2-D path: standard ``W' = W + (A @ B) * scale`` via PyTorch
-        matmul. The intermediate delta tensor is small enough not to
-        matter.
+        matmul. ``W: (in, out)``, ``A: (in, r)``, ``B: (r, out)``.
+        The intermediate delta tensor is small enough not to matter.
 
-        3-D MoE expert stack path (``W: (E, d_in, d_out)``,
-        ``A: (E, d_in, r)``, ``B: (E, r, d_out)``): we used to do
-        ``torch.bmm(A, B) * scale`` which materializes a full
-        ``(E, d_in, d_out)`` delta — at fp32 (the default LoRA
-        adapter dtype matching HF PEFT) this is 1 GiB for
-        Qwen3.5-MoE-35B's ``w_up`` (E=256, d_in=512, d_out=1024) and
-        OOMs a 24 GiB GPU. The fix: allocate ``eff`` as a single
-        ``(E, d_in, d_out)`` tensor in W's dtype (typically bf16),
-        then loop over experts using the cuBLASLt dispatcher's fused
-        ``D = alpha * (A_e @ B_e) + beta * C`` to write
-        ``eff[e] = scale * (A[e] @ B[e]) + W[e]`` directly. Same final
-        bytes as before but avoids the fp32 intermediate; total is
-        ~256 MiB per LoRA target at bf16 vs the prior >1.5 GiB peak.
+        3-D MoE expert stack path under option-B layout
+        (``W: (E, out, in)``, ``A: (E, in, r)``, ``B: (E, r, out)``):
+        the LoRA delta is ``A @ B`` shaped ``(E, in, out)``, which
+        is the *transpose* of ``W``'s ``(E, out, in)`` orientation.
+        Per expert, we compute ``eff_W[e] = W[e] + (B[e].T @ A[e].T) * scale``
+        — equivalently ``W[e] + (A[e] @ B[e]).T * scale`` but written
+        as a single dispatcher.matmul without materializing the
+        intermediate transpose. ``B[e].T: (out, r)`` and
+        ``A[e].T: (r, in)`` are non-contiguous views; the dispatcher
+        handles row-major OR col-major inputs natively, so no
+        ``.contiguous()`` is needed.
+
+        Pre-allocate one full effective buffer in W's dtype; the
+        caching allocator reuses it between layer forwards. Total
+        steady-state cost is one ``(E, out, in)`` buffer per LoRA
+        target at bf16 (~256 MiB for Qwen3.5-MoE-35B's w_up).
 
         The dispatcher requires A/B/C/D share dtype, so we cast A and
-        B to W's dtype per-expert. For typical attn LoRA on dense
-        layers the master/grad dtypes default to bf16 so this is a
-        no-op; for fp32 LoRA masters (HF PEFT parity) the cast happens
-        at compute time and the higher-precision update flows through
-        the optimizer step on host masters as usual.
+        B to W's dtype. For typical attn LoRA the master/grad dtypes
+        default to bf16 so this is a no-op; for fp32 LoRA masters
+        (HF PEFT parity) the cast happens at compute time and the
+        higher-precision update flows through the optimizer step on
+        host masters as usual.
         """
         from flextrain.ops import dispatcher
         eff = dict(weights)
@@ -443,25 +454,18 @@ class LoRAWrapperLayer:
                 delta = (A @ B) * cfg.scale
                 eff[cfg.target_name] = (W + delta.to(W.dtype)).contiguous()
             elif W.dim() == 3:
-                E, d_in, d_out = W.shape
-                # Pre-allocate one full effective buffer in W's dtype.
-                # PyTorch's caching allocator reuses these between
-                # successive layer forwards, so the steady-state cost
-                # is one (E, d_in, d_out) buffer per LoRA target —
-                # not multiplied by E.
+                E, d_out, d_in = W.shape
                 eff_W = torch.empty(
-                    (E, d_in, d_out), dtype=W.dtype, device=W.device,
+                    (E, d_out, d_in), dtype=W.dtype, device=W.device,
                 )
-                # Ensure A, B match W's dtype (dispatcher requires
-                # all four tensors share dtype). Cheap when already
-                # equal; allocates per-expert otherwise.
                 A_w = A if A.dtype == W.dtype else A.to(W.dtype)
                 B_w = B if B.dtype == W.dtype else B.to(W.dtype)
                 for e in range(E):
-                    # eff_W[e] = scale * (A[e] @ B[e]) + W[e]
+                    # eff_W[e] = scale * (B[e].T @ A[e].T) + W[e]
+                    # Shapes: (out, r) @ (r, in) = (out, in) ✓
                     dispatcher.matmul(
                         stream_ptr,
-                        A=A_w[e], B=B_w[e],
+                        A=B_w[e].T, B=A_w[e].T,
                         C=W[e], D=eff_W[e],
                         alpha=cfg.scale, beta=1.0,
                     )
@@ -635,8 +639,10 @@ class LoRAWrapperLayer:
         per-expert ``dW`` and never trip through PyTorch's matmul
         dispatcher (~3x cheaper per call vs. eager ``@`` + ``.add_()``).
 
-        Math (per expert e, projection name with stored ``W: (E, in,
-        out)``, ``A: (E, in, r)``, ``B: (E, r, out)``):
+        Math (per expert e, option-B layout: ``W: (E, out, in)``,
+        ``A: (E, in, r)``, ``B: (E, r, out)`` — A/B oriented so that
+        the LoRA delta ``A @ B`` is ``(E, in, out)``, transposed
+        relative to ``W``):
 
             dA[e] = X^T @ (dY @ B[e]^T) * scale       shape (in, r)
             dB[e] = (X @ A[e])^T @ dY * scale         shape (r, out)
@@ -646,6 +652,11 @@ class LoRAWrapperLayer:
 
             dA = X^T @ (dY @ B^T) * scale
             dB = (X @ A)^T @ dY * scale
+
+        Note: the X/dY contract is layout-independent — X is the fwd
+        input to the projection, dY is the upstream grad at its
+        output. So this math is identical for option-A and option-B
+        base layouts; only the A/B factor shapes change.
 
         ``dispatcher`` / ``stream_ptr`` come from the expert-loop's
         per-iteration choice (primary or secondary stream — different
