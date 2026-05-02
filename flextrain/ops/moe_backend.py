@@ -1469,12 +1469,22 @@ class SonicMoEExpertCompute:
         )
 
         # Stage per-expert grouped intermediates for downstream LoRA
-        # finalize. Sonic doesn't naturally materialize gathered x / dy
-        # — its kernels use gather indices internally. When LoRA is
-        # active, materialize them here (one index_select each, ~ TK * d
-        # bf16 each ≈ 256 MiB at TK=65536, d=2048). dh is the existing
-        # (TK, 2F) buffer from step 1, no new alloc.
-        # See MoEExpertCompute.bwd docstring for the dict contract.
+        # finalize. Sonic differs from flextrain/scatter in three ways:
+        #
+        # 1. Sonic uses gather-indexing internally — no naturally-
+        #    materialized gathered x / dy. Materialize via index_select
+        #    (~256 MiB each at TK=65536, d=2048, bf16).
+        #
+        # 2. Sonic stores the pre-SwiGLU activation and its gradient
+        #    in INTERLEAVED gate/up layout (even=gate, odd=up); the
+        #    LoRA finalize and the LoRA factor B both use the
+        #    flextrain CHUNKED convention ([up_F, gate_F] along the
+        #    2F axis). Deinterleave both ``dh`` and ``slot.x_up`` to
+        #    chunked before staging.
+        #
+        # 3. expert_offsets — sonic_expert_frequency_offset has leading
+        #    0, length E+1. grouped_mm wants (E,) cumulative ending
+        #    in TK; slice off the 0.
         if lora_capture is not None:
             x_gather_idx_long = slot.sonic_x_gather_idx[:TK].long()
             scattered_x_grouped = scratch_fn((TK, d_model), x.dtype)
@@ -1483,12 +1493,24 @@ class SonicMoEExpertCompute:
             scattered_upstream_grouped.copy_(
                 dy.index_select(0, x_gather_idx_long)
             )
-            # sonic_expert_frequency_offset has leading 0, length E+1.
-            # grouped_mm wants (E,) cumulative ending in TK; slice off the 0.
+            # Deinterleave dh: even=gate, odd=up → chunked [up, gate].
+            # Two slices are non-contiguous; concat materializes a fresh
+            # contiguous (TK, 2F) tensor.
+            dh_up = dh[:, 1::2]                          # (TK, F) — up
+            dh_gate = dh[:, 0::2]                        # (TK, F) — gate
+            dx_up_up_chunked = torch.cat([dh_up, dh_gate], dim=-1)
+            # Deinterleave slot.x_up the same way (sonic's preact is
+            # also interleaved — gemm_gated wrote it in sonic's native
+            # format).
+            x_up_inter = slot.x_up[:TK]
+            x_up_up_part = x_up_inter[:, 1::2]            # (TK, F) — up
+            x_up_gate_part = x_up_inter[:, 0::2]          # (TK, F) — gate
+            x_up_chunked = torch.cat([x_up_up_part, x_up_gate_part], dim=-1)
+
             lora_capture["scattered_x_grouped"] = scattered_x_grouped
-            lora_capture["dx_up_up_grouped"] = dh
+            lora_capture["dx_up_up_grouped"] = dx_up_up_chunked
             lora_capture["scattered_upstream_grouped"] = scattered_upstream_grouped
-            lora_capture["x_up_grouped"] = slot.x_up[:TK]
+            lora_capture["x_up_grouped"] = x_up_chunked
             lora_capture["expert_offsets"] = (
                 slot.sonic_expert_frequency_offset[1:]
             )

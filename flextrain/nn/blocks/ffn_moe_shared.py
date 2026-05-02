@@ -376,6 +376,7 @@ class MoESwiGLUSharedExpertFFN:
         layer_id: int,
         skip_grads: frozenset[str] = frozenset(),
         lora_per_expert_callback: object | None = None,
+        lora_capture: dict | None = None,
     ) -> torch.Tensor:
         """Backward.
 
@@ -575,6 +576,7 @@ class MoESwiGLUSharedExpertFFN:
             dy_resid, weights, grads, slot, ctx, chunk, layer_id=layer_id,
             skip_grads=skip_grads,
             lora_per_expert_callback=lora_per_expert_callback,
+            lora_capture=lora_capture,
         )
 
         # Combine all three dx contributions.
