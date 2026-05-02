@@ -7,16 +7,17 @@ reference that computes the same gradients via PyTorch's per-expert
 math. Backend-agnostic — the finalize only consumes (X, dY, A, B,
 scale, offs); backends produce these via their own bwd.
 
-Run:
-  ssh della "ssh della-k14g2 'source ~/.bashrc && conda activate flextrain && cd ~/flextrain-migration && PYTHONPATH=. python tests/moe/test_lora_moe_finalize.py'"
+Requires CUDA + bf16 + sm_80+ for ``torch.nn.functional.grouped_mm``.
+
+Run from repo root with the CUDA runtime libs on LD_LIBRARY_PATH:
+  PYTHONPATH=. python tests/moe/test_lora_moe_finalize.py
 """
 from __future__ import annotations
 
 import sys
+
 import torch
 import torch.nn.functional as F
-
-sys.path.insert(0, "/home/as1669/flextrain-migration")
 
 from flextrain.nn.layers.lora_wrapper import (
     LoRAWrapperLayer,

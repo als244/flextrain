@@ -21,13 +21,22 @@ LoRA is purely a layer-level wrapper.
 
 Caveats / current limitations
 -----------------------------
-* W' = W + B@A*s is materialized fresh each forward call. For very
-  large W this adds memory + compute (one extra GEMM per LoRA target
-  per fwd). With the default rank=16 the cost is ~r/d_out fraction
-  of the base matmul — negligible.
-* LoRA targets must be 2-D linear projections. 3-D MoE expert stacks
-  are not supported by this wrapper (use a per-expert LoRA in the MoE
-  block as a future extension).
+* W' = W + A@B*scale is materialized fresh each forward call. For
+  very large W this adds memory + compute (one extra GEMM per LoRA
+  target per fwd). With the default rank=16 the cost is ~r/d_out
+  fraction of the base matmul — negligible.
+* LoRA targets can be 2-D dense projections (Q/K/V/O, MLP up/down,
+  etc.) OR 3-D MoE routed-expert stacks (``w_up``, ``w_down``).
+  The 3-D path uses a deferred-wgrad pipeline: backend stages
+  per-expert grouped intermediates into
+  ``slot.aux["__lora_moe_capture__"]`` during bwd; the wrapper's
+  :meth:`backward_wgrad` consumes them via
+  :func:`torch.nn.functional.grouped_mm`-batched dA/dB accumulation.
+  See :meth:`_accumulate_moe_lora_grads_from_capture` for the math.
+* MoE router (``w_router``), shared-expert weights
+  (``w_shared_up``, ``w_shared_down``), and shared-expert gate
+  (``w_shared_expert_gate``) are NOT currently supported — see
+  the comment block above ``_MOE_CALLBACK_TARGETS`` for context.
 * The wrapper currently supports any base layer that exposes its
   ``param_spec``, ``schema``, and the standard
   ``forward / forward_recompute / backward / compute_cost`` methods.
@@ -840,21 +849,25 @@ class LoRAWrapperLayer:
     # Names that go through the deferred-LoRA-wgrad capture path
     # (accumulated by ``_accumulate_moe_lora_grads_from_capture`` from
     # the ``slot.aux["__lora_moe_capture__"]`` dict the backend
-    # populated). MoE expert weights only — 3-D ``(E, out, in)``
+    # populated). MoE routed-expert weights only — 3-D ``(E, out, in)``
     # tensors that the backend processes per-expert.
     #
-    # NOT in this set:
-    # * ``w_router`` (2-D, MoE router): historically went through the
-    #   per-expert callback at routed_swiglu_moe_bwd's router step,
-    #   firing with ``eid=-1``. That legacy path was removed in Phase 7.
-    #   Router LoRA is currently unsupported. If needed, add a small
-    #   dedicated path that captures ``(ffn_norm_output, dlogits)``
-    #   from routed_swiglu_moe_bwd into the capture dict.
-    # * ``w_shared_expert_gate`` (2-D, shared expert gate): same story.
-    # * ``w_shared_up``, ``w_shared_down`` (3-D shared experts): not
-    #   yet migrated to option-B. Stay on the legacy callback path
-    #   (which goes through ffn_moe_shared.bwd) until shared experts
-    #   are migrated.
+    # The following targets are NOT supported under LoRA right now and
+    # are explicitly excluded from ``_discover_lora_eligible_names``
+    # so that ``lora_targets="all"`` doesn't pick them up. Users who
+    # explicitly target them will hit a clear "slow scratch-dW" error
+    # in :meth:`accumulate_lora_grads`:
+    #
+    # * ``w_router`` (2-D MoE router): would need a small dedicated
+    #   capture for ``(ffn_norm_output, dlogits)`` in
+    #   :func:`routed_swiglu_moe_bwd`. Niche — PEFT defaults exclude
+    #   routers anyway.
+    # * ``w_shared_expert_gate`` (2-D, shared-expert gate): same story.
+    # * ``w_shared_up``, ``w_shared_down`` (3-D shared experts): the
+    #   shared-expert ParamSpec wasn't migrated to option-B in stage 1,
+    #   so the LoRA factor shapes / capture pipeline don't fit yet.
+    #   Add when shared experts migrate (e.g., when DeepSeek-V3-style
+    #   S>1 shared experts come up).
     _MOE_CALLBACK_TARGETS = frozenset((
         "w_up", "w_down",
     ))
@@ -873,14 +886,16 @@ class LoRAWrapperLayer:
         ctx: LayerContext,
     ) -> None:
         """Compute and accumulate ``dA, dB`` for LoRA targets that
-        weren't handled inline.
+        weren't already accumulated by an upstream specialized path.
 
         Three routing paths:
 
-        1. **Inline MoE callback** (``w_up, w_down, w_router``): handled
-           per-expert inside ``ffn_moe.bwd`` via the callback we
-           installed in :meth:`backward_dgrad`. ``dA, dB`` are already
-           accumulated. Skipped here.
+        1. **MoE deferred-wgrad capture** (``w_up``, ``w_down``):
+           accumulated by ``_accumulate_moe_lora_grads_from_capture``
+           inside :meth:`backward_wgrad`, consuming the
+           ``slot.aux["__lora_moe_capture__"]`` dict the backend
+           populated. ``dA, dB`` are already in ``grads`` by the time
+           this method runs; skipped here.
 
         2. **Dense fast path** (entry in
            ``intermediates.proj_inputs_and_grads``): rank-r matmuls
@@ -900,8 +915,8 @@ class LoRAWrapperLayer:
         for cfg in self.targets:
             target = cfg.target_name
             if target in self._MOE_CALLBACK_TARGETS:
-                # Already accumulated inside ffn_moe.bwd via the
-                # per-expert callback. Skip here.
+                # Already accumulated by _accumulate_moe_lora_grads_
+                # from_capture in backward_wgrad. Skip here.
                 continue
             ga = grads["g_" + cfg.a_name[2:]]
             gb = grads["g_" + cfg.b_name[2:]]

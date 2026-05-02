@@ -622,7 +622,8 @@ class Qwen3NextFullLayer:
         capture_xy: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = (
             {} if skip_g_inline else None
         )
-        # MoE LoRA capture (deferred-wgrad path; see qwen3_next docs).
+        # MoE LoRA: same protocol as the linear-attn variant above
+        # (see backward_dgrad's MoE LoRA comment block).
         moe_capture = slot.aux.get("__lora_moe_capture__")
 
         if "recompute_ffn_norm_output" not in slot.aux:

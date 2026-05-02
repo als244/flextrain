@@ -374,8 +374,6 @@ class MoESwiGLUSharedExpertFFN:
         chunk: ChunkMeta,
         *,
         layer_id: int,
-        skip_grads: frozenset[str] = frozenset(),
-        lora_per_expert_callback: object | None = None,
         lora_capture: dict | None = None,
     ) -> torch.Tensor:
         """Backward.
@@ -459,24 +457,14 @@ class MoESwiGLUSharedExpertFFN:
 
             # w_shared_expert_gate grad / dx via gate. Shape (d, 1) and
             # (T, d). bf16 throughout.
-            if "g_shared_expert_gate" in skip_grads:
-                if lora_per_expert_callback is not None:
-                    lora_per_expert_callback(
-                        "g_shared_expert_gate", -1, x_2d, d_sh_gate_pre,
-                    )
-            elif grads.get("g_shared_expert_gate") is not None:
+            if grads.get("g_shared_expert_gate") is not None:
                 grads["g_shared_expert_gate"].addmm_(x_2d.T, d_sh_gate_pre)
             dx_via_gate = d_sh_gate_pre @ weights["w_shared_expert_gate"].T  # (T, d) bf16
 
             # Down-proj bwd: sh_each = sh_act @ w_down.
             # d_sh_act = d_sh_each @ w_down.T;
             # g_w_down += sh_act.T @ d_sh_each.
-            if "g_shared_down" in skip_grads:
-                if lora_per_expert_callback is not None:
-                    lora_per_expert_callback(
-                        "g_shared_down", 0, sh_act_2d, d_sh_each_2d,
-                    )
-            elif grads.get("g_shared_down") is not None:
+            if grads.get("g_shared_down") is not None:
                 # Stored shape: (S=1, F, d).
                 grads["g_shared_down"][0].addmm_(sh_act_2d.T, d_sh_each_2d)
             d_sh_act_2d = d_sh_each_2d @ w_down.T                            # (T, F) bf16
@@ -491,12 +479,7 @@ class MoESwiGLUSharedExpertFFN:
             # d_sh_pre = cat([d_up, d_gate], dim=-1) (T, 2F).
             # g_w_up += x.T @ d_sh_pre; dx += d_sh_pre @ w_up.T.
             d_x_shared_pre_2d = torch.cat([d_up_2d, d_gate_2d], dim=-1)      # (T, 2F)
-            if "g_shared_up" in skip_grads:
-                if lora_per_expert_callback is not None:
-                    lora_per_expert_callback(
-                        "g_shared_up", 0, x_2d, d_x_shared_pre_2d,
-                    )
-            elif grads.get("g_shared_up") is not None:
+            if grads.get("g_shared_up") is not None:
                 grads["g_shared_up"][0].addmm_(x_2d.T, d_x_shared_pre_2d)
             dx_via_shared_mlp = d_x_shared_pre_2d @ w_up.T                   # (T, d) bf16
 
@@ -522,23 +505,11 @@ class MoESwiGLUSharedExpertFFN:
                 d_sh_gate.float() * sig_gate_f * (1.0 - sig_gate_f)
             ).to(dy_resid.dtype)                                             # (T, S)
 
-            if "g_shared_expert_gate" in skip_grads:
-                if lora_per_expert_callback is not None:
-                    lora_per_expert_callback(
-                        "g_shared_expert_gate", -1, x_2d, d_sh_gate_pre,
-                    )
-            elif grads.get("g_shared_expert_gate") is not None:
+            if grads.get("g_shared_expert_gate") is not None:
                 grads["g_shared_expert_gate"].addmm_(x_2d.T, d_sh_gate_pre)
             dx_via_gate = d_sh_gate_pre @ weights["w_shared_expert_gate"].T  # (T, d)
 
-            if "g_shared_down" in skip_grads:
-                if lora_per_expert_callback is not None:
-                    for eid in range(S):
-                        lora_per_expert_callback(
-                            "g_shared_down", eid,
-                            sh_act[:, eid, :], d_sh_each[:, eid, :],
-                        )
-            elif grads.get("g_shared_down") is not None:
+            if grads.get("g_shared_down") is not None:
                 grads["g_shared_down"].add_(
                     torch.einsum("tsf,tsd->sfd", sh_act, d_sh_each)
                 )
@@ -550,14 +521,7 @@ class MoESwiGLUSharedExpertFFN:
             d_gate, d_up = flextrain_swiglu_bwd(gate_c, up_c, d_sh_act)
             d_x_shared_pre = torch.cat([d_up, d_gate], dim=-1)               # (T, S, 2F)
 
-            if "g_shared_up" in skip_grads:
-                if lora_per_expert_callback is not None:
-                    for eid in range(S):
-                        lora_per_expert_callback(
-                            "g_shared_up", eid,
-                            x_2d, d_x_shared_pre[:, eid, :],
-                        )
-            elif grads.get("g_shared_up") is not None:
+            if grads.get("g_shared_up") is not None:
                 grads["g_shared_up"].add_(
                     torch.einsum("td,tsf->sdf", x_2d, d_x_shared_pre)
                 )
@@ -568,9 +532,9 @@ class MoESwiGLUSharedExpertFFN:
         # ------------------------------------------------------------------
         # Routed path bwd — delegate. The inner block accumulates
         # g_router/g_up/g_down into ``grads`` and returns dx_via_routed.
-        # ``skip_grads`` and ``lora_per_expert_callback`` plumb through:
-        # the routed path's g_router/g_up/g_down get the same fast-path
-        # treatment as a non-shared MoE.
+        # ``lora_capture`` (when not None) is forwarded so the routed
+        # backend can stage per-expert grouped intermediates for the
+        # downstream LoRA wgrad finalize.
         # ------------------------------------------------------------------
         dx_via_routed = self._routed_ffn.bwd(
             dy_resid, weights, grads, slot, ctx, chunk, layer_id=layer_id,
