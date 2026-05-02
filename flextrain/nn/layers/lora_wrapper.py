@@ -703,8 +703,19 @@ class LoRAWrapperLayer:
             grads: full grads dict — accumulators for dA/dB.
 
         No-op when no LoRA target is in ``_MOE_CALLBACK_TARGETS``.
+
+        Implementation: prefers ``torch.nn.functional.grouped_mm`` (torch
+        2.10+, sm_80+, bf16-only) for the 4-call batched per-target
+        path. Falls back to a per-expert Python loop with regular
+        ``torch.matmul`` when ``grouped_mm`` isn't available — same
+        math, ~E× more kernel launches per target. The fallback is
+        intended for older-torch dev environments; production paths
+        on della-class hardware always hit the grouped_mm branch.
         """
-        from torch.nn.functional import grouped_mm
+        # Optional torch 2.10+ symbol — fallback handles older torch.
+        grouped_mm = getattr(
+            torch.nn.functional, "grouped_mm", None,
+        )
 
         moe_targets = self._target_set & self._MOE_CALLBACK_TARGETS
         # Filter to MoE-expert targets only (w_up, w_down,
@@ -718,6 +729,13 @@ class LoRAWrapperLayer:
 
         TK = capture["TK"]
         offs = capture["expert_offsets"]  # (E,) int32 cumulative ending in TK
+
+        # For the per-expert fallback, copy offs to host ONCE so we
+        # don't sync .item() per-iter inside the loop. Cheap (E ints).
+        # The grouped_mm path consumes offs on-device directly.
+        offs_cpu: list[int] | None = None
+        if grouped_mm is None:
+            offs_cpu = offs.tolist()
 
         # Per-target X / dY mapping. Both X and dY must be bf16 for
         # grouped_mm; capture stages full TK so explicit [:TK] is a
@@ -772,25 +790,52 @@ class LoRAWrapperLayer:
             r = cfg.rank
             scale = float(cfg.scale)
 
-            # 1. dY_B = dY @ B^T per-expert. 2D × 3D forward-style.
-            #    dY: (TK, out), B^T: (E, out, r) → (TK, r)
-            dY_B = grouped_mm(dY, B.transpose(-1, -2), offs=offs)
+            if grouped_mm is not None:
+                # Fast path: torch.nn.functional.grouped_mm (torch 2.10+,
+                # sm_80+, bf16-only). 4 batched calls per target, no
+                # Python expert loop.
+                #
+                # 1. dY_B = dY @ B^T per-expert. 2D × 3D forward-style.
+                #    dY: (TK, out), B^T: (E, out, r) → (TK, r)
+                dY_B = grouped_mm(dY, B.transpose(-1, -2), offs=offs)
+                # 2. dA = X^T @ dY_B per-expert. 2D × 2D wgrad-style.
+                #    X^T: (in, TK), dY_B: (TK, r) → (E, in, r)
+                dA = grouped_mm(X.transpose(-1, -2), dY_B, offs=offs)
+                # 3. X_A = X @ A per-expert. 2D × 3D forward-style.
+                #    X: (TK, in), A: (E, in, r) → (TK, r)
+                X_A = grouped_mm(X, A, offs=offs)
+                # 4. dB = X_A^T @ dY per-expert. 2D × 2D wgrad-style.
+                #    X_A^T: (r, TK), dY: (TK, out) → (E, r, out)
+                dB = grouped_mm(X_A.transpose(-1, -2), dY, offs=offs)
+                ga.add_((dA * scale).to(ga.dtype))
+                gb.add_((dB * scale).to(gb.dtype))
+            else:
+                # Fallback: per-expert Python loop with torch.matmul.
+                # Same math; E× more kernel launches. Used only when
+                # torch.nn.functional.grouped_mm isn't available
+                # (torch < 2.10). Accumulates dA / dB into ga / gb
+                # in-place via .add_() so peak memory stays at one
+                # per-expert tile, not (E, in, r) + (E, r, out).
+                E = A.shape[0]
+                start = 0
+                for e in range(E):
+                    end = offs_cpu[e]
+                    if end == start:
+                        continue
+                    X_e = X[start:end]                          # (T_e, in)
+                    dY_e = dY[start:end]                        # (T_e, out)
+                    A_e = A[e]                                  # (in, r)
+                    B_e = B[e]                                  # (r, out)
 
-            # 2. dA = X^T @ dY_B per-expert. 2D × 2D wgrad-style.
-            #    X^T: (in, TK), dY_B: (TK, r) → (E, in, r)
-            dA = grouped_mm(X.transpose(-1, -2), dY_B, offs=offs)
+                    dY_B_e = dY_e @ B_e.transpose(-1, -2)       # (T_e, r)
+                    dA_e = (X_e.transpose(-1, -2) @ dY_B_e) * scale  # (in, r)
+                    ga[e].add_(dA_e.to(ga.dtype))
 
-            # 3. X_A = X @ A per-expert. 2D × 3D forward-style.
-            #    X: (TK, in), A: (E, in, r) → (TK, r)
-            X_A = grouped_mm(X, A, offs=offs)
+                    X_A_e = X_e @ A_e                           # (T_e, r)
+                    dB_e = (X_A_e.transpose(-1, -2) @ dY_e) * scale  # (r, out)
+                    gb[e].add_(dB_e.to(gb.dtype))
 
-            # 4. dB = X_A^T @ dY per-expert. 2D × 2D wgrad-style.
-            #    X_A^T: (r, TK), dY: (TK, out) → (E, r, out)
-            dB = grouped_mm(X_A.transpose(-1, -2), dY, offs=offs)
-
-            # 5. Accumulate.
-            ga.add_((dA * scale).to(ga.dtype))
-            gb.add_((dB * scale).to(gb.dtype))
+                    start = end
 
     def backward_wgrad(
         self, intermediates: BackwardIntermediates,

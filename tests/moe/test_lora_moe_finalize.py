@@ -2,12 +2,16 @@
 (``LoRAWrapperLayer._accumulate_moe_lora_grads_from_capture``).
 
 Builds a small MoE-LoRA setup with known random tensors, runs the
-grouped_mm-batched finalize, and compares dA/dB against an autograd
-reference that computes the same gradients via PyTorch's per-expert
-math. Backend-agnostic — the finalize only consumes (X, dY, A, B,
-scale, offs); backends produce these via their own bwd.
+finalize, and compares dA/dB against an autograd reference that
+computes the same gradients via PyTorch's per-expert math.
+Backend-agnostic — the finalize only consumes (X, dY, A, B, scale,
+offs); backends produce these via their own bwd.
 
-Requires CUDA + bf16 + sm_80+ for ``torch.nn.functional.grouped_mm``.
+When ``torch.nn.functional.grouped_mm`` is available (torch 2.10+,
+sm_80+, bf16), the test runs both the grouped_mm fast path AND the
+per-expert fallback path, comparing each to the reference.
+
+When grouped_mm is NOT available, only the fallback runs.
 
 Run from repo root with the CUDA runtime libs on LD_LIBRARY_PATH:
   PYTHONPATH=. python tests/moe/test_lora_moe_finalize.py
@@ -175,10 +179,6 @@ def main():
         _MOE_CALLBACK_TARGETS = LoRAWrapperLayer._MOE_CALLBACK_TARGETS
 
     stub = _StubWrapper()
-    LoRAWrapperLayer._accumulate_moe_lora_grads_from_capture(
-        stub, capture, weights, grads,
-    )
-    torch.cuda.synchronize()
 
     # Reference: compute dA, dB per expert via PyTorch.
     # w_up: X = scattered_x_grouped, dY = dx_up_up_grouped
@@ -197,16 +197,54 @@ def main():
         counts, args.scale,
     )
 
-    print("\n=== Comparison: finalize (grouped_mm) vs per-expert reference ===")
+    def _run_finalize_and_compare(path_name: str, force_fallback: bool):
+        """Zero the grads dict, run the finalize, compare to reference."""
+        for k in grads:
+            grads[k].zero_()
+
+        # Optionally hide grouped_mm so the finalize takes the fallback
+        # branch. Restore after.
+        saved = getattr(torch.nn.functional, "grouped_mm", None)
+        if force_fallback and saved is not None:
+            del torch.nn.functional.grouped_mm
+        try:
+            LoRAWrapperLayer._accumulate_moe_lora_grads_from_capture(
+                stub, capture, weights, grads,
+            )
+            torch.cuda.synchronize()
+        finally:
+            if force_fallback and saved is not None:
+                torch.nn.functional.grouped_mm = saved
+
+        print(f"\n=== {path_name} vs per-expert reference ===")
+        path_fail = False
+        for label, got, ref in [
+            ("g_up_lora_a (E, d, r)",   grads["g_up_lora_a"],   dA_up_ref),
+            ("g_up_lora_b (E, r, 2F)",  grads["g_up_lora_b"],   dB_up_ref),
+            ("g_down_lora_a (E, F, r)", grads["g_down_lora_a"], dA_down_ref),
+            ("g_down_lora_b (E, r, d)", grads["g_down_lora_b"], dB_down_ref),
+        ]:
+            if not _diffstats(label, got, ref, tol=args.cos_tol):
+                path_fail = True
+        return path_fail
+
+    has_grouped_mm = hasattr(torch.nn.functional, "grouped_mm")
+
     fail = False
-    for label, got, ref in [
-        ("g_up_lora_a (E, d, r)",          grads["g_up_lora_a"],   dA_up_ref),
-        ("g_up_lora_b (E, r, 2F)",         grads["g_up_lora_b"],   dB_up_ref),
-        ("g_down_lora_a (E, F, r)",        grads["g_down_lora_a"], dA_down_ref),
-        ("g_down_lora_b (E, r, d)",        grads["g_down_lora_b"], dB_down_ref),
-    ]:
-        if not _diffstats(label, got, ref, tol=args.cos_tol):
+    if has_grouped_mm:
+        if _run_finalize_and_compare(
+            "grouped_mm fast path", force_fallback=False,
+        ):
             fail = True
+    else:
+        print("\n[skip] grouped_mm not available (torch < 2.10) — "
+              "skipping fast-path test.")
+    # Always test the fallback path — both for boxes without grouped_mm
+    # and as a regression guard alongside the fast path.
+    if _run_finalize_and_compare(
+        "per-expert fallback", force_fallback=True,
+    ):
+        fail = True
 
     print()
     if fail:
