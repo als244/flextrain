@@ -257,6 +257,7 @@ def routed_swiglu_moe_bwd(
     scattered_x_recompute: torch.Tensor | None = None,
     skip_grads: frozenset[str] = frozenset(),
     lora_per_expert_callback: Callable | None = None,
+    lora_capture: dict[str, Any] | None = None,
 ) -> torch.Tensor:
     """End-to-end routed-SwiGLU MoE backward. Returns
     ``ffn_norm_upstream`` (the d-loss/d-input gradient).
@@ -270,9 +271,15 @@ def routed_swiglu_moe_bwd(
     that ran earlier in this bwd iter); ``None`` causes the backend
     to re-scatter from ``ffn_norm_output``.
 
-    LoRA: ``skip_grads`` and ``lora_per_expert_callback`` are
-    flextrain-only kwargs forwarded to the backend; non-flextrain
-    backends will reject non-empty ``skip_grads``.
+    LoRA, two paths (transitional — Phase 7 will drop the legacy):
+    * Legacy (flextrain-only): ``skip_grads`` + ``lora_per_expert_callback``.
+      Per-expert callback fires inside the expert loop; backend skips
+      the wgrad addmm for skipped projections.
+    * Generic (all backends, deferred): ``lora_capture`` dict that
+      the backend populates with per-expert grouped intermediates
+      (see ``MoEExpertCompute.bwd`` docstring for the contract).
+      The wrapper's ``backward_wgrad`` consumes this dict to run
+      grouped_mm-batched dA/dB accumulation.
     """
     num_tokens, d_model = dy_resid.shape
     primary_stream_ptr = primary_stream.cuda_stream
@@ -297,6 +304,9 @@ def routed_swiglu_moe_bwd(
     if skip_grads or lora_per_expert_callback is not None:
         backend_bwd_kwargs["skip_grads"] = skip_grads
         backend_bwd_kwargs["lora_per_expert_callback"] = lora_per_expert_callback
+    # Generic deferred-LoRA capture (all backends).
+    if lora_capture is not None:
+        backend_bwd_kwargs["lora_capture"] = lora_capture
     ffn_norm_upstream = expert_compute.bwd(
         dy_resid, ffn_norm_output, weights, grads, **backend_bwd_kwargs,
     )

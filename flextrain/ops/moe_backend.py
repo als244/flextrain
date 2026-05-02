@@ -151,6 +151,7 @@ class MoEExpertCompute(Protocol):
         scratch_fn: Callable[[tuple[int, ...], torch.dtype], torch.Tensor],
         dx: torch.Tensor | None = None,
         recompute_handoff: Any = None,
+        lora_capture: dict[str, Any] | None = None,
     ) -> torch.Tensor:
         """Run gather-bwd + per-expert MLP-bwd + scatter-bwd. Accumulates
         wgrads into ``grads`` (caller pre-zeroes if needed). Returns the
@@ -161,7 +162,38 @@ class MoEExpertCompute(Protocol):
         (``routed_swiglu_moe_bwd``) reads ``slot.aux["moe_dprobs"]`` (a
         ``(TK, 1)`` scattered-layout tensor for flextrain) to feed the
         router-gate-bwd. As more backends are added, this contract may
-        grow into a typed return — for now slot.aux is the carrier."""
+        grow into a typed return — for now slot.aux is the carrier.
+
+        ``lora_capture`` (when not None) is a caller-owned dict the
+        backend populates with per-expert grouped intermediates that a
+        downstream LoRA wgrad finalize will consume. Required keys:
+
+          * ``"scattered_x_grouped"`` (TK, d_model) bf16 — fwd input
+            grouped by expert (sorted/scattered layout the backend
+            already uses internally). Source for ``X`` in the LoRA
+            wgrad of ``w_up``.
+          * ``"dx_up_up_grouped"`` (TK, 2*F) bf16 — gradient at the
+            up-projection output, post-activation-bwd, grouped by
+            expert. Source for ``dY`` in w_up's LoRA wgrad.
+          * ``"scattered_upstream_grouped"`` (TK, d_model) bf16 —
+            upstream gradient at the down-projection output, grouped
+            by expert. Source for ``dY`` in w_down's LoRA wgrad.
+            (Backend MUST NOT in-place-overwrite this with dx_pre
+            when capturing.)
+          * ``"expert_offsets"`` (E,) int32 — cumulative ending
+            offsets, ``offs[-1] == TK``. Used as ``offs`` for
+            ``torch.nn.functional.grouped_mm``.
+          * ``"TK"`` int — actual token-slot count this chunk
+            (≤ TK_max). All staged tensors are sliced to this count.
+
+        ``slot.x_up`` (already saved at tier ≥3 or repopulated by
+        ``fwd_recompute``) provides the per-slot pre-SwiGLU activation
+        from which ``fwd_act = silu(gate)*value`` is recomputed by the
+        finalize as the ``X`` for w_down's LoRA wgrad.
+
+        When ``lora_capture is None`` (default), backend behaves
+        exactly as before — no staging, no extra allocations beyond
+        what pre-LoRA code already used."""
         ...
 
 
@@ -401,6 +433,9 @@ class FlextrainMoEExpertCompute:
         # do not accept these.
         skip_grads: frozenset[str] = frozenset(),
         lora_per_expert_callback: object | None = None,
+        # Generic LoRA capture (Phase 2 plumbing — no-op when None).
+        # See ``MoEExpertCompute.bwd`` docstring for the dict contract.
+        lora_capture: dict[str, Any] | None = None,
     ) -> torch.Tensor:
         from flextrain.ops.full_moe import (
             swiglu_expert_loop_bwd,
@@ -737,9 +772,12 @@ class ScatterMoEExpertCompute:
         scratch_fn: Callable[[tuple[int, ...], torch.dtype], torch.Tensor],
         dx: torch.Tensor | None = None,
         recompute_handoff: Any = None,
-        # Reject LoRA kwargs explicitly — backend doesn't support hooks.
+        # Reject legacy per-expert callback machinery — that path was
+        # flextrain-only. Generic deferred LoRA via ``lora_capture`` is
+        # supported (populated below when not None).
         skip_grads: frozenset[str] = frozenset(),
         lora_per_expert_callback: object | None = None,
+        lora_capture: dict[str, Any] | None = None,
     ) -> torch.Tensor:
         if skip_grads or lora_per_expert_callback is not None:
             raise NotImplementedError(
@@ -1268,9 +1306,11 @@ class SonicMoEExpertCompute:
         scratch_fn: Callable[[tuple[int, ...], torch.dtype], torch.Tensor],
         dx: torch.Tensor | None = None,
         recompute_handoff: Any = None,
-        # Reject LoRA kwargs explicitly.
+        # Reject legacy per-expert callback. Generic deferred LoRA via
+        # ``lora_capture`` (populated below when not None) is supported.
         skip_grads: frozenset[str] = frozenset(),
         lora_per_expert_callback: object | None = None,
+        lora_capture: dict[str, Any] | None = None,
     ) -> torch.Tensor:
         if skip_grads or lora_per_expert_callback is not None:
             raise NotImplementedError(
