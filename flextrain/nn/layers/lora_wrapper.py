@@ -512,16 +512,19 @@ class LoRAWrapperLayer:
     #   w_o                  (attention inline Wgrad -> dense fast path)
     #   w_1, w_3             (FFN deferred Wgrads -> dense fast path)
     #   w_2                  (FFN inline Wgrad -> dense fast path)
-    #   w_up, w_down         (MoE per-expert -> rank-r in callback)
-    #   w_router             (MoE 2-D -> rank-r in callback) -- normally
-    #                        excluded by default lora_targets="all" via
-    #                        _discover_lora_eligible_names; only fires
-    #                        when a user explicitly targets it.
+    #
+    # MoE-expert targets (w_up, w_down, w_shared_*) and MoE router
+    # targets (w_router, w_shared_expert_gate) are NOT in this set —
+    # they take the deferred-LoRA-wgrad path via the
+    # ``__lora_moe_capture__`` slot.aux dict + grouped_mm finalize in
+    # ``_accumulate_moe_lora_grads_from_capture``. The base accumulates
+    # base ``g_up`` / ``g_down`` as usual; LoRA finalize adds dA/dB on
+    # top. To freeze the base, simply don't allocate g_up/g_down in
+    # the optimizer state (backend skips inline addmm when grads.get
+    # is None).
     _FAST_PATH_TARGETS = frozenset(
         ("w_q", "w_k", "w_v", "w_o",
          "w_1", "w_2", "w_3",
-         "w_up", "w_down", "w_router",
-         "w_shared_up", "w_shared_down", "w_shared_expert_gate",
          "w_lin_out", "w_lin_qkvz", "w_lin_ba")
     )
 
@@ -533,13 +536,22 @@ class LoRAWrapperLayer:
 
     def _fast_path_target_names(self) -> frozenset[str]:
         """Subset of LoRA targets that support the dgrad/wgrad
-        skip-and-capture protocol. Currently the dense Llama
-        deferred-Wgrad set; non-overlap (w_o, w_2, MoE) goes through
-        the slow path."""
+        skip-and-capture protocol (dense projections only). MoE
+        targets take the separate capture-dict path."""
         return self._target_set & self._FAST_PATH_TARGETS
 
+    def _moe_lora_target_names(self) -> frozenset[str]:
+        """Subset of LoRA targets that take the deferred-LoRA capture
+        path (MoE expert weights + MoE routers). Disjoint from
+        fast-path and slow-path."""
+        return self._target_set & self._MOE_CALLBACK_TARGETS
+
     def _slow_path_target_names(self) -> frozenset[str]:
-        return self._target_set - self._fast_path_target_names()
+        return (
+            self._target_set
+            - self._fast_path_target_names()
+            - self._moe_lora_target_names()
+        )
 
     # ------------------------------------------------------------------
     # backward(): legacy monolithic shim (engine still calls this for
@@ -603,17 +615,16 @@ class LoRAWrapperLayer:
 
         skip_for_base = skip_target_names | self._fast_path_target_names()
 
-        # Install MoE per-expert LoRA callback before calling base, IF
-        # any LoRA target is a 3-D MoE expert weight (w_up/w_down +
-        # w_shared_up/w_shared_down) or one of the 2-D router-like
-        # projections (w_router, w_shared_expert_gate). The callback
-        # fires inside ffn_moe.bwd / ffn_moe_shared.bwd much more
-        # cheaply than the dense fast path (no per-expert clones).
-        moe_targets = self._target_set & self._MOE_CALLBACK_TARGETS
+        # Install MoE LoRA capture dict — backend will populate it with
+        # per-expert grouped intermediates that ``backward_wgrad`` then
+        # consumes via grouped_mm-batched finalize. MoE targets are NOT
+        # added to skip_for_base: the base's backend accumulates base
+        # ``g_up`` / ``g_down`` as usual (or skips when grads.get(...)
+        # is None for frozen-base training). LoRA finalize adds dA/dB
+        # on top. See _accumulate_moe_lora_grads_from_capture.
+        moe_targets = self._moe_lora_target_names()
         if moe_targets:
-            slot.aux["__lora_moe_callback__"] = self._make_moe_callback(
-                moe_targets, weights, grads,
-            )
+            slot.aux["__lora_moe_capture__"] = {}
 
         upstream_dx, inter = self.base.backward_dgrad(
             dx, chunk, eff, combined_grads, slot, ctx,
@@ -904,6 +915,21 @@ class LoRAWrapperLayer:
             intermediates, eff, combined_grads, slot, ctx,
             skip_target_names=skip_for_base,
         )
+
+        # Deferred LoRA wgrad finalize for MoE-LoRA targets. The base
+        # layer's backward_dgrad populated slot.aux["__lora_moe_capture__"]
+        # with per-expert grouped intermediates (via the backend's
+        # ``lora_capture`` kwarg). Run grouped_mm-batched dA/dB
+        # accumulation for w_up / w_down / w_shared_* now.
+        moe_capture = slot.aux.pop("__lora_moe_capture__", None)
+        if moe_capture is not None and moe_capture:
+            # Empty dict means the base layer didn't actually populate
+            # anything (e.g., dense-only base; capture was installed
+            # speculatively). Skip the finalize when the dict is empty.
+            self._accumulate_moe_lora_grads_from_capture(
+                moe_capture, weights, grads,
+            )
+
         # Release the cached eff at the end of the bwd pair so the
         # caching allocator can reuse the (E, d_in, d_out) buffer for
         # the next layer. Without this the cache would persist across

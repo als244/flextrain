@@ -306,20 +306,14 @@ class OLMoEBlock:
             {} if skip_g_inline else None
         )
 
-        # MoE FFN: gate g_up/g_down/g_router. The wrapper provides a
-        # per-expert callback via intermediates.aux on the way in --
-        # passed positionally below.
-        skip_g_moe: frozenset[str] = frozenset(
-            f"g_{n[2:]}" for n in skip_target_names
-            if n in ("w_up", "w_down", "w_router")
-        )
-        moe_callback = None  # populated by wrapper via slot.aux below
-        if skip_g_moe:
-            moe_callback = slot.aux.pop("__lora_moe_callback__", None)
-            if moe_callback is None:
-                # Wrapper didn't install one -- fall back to slow path
-                # (don't actually skip).
-                skip_g_moe = frozenset()
+        # Legacy MoE LoRA path retained until Phase 7 cleanup.
+        skip_g_moe: frozenset[str] = frozenset()
+        moe_callback = None
+
+        # Phase 5 deferred-LoRA-wgrad capture: wrapper installs an
+        # empty dict; backend populates during bwd; wrapper's
+        # backward_wgrad consumes via grouped_mm finalize.
+        moe_capture = slot.aux.get("__lora_moe_capture__")
 
         # --- MoE FFN backward (monolithic; expert Wgrads always inline) ---
         if "recompute_ffn_norm_output" not in slot.aux:
@@ -332,6 +326,7 @@ class OLMoEBlock:
             layer_id=self.layer_id,
             skip_grads=skip_g_moe,
             lora_per_expert_callback=moe_callback,
+            lora_capture=moe_capture,
         )
 
         ffn_norm_fwd_output = slot.aux.pop("recompute_ffn_norm_output")

@@ -333,16 +333,18 @@ class Qwen3NextLinearLayer:
         capture_xy: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = (
             {} if skip_g_inline else None
         )
-        skip_g_moe: frozenset[str] = frozenset(
-            f"g_{n[2:]}" for n in skip_target_names
-            if n in ("w_up", "w_down", "w_router",
-                     "w_shared_up", "w_shared_down", "w_shared_expert_gate")
-        )
+        # Legacy MoE LoRA path (skip_grads + per-expert callback).
+        # Currently inactive — Phase 5 of the LoRA refactor switched the
+        # wrapper to install ``__lora_moe_capture__`` instead. Code
+        # path retained until Phase 7 cleanup.
+        skip_g_moe: frozenset[str] = frozenset()
         moe_callback = None
-        if skip_g_moe:
-            moe_callback = slot.aux.pop("__lora_moe_callback__", None)
-            if moe_callback is None:
-                skip_g_moe = frozenset()
+
+        # New MoE LoRA path: wrapper installs an empty capture dict;
+        # backend populates it during bwd; wrapper's backward_wgrad
+        # consumes it via grouped_mm-batched finalize. ``.get`` (not
+        # ``.pop``) — wrapper's wgrad reads it back.
+        moe_capture = slot.aux.get("__lora_moe_capture__")
 
         # FFN-norm input is xo = x_inp + lin_out (post-residual), NOT
         # x_inp. slot.xo is saved at tier 2 by lin_attn block, or
@@ -358,6 +360,7 @@ class Qwen3NextLinearLayer:
             layer_id=self.layer_id,
             skip_grads=skip_g_moe,
             lora_per_expert_callback=moe_callback,
+            lora_capture=moe_capture,
         )
         ffn_norm_fwd_output = slot.aux.pop("recompute_ffn_norm_output")
         dx, _ = self.ffn_norm.bwd(
@@ -628,16 +631,12 @@ class Qwen3NextFullLayer:
         capture_xy: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = (
             {} if skip_g_inline else None
         )
-        skip_g_moe: frozenset[str] = frozenset(
-            f"g_{n[2:]}" for n in skip_target_names
-            if n in ("w_up", "w_down", "w_router",
-                     "w_shared_up", "w_shared_down", "w_shared_expert_gate")
-        )
+        # Legacy path retained until Phase 7 cleanup.
+        skip_g_moe: frozenset[str] = frozenset()
         moe_callback = None
-        if skip_g_moe:
-            moe_callback = slot.aux.pop("__lora_moe_callback__", None)
-            if moe_callback is None:
-                skip_g_moe = frozenset()
+
+        # Phase 5 deferred-LoRA-wgrad capture (replaces legacy callback).
+        moe_capture = slot.aux.get("__lora_moe_capture__")
 
         if "recompute_ffn_norm_output" not in slot.aux:
             slot.aux["recompute_ffn_norm_output"] = self.ffn_norm.fwd_from_rstd(
@@ -649,6 +648,7 @@ class Qwen3NextFullLayer:
             layer_id=self.layer_id,
             skip_grads=skip_g_moe,
             lora_per_expert_callback=moe_callback,
+            lora_capture=moe_capture,
         )
 
         ffn_norm_fwd_output = slot.aux.pop("recompute_ffn_norm_output")
