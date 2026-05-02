@@ -451,7 +451,9 @@ class FlextrainMoEExpertCompute:
         expert_dim = weights["w_down"].shape[2]
         expert_counts_cpu = self._host_counts(chunk_extra, layer_id, num_experts)
 
-        # 1. Scatter dy.
+        # 1. Scatter dy. READ-ONLY across the expert loop now (under
+        #    the deferred-LoRA-friendly path); the dx_pre output goes
+        #    to its own buffer, not in-place over scattered_upstream.
         scattered_upstream = scratch_fn((TK, d_model), dy.dtype)
         flextrain_moe_scatter(dy, slot.index_mapping, out=scattered_upstream)
 
@@ -463,11 +465,18 @@ class FlextrainMoEExpertCompute:
             scattered_x = scratch_fn((TK, d_model), dy.dtype)
             flextrain_moe_scatter(x, slot.index_mapping, out=scattered_x)
 
-        # 3. Per-expert bwd loop. Overwrites scattered_upstream with
-        #    per-slot dx; accumulates g_up/g_down (or fires LoRA cb);
-        #    writes dprobs.
+        # 3. Per-expert bwd loop. Writes per-slot dx_up_up into
+        #    ``dx_up_up_grouped`` and per-slot dx_pre into
+        #    ``dx_pre_grouped`` (caller-allocated TK-sized buffers).
+        #    Accumulates g_up/g_down per-expert (or fires legacy LoRA
+        #    callback / skips when the wrapper supplies a deferred
+        #    lora_capture). Writes dprobs.
         srw = slot.scattered_router_weights[:TK, :]
         dprobs = torch.zeros_like(srw)
+        # TK-sized output buffers — survive the loop so LoRA finalize
+        # can read dx_up_up_grouped, and gather can source dx_pre_grouped.
+        dx_up_up_grouped = scratch_fn((TK, 2 * expert_dim), dy.dtype)
+        dx_pre_grouped = scratch_fn((TK, d_model), dy.dtype)
         swiglu_expert_loop_bwd(
             scattered_upstream=scattered_upstream,
             scattered_x=scattered_x,
@@ -478,6 +487,8 @@ class FlextrainMoEExpertCompute:
             w_down=weights["w_down"],
             grads=grads,
             expert_counts_cpu=expert_counts_cpu,
+            dx_up_up_grouped=dx_up_up_grouped,
+            dx_pre_grouped=dx_pre_grouped,
             expert_dim=expert_dim,
             primary_stream=primary_stream,
             secondary_stream=secondary_stream,
@@ -485,12 +496,30 @@ class FlextrainMoEExpertCompute:
             lora_per_expert_callback=lora_per_expert_callback,
         )
 
-        # 4. Gather per-slot dx back to per-token dx.
+        # 4. Stage per-expert grouped intermediates for downstream LoRA
+        # finalize. All four are existing buffers (no new alloc) — just
+        # references the wrapper's grouped_mm driver will consume.
+        if lora_capture is not None:
+            # Cumulative ending offsets, GPU-side, ending in TK. The
+            # expert_counts_cpu tensor is host-pinned for the python
+            # loop; we need a GPU int32 cumsum for grouped_mm's `offs`.
+            # (Future opt: cache in slot.aux to avoid recomputing across
+            # layers — for now the cumsum is ~µs.)
+            expert_offsets = (
+                self.expert_counts_gpu(slot).cumsum(0).to(torch.int32)
+            )
+            lora_capture["scattered_x_grouped"] = scattered_x
+            lora_capture["dx_up_up_grouped"] = dx_up_up_grouped
+            lora_capture["scattered_upstream_grouped"] = scattered_upstream
+            lora_capture["expert_offsets"] = expert_offsets
+            lora_capture["TK"] = TK
+
+        # 5. Gather per-slot dx back to per-token dx.
         if dx is None:
             dx = torch.empty_like(dy)
-        flextrain_moe_gather(scattered_upstream, slot.index_mapping, out=dx)
+        flextrain_moe_gather(dx_pre_grouped, slot.index_mapping, out=dx)
 
-        # 5. Hand dprobs (scattered layout) to the caller for the
+        # 6. Hand dprobs (scattered layout) to the caller for the
         #    router-gate-bwd via slot.aux.
         slot.aux["moe_dprobs"] = dprobs
 
@@ -910,6 +939,18 @@ class ScatterMoEExpertCompute:
             # (E, d, 2F) over (E, 2F, d) physical storage. g_up is
             # (E, 2F, d), so permute the view before .add_().
             grads["g_up"].add_(d_w_up.permute(0, 2, 1))
+
+        # Stage per-expert grouped intermediates for downstream LoRA
+        # finalize. Scattermoe naturally produces all three as standalone
+        # buffers — just pass references; lifetime extends to end of bwd
+        # via the dict the wrapper holds. See MoEExpertCompute.bwd
+        # docstring for the contract.
+        if lora_capture is not None:
+            lora_capture["scattered_x_grouped"] = grouped_x
+            lora_capture["dx_up_up_grouped"] = d_pre_act
+            lora_capture["scattered_upstream_grouped"] = grouped_grad_out
+            lora_capture["expert_offsets"] = expert_offsets  # (E,) int32 cumsum
+            lora_capture["TK"] = TK
 
         # 7. d_x = scatter2scatter(d_pre_act, W=w_up, k=1, ...)
         # then sum over K. Under option-B, w_up: (E, 2F, d) — already the
@@ -1424,6 +1465,31 @@ class SonicMoEExpertCompute:
             is_glu_activation=True,
             concat_layout=False,
         )
+
+        # Stage per-expert grouped intermediates for downstream LoRA
+        # finalize. Sonic doesn't naturally materialize gathered x / dy
+        # — its kernels use gather indices internally. When LoRA is
+        # active, materialize them here (one index_select each, ~ TK * d
+        # bf16 each ≈ 256 MiB at TK=65536, d=2048). dh is the existing
+        # (TK, 2F) buffer from step 1, no new alloc.
+        # See MoEExpertCompute.bwd docstring for the dict contract.
+        if lora_capture is not None:
+            x_gather_idx_long = slot.sonic_x_gather_idx[:TK].long()
+            scattered_x_grouped = scratch_fn((TK, d_model), x.dtype)
+            scattered_x_grouped.copy_(x.index_select(0, x_gather_idx_long))
+            scattered_upstream_grouped = scratch_fn((TK, d_model), dy.dtype)
+            scattered_upstream_grouped.copy_(
+                dy.index_select(0, x_gather_idx_long)
+            )
+            # sonic_expert_frequency_offset has leading 0, length E+1.
+            # grouped_mm wants (E,) cumulative ending in TK; slice off the 0.
+            lora_capture["scattered_x_grouped"] = scattered_x_grouped
+            lora_capture["dx_up_up_grouped"] = dh
+            lora_capture["scattered_upstream_grouped"] = scattered_upstream_grouped
+            lora_capture["expert_offsets"] = (
+                slot.sonic_expert_frequency_offset[1:]
+            )
+            lora_capture["TK"] = TK
 
         # 4. dw_up = gemm(x.T, dh). Same allocation pattern as step 2.
         # sonicmoe (functional/__init__.py:187): `dw1 = torch.empty_like(w1)`

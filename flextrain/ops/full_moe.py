@@ -477,7 +477,7 @@ def swiglu_expert_loop_fwd(
 
 
 def swiglu_expert_loop_bwd(
-    scattered_upstream: torch.Tensor,    # (TK, d_model) bf16; bwd input → dx output, in-place
+    scattered_upstream: torch.Tensor,    # (TK, d_model) bf16; bwd input — READ-ONLY across loop
     scattered_x: torch.Tensor,           # (TK, d_model) bf16; saved fwd input (for g_up wgrad)
     x_preact_buf: torch.Tensor,          # (TK, 2F) bf16; saved fwd pre-SwiGLU
     srw: torch.Tensor,                   # (TK, 1) bf16; saved scattered router weights
@@ -486,6 +486,8 @@ def swiglu_expert_loop_bwd(
     w_down: torch.Tensor,                # (E, d_model, F) bf16
     grads: MutableMapping[str, torch.Tensor],  # accumulator dict
     expert_counts_cpu: torch.Tensor,     # (E,) int host — count per expert
+    dx_up_up_grouped: torch.Tensor,      # (TK, 2F) bf16 — OUTPUT: per-slot grad at up-proj output, written per expert into [start:end]
+    dx_pre_grouped: torch.Tensor,        # (TK, d_model) bf16 — OUTPUT: per-slot grad at FFN input, written per expert into [start:end]
     *,
     expert_dim: int,
     primary_stream: torch.cuda.Stream,
@@ -499,46 +501,57 @@ def swiglu_expert_loop_bwd(
     Grad accumulators inherit the same orientation:
     ``g_up[e]: (2F, d)``, ``g_down[e]: (d, F)``.
 
+    Buffer contract:
+      * ``scattered_upstream`` is READ-ONLY across the loop — it is the
+        upstream gradient at the down-projection output, used as the X
+        for steps (a) (dgrad through w_down) and (c) (g_down wgrad).
+        The deferred-LoRA path needs it preserved so caller must NOT
+        rely on in-place overwrite for dx_pre output (it now goes to
+        ``dx_pre_grouped``).
+      * ``dx_up_up_grouped`` and ``dx_pre_grouped`` are caller-allocated
+        ``(TK, ·)`` buffers. The loop writes per-expert into
+        ``[start:end]`` slices. After the loop they hold the full
+        grouped tensors (LoRA finalize reads ``dx_up_up_grouped``;
+        gather sources from ``dx_pre_grouped``).
+
     Steps per expert ``e`` (``T_e = expert_counts_cpu[e]``):
       a) ``dx_act_up = scattered_upstream[start:end] @ w_down[e]``
-         (no .T — w_down[e] is already (d, F)).
-      b) ``dx_up_up, dprobs[start:end] = swiglu_moe_bwd(...)`` — Triton
-         fused; rescales by saved ``srw[start:end]`` and computes
-         per-slot d_router_weight (dot product with recomputed
-         post-SwiGLU activation).
-      c) Optionally accumulate
+         (T_e, F) — per-expert scratch.
+      b) ``dx_up_up_grouped[start:end] = swiglu_moe_bwd(...)`` — Triton
+         fused; rescales by saved ``srw[start:end]``, computes per-slot
+         d_router_weight, recomputes ``fwd_act`` (per-expert scratch).
+      c) Optional g_down wgrad (when not skipped):
          ``g_down[e] += scattered_upstream[start:end].T @ fwd_act``
-         (shape (d, T_e) @ (T_e, F) = (d, F)). Skipped when
-         ``"g_down" in skip_grads`` — the LoRA wrapper handles the
-         rank-r path via callback.
-      d) Overwrite ``scattered_upstream[start:end] = dx_up_up @ w_up[e]``
-         (no .T — w_up[e] is already (2F, d), and the dgrad is
-         (T_e, 2F) @ (2F, d) = (T_e, d)).
-      e) Optionally accumulate
-         ``g_up[e] += dx_up_up.T @ scattered_x[start:end]``
-         (shape (2F, T_e) @ (T_e, d) = (2F, d)).
+         shape (d, T_e) @ (T_e, F) = (d, F).
+      d) ``dx_pre_grouped[start:end] = dx_up_up_grouped[start:end] @ w_up[e]``
+         (T_e, 2F) @ (2F, d) = (T_e, d) — the dgrad at the FFN input
+         for this expert's tokens, written into the dx_pre buffer that
+         the gather will source from.
+      e) Optional g_up wgrad:
+         ``g_up[e] += dx_up_up_grouped[start:end].T @ scattered_x[start:end]``
+         shape (2F, T_e) @ (T_e, d) = (2F, d).
 
     Steps a/d are dgrads (always run). Steps c/e are wgrads and may be
-    skipped via ``skip_grads``; in that case ``lora_per_expert_callback``
-    fires per-expert with ``(name, eid, X, dY)`` so the LoRA wrapper
-    can do its own rank-r accumulation without ever materializing the
-    full per-expert ``dW``.
+    skipped via ``skip_grads`` (legacy callback path) or by simply
+    leaving ``grads.get("g_*") is None`` (frozen base + LoRA capture
+    path — backend skips the wgrad addmm; LoRA finalize replaces it).
     """
     num_experts = w_up.shape[0]
     max_exp_tokens = int(expert_counts_cpu.max())
     primary_stream_ptr = primary_stream.cuda_stream
     use_secondary = secondary_stream is not None
 
-    # Scratch carving: each expert needs (T_e, F) dx_act_up + (T_e, 2F) dx_up_up
-    # + (T_e, F) fwd_act = (T_e, 4F) total per stream.
+    # Per-stream transient scratch: dx_act_up (T_e, F) + fwd_act (T_e, F)
+    # = (T_e, 2F) per expert. dx_up_up no longer carved here — it's a
+    # slice of the caller-supplied ``dx_up_up_grouped: (TK, 2F)``.
     bf = scattered_upstream.dtype
     device = scattered_upstream.device
     X_temp_even = torch.zeros(
-        max_exp_tokens * (4 * expert_dim), dtype=bf, device=device,
+        max_exp_tokens * (2 * expert_dim), dtype=bf, device=device,
     )
     if use_secondary:
         X_temp_odd = torch.zeros(
-            max_exp_tokens * (4 * expert_dim), dtype=bf, device=device,
+            max_exp_tokens * (2 * expert_dim), dtype=bf, device=device,
         )
         secondary_stream_ptr = secondary_stream.cuda_stream
         secondary_stream.wait_stream(primary_stream)
@@ -576,6 +589,11 @@ def swiglu_expert_loop_bwd(
         w_up_e = w_up[eid, :, :]
         w_down_e = w_down[eid, :, :]
 
+        # dx_up_up and dx_pre slices live in the caller-supplied
+        # TK-sized buffers; both survive the loop iteration.
+        dx_up_up = dx_up_up_grouped[start:end, :]
+        exp_dx_pre = dx_pre_grouped[start:end, :]
+
         if use_secondary and (eid % 2 == 1):
             cur_dispatcher = dispatcher_secondary
             cur_stream_ptr = secondary_stream_ptr
@@ -596,10 +614,6 @@ def swiglu_expert_loop_bwd(
             n_exp_tokens, expert_dim
         )
         toff += n_exp_tokens * expert_dim
-        dx_up_up = X_temp[toff : toff + n_exp_tokens * 2 * expert_dim].view(
-            n_exp_tokens, 2 * expert_dim
-        )
-        toff += n_exp_tokens * 2 * expert_dim
         fwd_act = X_temp[toff : toff + n_exp_tokens * expert_dim].view(
             n_exp_tokens, expert_dim
         )
@@ -610,7 +624,8 @@ def swiglu_expert_loop_bwd(
             cur_dispatcher.matmul_fast(
                 cur_stream_ptr, A=exp_upstream, B=w_down_e, D=dx_act_up,
             )
-            # b) SwiGLU bwd: rescale + d_router_weight + recomputed fwd_act
+            # b) SwiGLU bwd: writes into dx_up_up_grouped[start:end] slice
+            #    + recomputes per-slot dprobs and fwd_act (transient).
             dx_up_up, exp_dprobs = flextrain_swiglu_moe_bwd(
                 dx_act_up, x_preact, exp_probs,
                 dx=dx_up_up, dw=exp_dprobs, fwd_act=fwd_act,
@@ -635,10 +650,10 @@ def swiglu_expert_loop_bwd(
                     C=g_down_e, D=g_down_e,
                     beta=1.0, alpha=1.0,
                 )
-            # d) dx_pre = dx_up_up @ w_up[e] (overwrites exp_upstream)
+            # d) dx_pre = dx_up_up @ w_up[e] → dx_pre_grouped[start:end]
             #    (T_e, 2F) @ (2F, d) → (T_e, d). w_up[e] is (2F, d), no .T.
             cur_dispatcher.matmul_fast(
-                cur_stream_ptr, A=dx_up_up, B=w_up_e, D=exp_upstream,
+                cur_stream_ptr, A=dx_up_up, B=w_up_e, D=exp_dx_pre,
             )
             # e) g_up[e] += dx_up_up.T @ scattered_x[start:end] (or LoRA callback)
             #    (2F, T_e) @ (T_e, d) → (2F, d). g_up[e] is (2F, d).
