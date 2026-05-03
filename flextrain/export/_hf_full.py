@@ -370,7 +370,56 @@ def save_hf_full(
         arch.pre_export_hook(am, hf_state, len(am.backbone))
     _post_export_permute_for_arch(am, hf_state, arch.hf_arch_ids)
 
+    # Pass-through: any HF tensor that isn't covered by ArchSpec /
+    # pre_export_hook (e.g. vision tower weights on Qwen3.5
+    # multimodal saves) gets copied over unchanged. FT only trains
+    # the LM but the source dir may contain extra weights that
+    # downstream serving frameworks (vLLM, SGLang) require to load.
+    # Without this, ``visual.*`` keys are dropped on save and vLLM
+    # rejects the resulting checkpoint.
+    _passthrough_extra_weights(hf_source_dir, hf_state)
+
     write_sharded_safetensors(
         hf_state, out_dir, shard_size_bytes=shard_size_bytes
     )
     return out_dir
+
+
+def _passthrough_extra_weights(
+    hf_source_dir: str, hf_state: dict[str, torch.Tensor],
+) -> None:
+    """Copy any safetensors tensor from the source HF dir whose name
+    is NOT already in ``hf_state``. Skips lm_head.weight when absent
+    (typical for tied-embed models) since callers explicitly drop it
+    in their pre_export_hook.
+
+    Catches: vision tower weights on multimodal saves, MTP / speculative-
+    head weights, anything else not covered by the LM-side ArchSpec.
+    """
+    import glob
+    from safetensors import safe_open
+
+    shards = sorted(glob.glob(os.path.join(hf_source_dir, "*.safetensors")))
+    if not shards:
+        return
+    n_added = 0
+    n_skipped_lm_head_tied = 0
+    for shard in shards:
+        try:
+            with safe_open(shard, framework="pt", device="cpu") as f:
+                for k in f.keys():
+                    if k in hf_state:
+                        continue
+                    # Don't re-add lm_head.weight if a hook intentionally
+                    # dropped it (tied embedding) — would defeat the
+                    # tied-embed save behavior.
+                    if k == "lm_head.weight":
+                        n_skipped_lm_head_tied += 1
+                        continue
+                    hf_state[k] = f.get_tensor(k)
+                    n_added += 1
+        except Exception:
+            continue
+    if n_added > 0:
+        print(f"[save_hf_full] passed {n_added} non-LM tensor(s) through "
+              f"from source HF dir (vision / MTP / aux)", flush=True)
