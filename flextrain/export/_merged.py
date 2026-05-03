@@ -96,11 +96,27 @@ def merge_lora_into_base(am) -> int:
                 B.zero_()
                 merged += 1
             elif A.dim() == 3 and B.dim() == 3 and W.dim() == 3:
-                # Per-expert: A (E, in, r), B (E, r, out), W (E, in, out)
-                # Use bmm; do it on CPU in fp32 to avoid loading huge
-                # MoE expert stacks onto GPU here.
-                delta = torch.bmm(A.float(), B.float()) * scale
-                W.add_(delta.to(W.dtype))
+                # Per-expert MoE LoRA. LoRA factor convention (PEFT-aligned):
+                #   A (E, in, r), B (E, r, out)
+                # so the natural delta is bmm(A, B) -> (E, in, out).
+                #
+                # Option-B MoE storage transposed the routed-expert weights
+                # so they live as W (E, out, in). Add delta to W after
+                # transposing the bmm result to match W's orientation.
+                # Done on CPU in fp32 to avoid loading huge MoE expert
+                # stacks onto the GPU here.
+                delta = torch.bmm(A.float(), B.float()) * scale  # (E, in, out)
+                if W.shape[-2:] == delta.shape[-2:]:
+                    W.add_(delta.to(W.dtype))
+                elif W.shape[-2:] == delta.shape[-2:][::-1]:
+                    # Option-B layout: W is transposed relative to delta.
+                    W.add_(delta.transpose(-1, -2).contiguous().to(W.dtype))
+                else:
+                    raise ValueError(
+                        f"layer {L} target {target!r}: cannot align "
+                        f"LoRA delta {tuple(delta.shape)} with W "
+                        f"{tuple(W.shape)} via either direct add or transpose."
+                    )
                 A.zero_()
                 B.zero_()
                 merged += 1
