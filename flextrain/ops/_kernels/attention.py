@@ -263,14 +263,18 @@ def _flash3_fwd(
 ):
     """flash-attn 3 fwd via the public API.
 
-    Upstream's ``_flash_attn_forward`` accepts a caller-allocated
-    ``out_=`` buffer and writes into it directly. softmax_lse is
-    returned by upstream — we copy into the caller's buffer.
+    TODO: drop down to ``flash_attn_3_gpu.fwd`` directly to skip the
+    custom-op wrapper entirely (and avoid the extra alloc+copy below).
+    Upstream's ``_flash_attn_forward`` is wrapped with
+    ``@torch.library.custom_op(..., mutates_args=())`` and returns the
+    same tensor that was passed via ``out_=``. Modern torch's
+    aliasing check rejects that (return aliases an input), so we
+    can't pass our caller-allocated buffer through. Instead let FA3
+    allocate fresh and copy into the caller's buffer.
     """
     softmax_scale = q.shape[-1] ** -0.5
     out_ret, lse_ret, _out_accum, _lse_accum = _f3_fwd(
         q, k, v,
-        out_=out,
         cu_seqlens_q=q_seq_offsets,
         cu_seqlens_k=k_seq_offsets,
         seqused_q=None, seqused_k=None,
@@ -283,11 +287,7 @@ def _flash3_fwd(
         softcap=softcap,
         sm_margin=sm_margin,
     )
-    # The upstream API copies into ``out_`` in place, but defensively
-    # mirror — if it ever decides to allocate fresh, our caller's
-    # buffer still gets the result.
-    if out_ret is not out:
-        out.copy_(out_ret)
+    out.copy_(out_ret)
     softmax_lse.copy_(lse_ret)
     return out, softmax_lse
 
