@@ -400,10 +400,18 @@ def flash_attn_recompute_flops(
     ``cfg.is_causal``. Linear-attn layers use ``self.lin_attn``
     instead and skip this correction (they don't run a per-step
     quadratic kernel).
+
+    Under ``--mode lora`` the backbone layers are wrapped by
+    :class:`LoRAWrapperLayer`, which delegates ``compute_cost`` but
+    does NOT re-expose the base layer's ``self.attn``. Unwrap via
+    the wrapper's ``self.base`` chain before checking.
     """
     total = 0
     for layer in layers:
-        attn = getattr(layer, "attn", None)
+        base = layer
+        while hasattr(base, "base") and getattr(base, "base") is not base:
+            base = base.base
+        attn = getattr(base, "attn", None)
         if attn is None:
             continue
         cfg = getattr(attn, "cfg", None)
