@@ -106,6 +106,41 @@ def _qwen3_moe_post_load_hook(
         )
 
 
+def _qwen3_moe_pre_export_hook(am, dst, num_layers: int) -> None:
+    """Inverse of ``_qwen3_moe_post_load_hook``: emit per-expert HF
+    tensors from FT's stacked ``w_up`` / ``w_down``.
+
+    Qwen3-MoE has only the per-expert format on disk (no fused
+    ``gate_up_proj``); we always emit per-expert
+    ``mlp.experts.{e}.{gate,up,down}_proj.weight``. The ArchSpec walk
+    didn't emit ``w_up`` / ``w_down`` (no entries in ``layer``), so
+    nothing to drop.
+
+    Tied embeddings: when the source config has
+    ``tie_word_embeddings: True``, drop ``lm_head.weight`` from the
+    export — HF will re-mirror at load time.
+    """
+    from flextrain.export._pre_export_helpers import (
+        emit_routed_experts,
+        read_tie_word_embeddings,
+    )
+    for L in range(num_layers):
+        host = am.buffers.host_params[L]
+        w_up = host.get("w_up")
+        w_down = host.get("w_down")
+        if w_up is None or w_down is None:
+            continue  # not a MoE layer (defensive — qwen3_moe always is)
+        emit_routed_experts(
+            dst,
+            layer_prefix=f"model.layers.{L}",
+            w_up=w_up,
+            w_down=w_down,
+            fused=False,
+        )
+    if read_tie_word_embeddings(am):
+        dst.pop("lm_head.weight", None)
+
+
 QWEN3_MOE_ARCH = ArchSpec(
     hf_arch_ids=("Qwen3MoeForCausalLM",),
     embed=(
@@ -125,6 +160,7 @@ QWEN3_MOE_ARCH = ArchSpec(
             flextrain_name="w_head_proj",
             hf_name="lm_head.weight",
             transform=Transform.TRANSPOSE,
+            optional=True,
         ),
     ),
     layer=(
@@ -176,6 +212,7 @@ QWEN3_MOE_ARCH = ArchSpec(
         # w_up / w_down populated by post_load_hook.
     ),
     post_load_hook=_qwen3_moe_post_load_hook,
+    pre_export_hook=_qwen3_moe_pre_export_hook,
 )
 
 register_arch(QWEN3_MOE_ARCH)

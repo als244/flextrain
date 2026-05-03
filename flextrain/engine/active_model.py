@@ -197,6 +197,10 @@ class ActiveModel:
     # exported safetensors.
     _hf_source_path: str | None = None
     _hf_arch: Any | None = None
+    # Per-layer hyperparams from arch.hf_config_to_hyperparams — kept
+    # so ``pre_export_hook`` / ``_post_export_permute_for_arch`` can
+    # read e.g. partial_rotary_factor for inverse permutations.
+    _hf_hyperparams: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         device = torch.device(self.device)

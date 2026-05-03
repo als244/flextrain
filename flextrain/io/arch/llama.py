@@ -38,6 +38,16 @@ from typing import Any, Mapping
 from ..hf_weights import ArchSpec, Transform, WeightMapEntry, register_arch
 
 
+def _llama_pre_export_hook(am, dst, num_layers: int) -> None:
+    """Drop ``lm_head.weight`` from the export when the source had
+    ``tie_word_embeddings: True`` (Llama-3.2-1B / 3B). FT mirrors the
+    embedding into ``w_head_proj`` at load time and the unmirroring
+    isn't needed: HF re-mirrors at the receiving end."""
+    from flextrain.export._pre_export_helpers import read_tie_word_embeddings
+    if read_tie_word_embeddings(am):
+        dst.pop("lm_head.weight", None)
+
+
 LLAMA_ARCH = ArchSpec(
     hf_arch_ids=("LlamaForCausalLM",),
     embed=(
@@ -57,6 +67,7 @@ LLAMA_ARCH = ArchSpec(
             flextrain_name="w_head_proj",
             hf_name="lm_head.weight",
             transform=Transform.TRANSPOSE,
+            optional=True,
         ),
     ),
     layer=(
@@ -106,6 +117,7 @@ LLAMA_ARCH = ArchSpec(
             transform=Transform.TRANSPOSE,
         ),
     ),
+    pre_export_hook=_llama_pre_export_hook,
 )
 
 register_arch(LLAMA_ARCH)

@@ -26,6 +26,16 @@ from typing import Any
 from ..hf_weights import ArchSpec, Transform, WeightMapEntry, register_arch
 
 
+def _qwen3_pre_export_hook(am, dst, num_layers: int) -> None:
+    """Drop ``lm_head.weight`` from the export when the source had
+    ``tie_word_embeddings: True`` (Qwen3-1.7B / 4B). FT mirrors the
+    embedding into ``w_head_proj`` at load time; HF re-mirrors at
+    the receiving end."""
+    from flextrain.export._pre_export_helpers import read_tie_word_embeddings
+    if read_tie_word_embeddings(am):
+        dst.pop("lm_head.weight", None)
+
+
 QWEN3_ARCH = ArchSpec(
     hf_arch_ids=("Qwen3ForCausalLM",),
     embed=(
@@ -45,6 +55,7 @@ QWEN3_ARCH = ArchSpec(
             flextrain_name="w_head_proj",
             hf_name="lm_head.weight",
             transform=Transform.TRANSPOSE,
+            optional=True,
         ),
     ),
     layer=(
@@ -105,6 +116,7 @@ QWEN3_ARCH = ArchSpec(
             transform=Transform.TRANSPOSE,
         ),
     ),
+    pre_export_hook=_qwen3_pre_export_hook,
 )
 
 register_arch(QWEN3_ARCH)

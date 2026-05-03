@@ -375,6 +375,85 @@ _FULL_ATTN = (
 )
 
 
+def _qwen3_5_pre_export_hook(am, dst, num_layers: int) -> None:
+    """Inverse of ``_qwen3_5_post_load_hook`` (and the linear-attn
+    bundling). Three operations:
+
+    1. **(1+w) RMSNorm shift inverse**: subtract 1.0 from every
+       non-gated norm γ. HF's ``Qwen3_5RMSNorm`` forwards
+       ``output * (1 + weight)``, i.e. saves ``γ_canonical - 1``;
+       FT stores ``γ_canonical`` directly so the export needs the
+       inverse. Applies to: ``input_layernorm``,
+       ``post_attention_layernorm``, ``q_norm``, ``k_norm``, and the
+       backbone-level ``model.language_model.norm.weight``. The
+       linear-attn norm (``linear_attn.norm.weight``) is the GATED
+       variant and must NOT be shifted.
+    2. **Linear-attn unbundle**: split FT ``w_lin_qkvz`` (block-major
+       ``[Q | K | V | Z]``) and ``w_lin_ba`` (block-major ``[B | A]``)
+       back into HF's split per-K-head ``in_proj_qkv`` /
+       ``in_proj_z`` / ``in_proj_b`` / ``in_proj_a``.
+    3. **Tied embedding**: drop ``lm_head.weight`` when the source
+       config has ``tie_word_embeddings: True`` (Qwen3.5-2B,
+       Qwen3.5-0.8B-Base). HF will re-mirror at load.
+
+    Note: the per-head Q/K halved->pair RoPE permutation and the
+    per-head ``[q_h | gate_h]`` -> flat ``[Q_all | gate_all]``
+    layout split are handled by ``_post_export_permute_for_arch``
+    in ``flextrain.export._hf_full`` (see ``_invert_qwen3_5_*``).
+    """
+    from flextrain.export._pre_export_helpers import (
+        emit_linear_attn_unbundle,
+        read_tie_word_embeddings,
+        subtract_one_from_norms,
+    )
+    # ----- (1) Norm γ shift inverse. -----
+    norm_names: list[str] = []
+    for L in range(num_layers):
+        norm_names.append(
+            f"model.language_model.layers.{L}.input_layernorm.weight"
+        )
+        norm_names.append(
+            f"model.language_model.layers.{L}.post_attention_layernorm.weight"
+        )
+        norm_names.append(
+            f"model.language_model.layers.{L}.self_attn.q_norm.weight"
+        )
+        norm_names.append(
+            f"model.language_model.layers.{L}.self_attn.k_norm.weight"
+        )
+    norm_names.append("model.language_model.norm.weight")
+    subtract_one_from_norms(dst, norm_names)
+
+    # ----- (2) Linear-attn unbundle. -----
+    # Read linear-attn dim config from am.dims (populated by
+    # hf_config_to_flextrain at load time).
+    dims = am.dims
+    num_v = int(dims.get("linear_num_v_heads", dims.get("num_v_heads", 16)))
+    num_k = int(dims.get("linear_num_k_heads", dims.get("num_k_heads", 16)))
+    head_k = int(dims.get("linear_head_k_dim", dims.get("head_k_dim", 128)))
+    head_v = int(dims.get("linear_head_v_dim", dims.get("head_v_dim", 128)))
+    for L in range(num_layers):
+        host = am.buffers.host_params[L]
+        w_qkvz = host.get("w_lin_qkvz")
+        w_ba = host.get("w_lin_ba")
+        if w_qkvz is None or w_ba is None:
+            continue   # not a linear-attn layer (full-attn layer)
+        emit_linear_attn_unbundle(
+            dst,
+            layer_prefix=f"model.language_model.layers.{L}",
+            w_lin_qkvz=w_qkvz,
+            w_lin_ba=w_ba,
+            num_k_heads=num_k,
+            num_v_heads=num_v,
+            head_k_dim=head_k,
+            head_v_dim=head_v,
+        )
+
+    # ----- (3) Tied embedding. -----
+    if read_tie_word_embeddings(am):
+        dst.pop("lm_head.weight", None)
+
+
 QWEN3_5_ARCH = ArchSpec(
     hf_arch_ids=("Qwen3_5ForCausalLM", "Qwen3_5ForConditionalGeneration"),
     embed=(
@@ -402,6 +481,7 @@ QWEN3_5_ARCH = ArchSpec(
     ),
     layer=_COMMON + _LINEAR_ATTN + _FULL_ATTN,
     post_load_hook=_qwen3_5_post_load_hook,
+    pre_export_hook=_qwen3_5_pre_export_hook,
 )
 
 register_arch(QWEN3_5_ARCH)

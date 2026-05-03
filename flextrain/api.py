@@ -451,6 +451,9 @@ def from_pretrained(
         post_load = getattr(arch_module, "post_load_permute", None)
         if post_load is not None:
             post_load(am, hf_config, dims, hyperparams)
+        # Stash hyperparams so the export side can recover e.g.
+        # partial_rotary_factor for the inverse permutation.
+        am._hf_hyperparams = dict(hyperparams)
         if verbose:
             import sys
             print("[from_pretrained] Weights loaded.", flush=True, file=sys.stderr)

@@ -48,12 +48,10 @@ def _post_export_permute_for_arch(
     For Qwen3-dense: same Q/K halved->pair invert, plus q_norm /
     k_norm (per-head channels).
 
-    Qwen3.5 / Qwen3.5-MoE / Qwen3-Next: out of scope here — those
-    ship gated q_proj or per-K-head bundled linear-attn projections
-    that aren't a 1:1 inversion. The full-weight exporter rejects
-    those archs (caller should use ``save_hf_merged`` only after a
-    LoRA run, and we leave full-FT export for those models for a
-    future patch).
+    For Qwen3.5 family (dense + MoE): invert the partial-rotary
+    halved->pair on Q/K (only the rope_dim channels), the per-head
+    ``[q_h | gate_h]`` interleave inverse on q_proj, and the head-
+    internal q_norm/k_norm permutation.
     """
     if not hf_arch_ids:
         return
@@ -63,6 +61,19 @@ def _post_export_permute_for_arch(
         return
     if arch_set & {"Qwen3ForCausalLM"}:
         _invert_qwen3_qk_perm(am, dst)
+        return
+    if arch_set & {"Qwen3MoeForCausalLM"}:
+        # qwen3_moe shares the qwen3-dense Q/K + q_norm/k_norm pattern.
+        _invert_qwen3_qk_perm(am, dst)
+        return
+    if arch_set & {"OlmoeForCausalLM"}:
+        _invert_olmoe_qk_perm(am, dst)
+        return
+    if arch_set & {
+        "Qwen3_5ForCausalLM", "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForCausalLM", "Qwen3_5MoeForConditionalGeneration",
+    }:
+        _invert_qwen3_5_perm(am, dst)
         return
     # Other archs: caller will get a louder failure if their
     # exported weights need a permute we haven't wired here.
@@ -137,6 +148,127 @@ def _invert_qwen3_qk_perm(am, dst: dict[str, torch.Tensor]) -> None:
         for nm in (
             f"model.layers.{i}.self_attn.q_norm.weight",
             f"model.layers.{i}.self_attn.k_norm.weight",
+        ):
+            t = dst.get(nm)
+            if t is None or t.dim() != 1 or t.numel() != head_dim:
+                continue
+            dst[nm] = t.index_select(0, head_perm_inv).contiguous()
+
+
+def _invert_olmoe_qk_perm(am, dst: dict[str, torch.Tensor]) -> None:
+    """OLMoE: full-RoPE halved->pair on Q/K (same as Llama). Plus
+    q_norm/k_norm full-row vectors share the same per-head_dim
+    permutation along their flat axis."""
+    dims = am.dims
+    n_heads = int(dims["n_heads"])
+    n_kv = int(dims["n_kv_heads"])
+    head_dim = int(dims["head_dim"])
+    n_layers = int(dims["n_layers"])
+    attn_dim = n_heads * head_dim
+    kv_dim = n_kv * head_dim
+    q_perm_inv = _invert_perm(_halved_to_pair_perm(attn_dim, head_dim, head_dim))
+    k_perm_inv = _invert_perm(_halved_to_pair_perm(kv_dim, head_dim, head_dim))
+    for i in range(n_layers):
+        for nm, perm in (
+            (f"model.layers.{i}.self_attn.q_proj.weight", q_perm_inv),
+            (f"model.layers.{i}.self_attn.k_proj.weight", k_perm_inv),
+            (f"model.layers.{i}.self_attn.q_norm.weight", q_perm_inv),
+            (f"model.layers.{i}.self_attn.k_norm.weight", k_perm_inv),
+        ):
+            t = dst.get(nm)
+            if t is None:
+                continue
+            dst[nm] = t.index_select(0, perm).contiguous()
+
+
+def _invert_qwen3_5_perm(am, dst: dict[str, torch.Tensor]) -> None:
+    """Inverse of Qwen3.5's load-side ``post_load_permute``:
+
+    1. **q_proj** (gated) — FT host stores ``(in, n_heads * 2 * head_dim)``
+       flat ``[Q_all | gate_all]`` with halved->pair on Q. ArchSpec
+       walk emits this as ``q_proj.weight`` (out=n_heads*2*head_dim,
+       in) via TRANSPOSE. We must invert by:
+         a) undo halved->pair on the Q portion (only the rope_dim
+            channels of each head's slice; the trailing
+            head_dim - rope_dim channels stay put)
+         b) re-arrange flat ``[Q_all | gate_all]`` back to per-head
+            ``[q_h | gate_h]``.
+    2. **k_proj** — partial-rotary halved->pair inverse.
+    3. **q_norm / k_norm** — head-internal halved->pair inverse on
+       the partial-rotary channels.
+    4. Layers without ``self_attn.*`` (linear-attn layers) are
+       skipped automatically because their entries are absent.
+
+    Operates only on full-attn layers (others have no q_proj /
+    k_proj). Multimodal Qwen3.5 saves use the
+    ``model.language_model.layers.{i}.*`` prefix.
+    """
+    dims = am.dims
+    head_dim = int(dims["head_dim"])
+    n_heads = int(dims["n_heads"])
+    n_kv = int(dims["n_kv_heads"])
+    n_layers = int(dims["n_layers"])
+    attn_dim = n_heads * head_dim
+    kv_dim = n_kv * head_dim
+    # Partial RoPE: only the first ``rope_dim`` channels of each head
+    # block go through the halved->pair perm; the rest stay put.
+    hp = getattr(am, "_hf_hyperparams", None) or {}
+    partial = float(hp.get("partial_rotary_factor", 0.25))
+    rope_dim = int(head_dim * partial)
+    q_perm_inv = _invert_perm(_halved_to_pair_perm(attn_dim, head_dim, rope_dim))
+    k_perm_inv = _invert_perm(_halved_to_pair_perm(kv_dim, head_dim, rope_dim))
+    head_perm_inv = _invert_perm(
+        _halved_to_pair_perm(head_dim, head_dim, rope_dim)
+    )
+
+    def _per_layer_prefix(i: int) -> str:
+        """Multimodal Qwen3.5 / Qwen3.5-MoE wraps weights under
+        ``model.language_model.layers.{i}.*``. Older / non-multimodal
+        saves use ``model.layers.{i}.*``. Probe."""
+        for cand in (
+            f"model.language_model.layers.{i}",
+            f"model.layers.{i}",
+        ):
+            if any(k.startswith(cand + ".") for k in dst):
+                return cand
+        # Default: language_model (matches what FT loads).
+        return f"model.language_model.layers.{i}"
+
+    for L in range(n_layers):
+        prefix = _per_layer_prefix(L)
+        # 1. q_proj: undo per-head [q | gate] split + halved->pair on Q.
+        nm_q = f"{prefix}.self_attn.q_proj.weight"
+        t_q = dst.get(nm_q)
+        if t_q is not None:
+            # FT host: (in, n_heads * 2 * head_dim) flat [Q_all | gate_all].
+            # ArchSpec TRANSPOSE produced (out=n_heads*2*head_dim, in) in dst.
+            # Undo halved->pair on the Q half (first attn_dim rows).
+            in_dim = t_q.shape[1]
+            assert t_q.shape[0] == n_heads * 2 * head_dim, (
+                f"q_proj export: expected first dim {n_heads*2*head_dim}, "
+                f"got {t_q.shape[0]}"
+            )
+            q_part = t_q[:attn_dim, :]                      # (attn_dim, in)
+            gate_part = t_q[attn_dim:, :]                   # (attn_dim, in)
+            # Undo halved->pair on Q rows.
+            q_part = q_part.index_select(0, q_perm_inv).contiguous()
+            # Re-interleave per-head: HF wants per-head [q_h | gate_h]
+            # along axis 0; FT had flat [Q_all | gate_all].
+            q_per_head = q_part.reshape(n_heads, head_dim, in_dim)
+            gate_per_head = gate_part.reshape(n_heads, head_dim, in_dim)
+            interleaved = torch.cat([q_per_head, gate_per_head], dim=1)  # (n_heads, 2*head_dim, in)
+            dst[nm_q] = interleaved.reshape(n_heads * 2 * head_dim, in_dim).contiguous()
+
+        # 2. k_proj: simple halved->pair inverse.
+        nm_k = f"{prefix}.self_attn.k_proj.weight"
+        t_k = dst.get(nm_k)
+        if t_k is not None:
+            dst[nm_k] = t_k.index_select(0, k_perm_inv).contiguous()
+
+        # 3. q_norm / k_norm: head-internal halved->pair inverse.
+        for nm in (
+            f"{prefix}.self_attn.q_norm.weight",
+            f"{prefix}.self_attn.k_norm.weight",
         ):
             t = dst.get(nm)
             if t is None or t.dim() != 1 or t.numel() != head_dim:
@@ -234,6 +366,8 @@ def save_hf_full(
     copy_hf_aux_files(hf_source_dir, out_dir)
 
     hf_state = _build_hf_state_dict_from_archspec(am, arch, src)
+    if arch.pre_export_hook is not None:
+        arch.pre_export_hook(am, hf_state, len(am.backbone))
     _post_export_permute_for_arch(am, hf_state, arch.hf_arch_ids)
 
     write_sharded_safetensors(

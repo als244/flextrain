@@ -122,6 +122,32 @@ def _olmoe_post_load_hook(
         )
 
 
+def _olmoe_pre_export_hook(am, dst, num_layers: int) -> None:
+    """Inverse of ``_olmoe_post_load_hook``: emit per-expert HF tensors
+    from FT's stacked ``w_up`` / ``w_down``. OLMoE has only the
+    per-expert format (no fused gate_up_proj).
+    """
+    from flextrain.export._pre_export_helpers import (
+        emit_routed_experts,
+        read_tie_word_embeddings,
+    )
+    for L in range(num_layers):
+        host = am.buffers.host_params[L]
+        w_up = host.get("w_up")
+        w_down = host.get("w_down")
+        if w_up is None or w_down is None:
+            continue
+        emit_routed_experts(
+            dst,
+            layer_prefix=f"model.layers.{L}",
+            w_up=w_up,
+            w_down=w_down,
+            fused=False,
+        )
+    if read_tie_word_embeddings(am):
+        dst.pop("lm_head.weight", None)
+
+
 OLMOE_ARCH = ArchSpec(
     hf_arch_ids=("OlmoeForCausalLM",),
     embed=(
@@ -197,6 +223,7 @@ OLMOE_ARCH = ArchSpec(
         # allocates empty tensors in dest; the hook populates them.
     ),
     post_load_hook=_olmoe_post_load_hook,
+    pre_export_hook=_olmoe_pre_export_hook,
 )
 
 register_arch(OLMOE_ARCH)

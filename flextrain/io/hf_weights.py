@@ -59,7 +59,7 @@ import glob
 import json
 import os
 from dataclasses import dataclass, field
-from typing import Callable, Mapping, MutableMapping
+from typing import Any, Callable, Mapping, MutableMapping
 
 import torch
 
@@ -152,6 +152,27 @@ class ArchSpec:
         read additional raw HF tensors via ``safe_open`` to populate
         the stacked FlexTrain tensors. Signature:
         ``(hf_path: str, dest: Mapping, num_layers: int) -> None``.
+    pre_export_hook
+        Symmetric inverse of ``post_load_hook``. Optional callable
+        invoked by ``save_hf_full`` after the ArchSpec walk emits the
+        per-tensor entries and BEFORE the final permute / write. Used
+        to:
+          1. Unstack FT 3-D MoE weights (``w_up (E, 2F, d)`` / ``w_down``)
+             back to per-expert HF tensors that the loader expects.
+          2. Unbundle FT linear-attn projections (``w_lin_qkvz`` /
+             ``w_lin_ba``) back to HF's split per-K-head form
+             (``in_proj_qkv`` / ``in_proj_z`` / ``in_proj_b`` /
+             ``in_proj_a``).
+          3. Subtract 1.0 from non-gated RMSNorm γ for arches whose HF
+             RMSNorm forwards ``(1 + weight) * x_normed`` (Qwen3.5 /
+             Qwen3.5-MoE / Qwen3-Next / Gemma2 / Gemma3) since FT
+             stores the canonical γ = 1 + w_HF on master.
+        The hook receives the active model, the MUTABLE HF state dict
+        (``{hf_name: cpu Tensor}``), and the layer count. It mutates
+        the dict in place: deletes any FT-stacked / FT-bundled tensors
+        listed in ArchSpec.layer that the dump should NOT contain, and
+        writes the per-expert / split / shifted HF tensors directly.
+        Signature: ``(am, dst, num_layers) -> None``.
     """
 
     hf_arch_ids: tuple[str, ...]
@@ -159,6 +180,7 @@ class ArchSpec:
     head: tuple[WeightMapEntry, ...]
     layer: tuple[WeightMapEntry, ...]
     post_load_hook: Callable[[str, Mapping, int], None] | None = None
+    pre_export_hook: Callable[[Any, MutableMapping, int], None] | None = None
 
 
 # Registry: hf_arch_id -> ArchSpec. ``register_arch`` populates it; arch

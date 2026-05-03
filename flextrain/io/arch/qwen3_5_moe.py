@@ -469,6 +469,101 @@ _FULL_ATTN_ENTRIES = (
 )
 
 
+def _qwen3_5_moe_pre_export_hook(am, dst, num_layers: int) -> None:
+    """Inverse of ``_qwen3_5_moe_post_load_hook``. Five operations
+    (mirror of the load hook):
+
+    1. Subtract 1.0 from every non-gated RMSNorm γ (input/post/q/k norms +
+       backbone-level final norm).
+    2. Linear-attn unbundle (split FT ``w_lin_qkvz`` / ``w_lin_ba`` back
+       into HF ``in_proj_qkv`` / ``in_proj_z`` / ``in_proj_b`` /
+       ``in_proj_a``).
+    3. Routed-expert unstack from option-B ``w_up`` / ``w_down`` to HF
+       fused ``mlp.experts.gate_up_proj`` / ``mlp.experts.down_proj``
+       (qwen3_5_moe ships fused on disk; per-expert fallback handled
+       inside ``emit_routed_experts``).
+    4. Shared-expert unstack from FT ``w_shared_up`` / ``w_shared_down`` /
+       ``w_shared_expert_gate`` to HF ``mlp.shared_expert.{gate,up,down}_proj``
+       and ``mlp.shared_expert_gate.weight``.
+    5. Tied embedding: drop ``lm_head.weight`` when the source config
+       has ``tie_word_embeddings: True`` (rare for 35B but possible).
+
+    The Q/K halved->pair perm + per-head [q|gate] split + q_norm/k_norm
+    head perm are handled by ``_invert_qwen3_5_perm`` in
+    ``flextrain.export._hf_full``.
+    """
+    from flextrain.export._pre_export_helpers import (
+        detect_fused_moe_format,
+        emit_linear_attn_unbundle,
+        emit_routed_experts,
+        emit_shared_experts,
+        read_tie_word_embeddings,
+        subtract_one_from_norms,
+    )
+    # ----- (1) Norm γ shift inverse. -----
+    norm_names: list[str] = []
+    for L in range(num_layers):
+        prefix = f"model.language_model.layers.{L}"
+        norm_names.append(f"{prefix}.input_layernorm.weight")
+        norm_names.append(f"{prefix}.post_attention_layernorm.weight")
+        norm_names.append(f"{prefix}.self_attn.q_norm.weight")
+        norm_names.append(f"{prefix}.self_attn.k_norm.weight")
+    norm_names.append("model.language_model.norm.weight")
+    subtract_one_from_norms(dst, norm_names)
+
+    # ----- (2) Linear-attn unbundle. -----
+    dims = am.dims
+    num_v = int(dims.get("linear_num_v_heads", dims.get("num_v_heads", 32)))
+    num_k = int(dims.get("linear_num_k_heads", dims.get("num_k_heads", 16)))
+    head_k = int(dims.get("linear_head_k_dim", dims.get("head_k_dim", 128)))
+    head_v = int(dims.get("linear_head_v_dim", dims.get("head_v_dim", 128)))
+
+    # ----- (3) MoE expert unstack. -----
+    src_dir = getattr(am, "_hf_source_path", None)
+    fused = detect_fused_moe_format(src_dir)
+    if fused is None:
+        # qwen3_5_moe canonical format is fused.
+        fused = True
+
+    for L in range(num_layers):
+        host = am.buffers.host_params[L]
+        prefix = f"model.language_model.layers.{L}"
+        # Linear-attn unbundle (only present on linear-attn layer
+        # indices — host won't have w_lin_qkvz on full-attn layers).
+        w_qkvz = host.get("w_lin_qkvz")
+        w_ba = host.get("w_lin_ba")
+        if w_qkvz is not None and w_ba is not None:
+            emit_linear_attn_unbundle(
+                dst,
+                layer_prefix=prefix,
+                w_lin_qkvz=w_qkvz, w_lin_ba=w_ba,
+                num_k_heads=num_k, num_v_heads=num_v,
+                head_k_dim=head_k, head_v_dim=head_v,
+            )
+        # Routed experts (every layer).
+        w_up = host.get("w_up")
+        w_down = host.get("w_down")
+        if w_up is not None and w_down is not None:
+            emit_routed_experts(
+                dst, layer_prefix=prefix,
+                w_up=w_up, w_down=w_down, fused=fused,
+            )
+        # Shared experts (every MoE layer).
+        w_shared_up = host.get("w_shared_up")
+        w_shared_down = host.get("w_shared_down")
+        if w_shared_up is not None and w_shared_down is not None:
+            emit_shared_experts(
+                dst, layer_prefix=prefix,
+                w_shared_up=w_shared_up,
+                w_shared_down=w_shared_down,
+                w_shared_gate=host.get("w_shared_expert_gate"),
+            )
+
+    # ----- (5) Tied embedding. -----
+    if read_tie_word_embeddings(am):
+        dst.pop("lm_head.weight", None)
+
+
 QWEN3_5_MOE_ARCH = ArchSpec(
     hf_arch_ids=("Qwen3_5MoeForConditionalGeneration", "Qwen3_5MoeForCausalLM"),
     embed=(
@@ -488,10 +583,12 @@ QWEN3_5_MOE_ARCH = ArchSpec(
             flextrain_name="w_head_proj",
             hf_name="lm_head.weight",
             transform=Transform.TRANSPOSE,
+            optional=True,
         ),
     ),
     layer=_COMMON_ENTRIES + _LINEAR_ATTN_ENTRIES + _FULL_ATTN_ENTRIES,
     post_load_hook=_qwen3_5_moe_post_load_hook,
+    pre_export_hook=_qwen3_5_moe_pre_export_hook,
 )
 
 register_arch(QWEN3_5_MOE_ARCH)
