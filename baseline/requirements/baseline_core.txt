@@ -33,8 +33,10 @@ liger-kernel
 
 # HF kernels loader + sonic-moe build deps (HF native MoE dispatch
 # uses kernels.lazy_load_kernel for kernels-community/sonic-moe).
+# `tvm-ffi` was renamed upstream to `apache-tvm-ffi` (the old PyPI
+# entry is yanked); both publish the same `tvm_ffi` top-level import.
 kernels
-tvm-ffi
+apache-tvm-ffi
 nvidia-cutlass-dsl
 
 # Linear / hybrid attention (Qwen3-Next, Qwen3.5-MoE).
