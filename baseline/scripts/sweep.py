@@ -241,13 +241,21 @@ def _run_one_backend(
     # run.err without grepping through training stdout.
     # ``# command:`` preamble is duplicated in both so each file is
     # self-describing when read in isolation.
+    #
+    # Pin cwd=REPO_ROOT so any relative paths in the config (the
+    # canonical example: ``model_path = "models/Llama-3.1-8B"``)
+    # resolve consistently regardless of where the user invoked
+    # sweep.py from. Without this, running ``cd baseline && python
+    # scripts/sweep.py ...`` looks for ``baseline/models/...``.
     with log_path.open("w") as log_file, err_path.open("w") as err_file:
         for f in (log_file, err_file):
             f.write(f"# command: {' '.join(cmd)}\n")
+            f.write(f"# cwd:     {REPO_ROOT}\n")
             f.flush()
         try:
             proc = subprocess.run(
-                cmd, stdout=log_file, stderr=err_file, check=False
+                cmd, stdout=log_file, stderr=err_file, check=False,
+                cwd=REPO_ROOT,
             )
         except Exception as exc:  # noqa: BLE001 — surface any launcher failure
             err_file.write(f"\n# launcher exception: {exc!r}\n")
