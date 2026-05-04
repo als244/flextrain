@@ -87,11 +87,11 @@ activation_offload = "cpu"
 optimizer_offload = "cpu"
 
 # -----------------------------------------------------------------------
-# MegaTrain (CPU-master, deepspeed_cpu_adam optimizer). Vendor default
-# checkpoint_interval=4 is a good baseline; sweep 1/2/4/8 if you need
-# the tightest fit.
+# MegaTrain (CPU-master, deepspeed_cpu_adam optimizer). The
+# train_synthetic.py default is already deepspeed_cpu_adam, so no
+# --optimizer override is needed. Vendor default checkpoint_interval=4
+# is a good baseline; sweep 1/2/4/8 if you need the tightest fit.
 # -----------------------------------------------------------------------
 [megatrain]
 activation_checkpoint_interval = 4
 num_grad_slabs = 12
-extra_args = ["--optimizer", "deepspeed_cpu_adam"]

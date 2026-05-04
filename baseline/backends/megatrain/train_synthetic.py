@@ -78,7 +78,11 @@ def parse_args() -> argparse.Namespace:
             "falls back to default; 'sonic' is strict."
         ),
     )
-    parser.add_argument("--optimizer", choices=["adamw", "deepspeed_cpu_adam"], default="adamw")
+    # Default to deepspeed_cpu_adam: MegaTrain is a CPU-master/offload
+    # backend, so a CPU-resident optimizer is the right default to keep
+    # the memory invariant (params, grads, opt state all in host RAM).
+    # The plain ``adamw`` choice stays available for parity testing.
+    parser.add_argument("--optimizer", choices=["adamw", "deepspeed_cpu_adam"], default="deepspeed_cpu_adam")
     return parser.parse_args()
 
 

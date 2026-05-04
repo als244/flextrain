@@ -101,7 +101,15 @@ def build_args(
       - Each key maps to its kebab-case CLI flag
         (``activation_checkpointing`` -> ``--activation-checkpointing``).
       - Bool true -> emit the flag (no value); bool false -> omit.
-      - List values for the special key ``extra_args`` are appended verbatim.
+      - The special key ``extra_args`` is a list of *backend-script*
+        flags (passed through to e.g. megatrain's train_synthetic.py
+        via ``--backend-extra-arg``). Each list element becomes one
+        ``--backend-extra-arg X`` pair, so
+        ``extra_args = ["--optimizer", "deepspeed_cpu_adam"]`` becomes
+        ``--backend-extra-arg --optimizer --backend-extra-arg deepspeed_cpu_adam``
+        on the run_baseline.py command line. Use this when you need a
+        backend-specific flag that the harness doesn't model as a
+        first-class TOML key.
       - Strings containing ``${NUM_GPUS}`` etc. are templated from ``ctx``.
     """
     merged: dict = {**common, **backend_section}
@@ -114,7 +122,8 @@ def build_args(
                 raise SystemExit(
                     f"config key 'extra_args' must be a list of strings, got {type(rendered).__name__}"
                 )
-            extra.extend(str(item) for item in rendered)
+            for item in rendered:
+                extra.extend(["--backend-extra-arg", str(item)])
             continue
         flag = f"--{_kebab(key)}"
         if isinstance(rendered, bool):
