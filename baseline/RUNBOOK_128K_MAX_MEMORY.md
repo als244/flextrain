@@ -16,22 +16,56 @@ just the bootstrap: clone, install, point at a checkpoint, run.
   3 8B checkpoints are 8K context only and will not work without rope
   scaling.
 
-## 1. Install backend envs (one-time)
+## 1. Install conda envs (one-time)
+
+The harness installs into two conda envs you'll see in `conda env list`:
+`baseline_core` (covers `trl_deepspeed`, `trl_fsdp`, `deepspeed_arctic`,
+`megatrain`, `torchtitan` — their pip deps are mutually compatible) and
+`baseline_megatron` (Megatron-Core + transformer-engine, kept in its own
+env because TE pins torch tightly).
 
 ```bash
 cd "$(git rev-parse --show-toplevel)"
-for backend in trl_fsdp trl_deepspeed deepspeed_arctic megatrain torchtitan megatron; do
-  baseline/scripts/install_backend.sh \
-    --backend "$backend" \
-    --torch-index-url auto \
-    --flash fa2 --flash-version 2.8.3
-done
+
+# Set up baseline_core (one invocation does all five core backends —
+# the core conda env is reused after the first --backend creates it).
+baseline/scripts/install_backend.sh --backend trl_deepspeed
+baseline/scripts/install_backend.sh --backend trl_fsdp
+baseline/scripts/install_backend.sh --backend deepspeed_arctic
+baseline/scripts/install_backend.sh --backend megatrain
+baseline/scripts/install_backend.sh --backend torchtitan
+
+# Set up baseline_megatron (its own conda env).
+baseline/scripts/install_backend.sh --backend megatron
 ```
 
-`--torch-index-url auto` picks the right PyTorch wheel for the local
-CUDA version. `--flash fa2 --flash-version 2.8.3` resolves an exact
-prebuilt FlashAttention 2 wheel; FA3 is auto-probed at runtime via the
-`auto` attention default.
+What each invocation does (idempotent — re-running is safe):
+- Creates the target conda env with `python=3.12` if not already present.
+- Detects the local CUDA via `nvidia-smi` and installs torch from the
+  matching wheel index (cu130 / cu128 / cu126 / cu124 / cu121).
+- Installs the consolidated requirements file
+  (`baseline/requirements/baseline_core.txt` or `baseline_megatron.txt`).
+- Resolves and installs prebuilt FlashAttention 2 + 3 wheels matching
+  the env's torch / CUDA / Python ABI / platform.
+- For backends that need it: editable-installs the MegaTrain or
+  TorchTitan vendor checkout (clones into `baseline/vendor/...` if no
+  local checkout exists).
+- Resolves and installs a matching prebuilt `causal-conv1d` wheel into
+  `baseline_core` (probes the detected torch tag and walks back through
+  earlier torch minors to find an ABI-compatible one).
+
+You can verify the conda envs after install with:
+
+```bash
+conda env list
+# # conda environments:
+# #
+# baseline_core         /home/.../miniconda3/envs/baseline_core
+# baseline_megatron     /home/.../miniconda3/envs/baseline_megatron
+```
+
+If you want a specific FA wheel version pinned (rather than the latest
+matching one), pass `--flash-version 2.8.3` etc. to the install command.
 
 ## 2. Point at your model
 

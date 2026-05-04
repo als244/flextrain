@@ -68,75 +68,112 @@ the canonical example.
 Running baselines does not require installing `flextrain` as a Python
 package. The launcher and synthetic datasets are repo-local source
 files; `baseline/run_baseline.py` adds the repo root to `PYTHONPATH`,
-and generated backend commands do the same. Each backend can therefore
-live in its own virtualenv with only that backend's dependencies
-installed.
+and generated backend commands do the same.
 
-Create an independent backend env with:
+The harness installs into **two conda envs** that you'll see in
+`conda env list`:
+
+| Conda env | Backends |
+|---|---|
+| `baseline_core` | `trl_deepspeed`, `trl_fsdp`, `deepspeed_arctic`, `megatrain`, `torchtitan` |
+| `baseline_megatron` | `megatron` |
+
+The five "core" backends share one env because their pip deps are
+mutually compatible. Megatron lives alone because `transformer-engine`
+pins torch tightly and historically conflicts with the deeper deps of
+the HF backends. Override env names with `--env-name NAME` if you want
+something else.
+
+Set up the envs:
 
 ```bash
+# baseline_core (one env covers five backends — re-running with a
+# different --backend just adds that backend's vendor checkout if any):
 baseline/scripts/install_backend.sh --backend trl_deepspeed
 baseline/scripts/install_backend.sh --backend trl_fsdp
 baseline/scripts/install_backend.sh --backend deepspeed_arctic
-baseline/scripts/install_backend.sh --backend torchtitan
-baseline/scripts/install_backend.sh --backend megatron
 baseline/scripts/install_backend.sh --backend megatrain
+baseline/scripts/install_backend.sh --backend torchtitan
+
+# baseline_megatron (separate env):
+baseline/scripts/install_backend.sh --backend megatron
 ```
 
-By default this creates `baseline/envs/<backend>`, installs Torch first
-from `https://download.pytorch.org/whl/cu126`, installs
-`baseline/requirements/<backend>.txt`, then installs matching prebuilt
-FlashAttention 2 and FlashAttention 3 wheels from
-[`mjun0812/flash-attention-prebuild-wheels`](https://github.com/mjun0812/flash-attention-prebuild-wheels)
-when a wheel exists for the env's Python/CUDA/Torch/platform
-combination. It also installs `flash-linear-attention` in every backend
-env; HF-style/Qwen-hybrid backends additionally try a matching prebuilt
-`causal-conv1d` wheel from
-[`Dao-AILab/causal-conv1d`](https://github.com/Dao-AILab/causal-conv1d/releases).
-The `causal-conv1d` resolver probes the detected torch tag first and
-then walks back through earlier torch minors (default 2) so a fresh
-torch release lacking exact prebuilt wheels still picks up the most
-recent ABI-compatible one without manual flags.
+What each invocation does (idempotent):
 
-MegaTrain and TorchTitan source checkouts are not vendored in git. The
-installer uses an existing checkout in `baseline/MegaTrain` or
-`baseline/TorchTitan` when present; otherwise it fetches them into
-ignored `baseline/vendor/...` directories. Override the source with
-`MEGATRAIN_REPO`, `MEGATRAIN_REF`, `TORCHTITAN_REPO`, or
-`TORCHTITAN_REF`.
+1. **Conda env**: creates the target env (`baseline_core` or
+   `baseline_megatron`) with `python=3.12` if missing, else reuses it.
+2. **Torch**: detects local CUDA via
+   [`baseline/scripts/detect_cuda.py`](scripts/detect_cuda.py)
+   (`nvidia-smi` → `nvcc` → `/usr/local/cuda/version.json`), maps to the
+   right torch wheel index (`cu130` / `cu128` / `cu126` / `cu124` /
+   `cu121`), and pip-installs `torch torchvision torchaudio` from that
+   index.
+3. **Requirements**: `pip install -r baseline/requirements/<env>.txt`
+   (consolidated `baseline_core.txt` or `baseline_megatron.txt`).
+4. **Vendor checkouts** (core env only): editable-installs MegaTrain
+   and TorchTitan if either is present in `baseline/<Name>/` or the
+   gitignored `baseline/vendor/<Name>/`; otherwise clones from the
+   pinned upstream.
+5. **FlashAttention**: resolves matching prebuilt FA2 + FA3 wheels from
+   [`mjun0812/flash-attention-prebuild-wheels`](https://github.com/mjun0812/flash-attention-prebuild-wheels)
+   based on the env's torch + CUDA + Python ABI + platform.
+6. **`flash-linear-attention`** + matching prebuilt `causal-conv1d`
+   wheel from
+   [`Dao-AILab/causal-conv1d`](https://github.com/Dao-AILab/causal-conv1d/releases)
+   (core env only). The `causal-conv1d` resolver probes the detected
+   torch tag and walks back through earlier torch minors (default 2)
+   so a fresh torch release without an exact prebuilt wheel still
+   picks up the most recent ABI-compatible one.
 
-Detect the local CUDA version with:
+Detect the local CUDA version manually:
 
 ```bash
 baseline/scripts/detect_cuda.py
+# cuda_version=13.1
+# torch_cuda_tag=cu130
+# torch_index_url=https://download.pytorch.org/whl/cu130
 ```
 
-Use the detected CUDA wheel index when that is what you want:
+Override the torch wheel index for a cluster image:
 
 ```bash
-baseline/scripts/install_backend.sh --backend trl_deepspeed --torch-index-url auto --recreate
+baseline/scripts/install_backend.sh --backend trl_deepspeed \
+  --torch-index-url https://download.pytorch.org/whl/cu130
 ```
 
-Or set the Torch source explicitly for a cluster image:
-
-```bash
-TORCH_INDEX_URL=https://download.pytorch.org/whl/cu130 \
-  baseline/scripts/install_backend.sh --backend trl_deepspeed --recreate
-```
-
-If Torch is already provisioned in the env:
+Skip the torch reinstall (env already has the torch you want):
 
 ```bash
 baseline/scripts/install_backend.sh --backend trl_deepspeed --skip-torch
 ```
 
-Useful install controls:
+Drop and recreate the conda env from scratch:
 
-- `--flash-version VERSION`: require an exact prebuilt FlashAttention package version, for example `--flash fa2 --flash-version 2.8.3`
-- `--linear-attention {auto,strict,none}`: install `flash-linear-attention` for all backends and Qwen hybrid-attention deps where useful; `auto` warns when no exact `causal-conv1d` wheel exists, `strict` fails
-- `--causal-conv1d-torch-tag TAG`: pin a specific causal-conv1d wheel torch tag (disables the automatic minor-version probing); only needed when you want a wheel other than the latest ABI-compatible one
+```bash
+baseline/scripts/install_backend.sh --backend trl_deepspeed --recreate
+```
 
-Run one backend with its own env:
+Other install controls:
+
+- `--env-name NAME`: target a non-default conda env (`baseline_core` /
+  `baseline_megatron` are the defaults). The `BASELINE_CORE_ENV` and
+  `BASELINE_MEGATRON_ENV` env vars override the defaults globally for
+  both `install_backend.sh` and `run_in_backend_env.sh`.
+- `--python-version VER`: python version for `conda create`. Default
+  `3.12`. Only honoured when the env is being created from scratch.
+- `--flash-version VERSION`: require an exact prebuilt FlashAttention
+  package version, e.g. `--flash fa2 --flash-version 2.8.3`.
+- `--linear-attention {auto,strict,none}`: install
+  `flash-linear-attention` and Qwen `causal-conv1d` deps where useful.
+  `auto` warns when no exact `causal-conv1d` wheel exists, `strict`
+  fails.
+- `--causal-conv1d-torch-tag TAG`: pin a specific `causal-conv1d` wheel
+  torch tag (disables the automatic minor-version probing); only needed
+  when you want a wheel other than the latest ABI-compatible one.
+
+Run one backend through the dispatcher (auto-activates the right
+conda env per backend):
 
 ```bash
 baseline/scripts/run_in_backend_env.sh trl_deepspeed \
@@ -145,16 +182,23 @@ baseline/scripts/run_in_backend_env.sh trl_deepspeed \
   --num-gpus 4
 ```
 
-`run_in_backend_env.sh` runs `baseline/scripts/check_cuda_compat.py`
-before the backend launches, so a torch wheel built for a CUDA newer
+`run_in_backend_env.sh` activates `baseline_core` or `baseline_megatron`
+based on the requested backend, then runs
+[`baseline/scripts/check_cuda_compat.py`](scripts/check_cuda_compat.py)
+before the backend launches — so a torch wheel built for a CUDA newer
 than the installed driver fails fast with an actionable message instead
 of an opaque CUDA error mid-run. Set `BASELINE_SKIP_CUDA_CHECK=1` to
 bypass (useful for CI installs done off-GPU) or
 `BASELINE_CUDA_CHECK_WARN_ONLY=1` to downgrade the failure to a warning.
 
-`--backend all` is still useful for dry-run command generation, but
-independent installs usually mean activating/running one backend env at
-a time.
+If you'd rather activate the env yourself once and run multiple
+backends:
+
+```bash
+conda activate baseline_core
+python baseline/run_baseline.py --backend trl_fsdp ...
+python baseline/run_baseline.py --backend trl_deepspeed ...
+```
 
 ## Common Arguments
 

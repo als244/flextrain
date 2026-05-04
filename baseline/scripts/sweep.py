@@ -189,19 +189,6 @@ def _resolve_backends(
     return requested
 
 
-def _ensure_env_dir(backend: str) -> Path | None:
-    """Return the backend env dir if it exists, else None.
-
-    The sweep doesn't install — that's a one-time setup step. If a backend's
-    env is missing, we record an error and skip it (rather than aborting the
-    whole sweep).
-    """
-    env_dir = BASELINE_DIR / "envs" / backend
-    if env_dir.is_dir() and (env_dir / "bin" / "activate").is_file():
-        return env_dir
-    return None
-
-
 def _run_one_backend(
     backend: str,
     cli_args: list[str],
@@ -213,22 +200,11 @@ def _run_one_backend(
 
     Status is one of:
       - 'ok'           : exited 0
-      - 'failed'       : exited non-zero
-      - 'no_env'       : backend env dir not present (skipped)
+      - 'failed'       : exited non-zero (incl. missing conda env — the
+                          wrapper script reports that with rc=2)
       - 'skipped_dry'  : dry-run mode, command emitted but not executed
     """
     backend_run_dir.mkdir(parents=True, exist_ok=True)
-
-    env_dir = _ensure_env_dir(backend)
-    if env_dir is None and not dry_run:
-        msg = (
-            f"[sweep] {backend}: env dir baseline/envs/{backend} missing or "
-            f"unactivatable. Run baseline/scripts/install_backend.sh "
-            f"--backend {backend} first."
-        )
-        print(msg, flush=True)
-        (backend_run_dir / "run.log").write_text(msg + "\n")
-        return backend, 127, "no_env"
 
     cmd = [
         str(RUN_IN_BACKEND_ENV),

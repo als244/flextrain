@@ -1,9 +1,0 @@
-transformers>=4.45
-accelerate
-datasets
-safetensors
-sentencepiece
-protobuf
-numpy
-megatron-core
-transformer-engine[pytorch]

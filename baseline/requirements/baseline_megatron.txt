@@ -1,0 +1,20 @@
+# Pip deps for the "baseline_megatron" conda env. Megatron-Core +
+# transformer-engine are kept in their own env because TE pins torch
+# carefully and historically conflicts with side-by-side installs of
+# the HF backends' deeper deps (deepspeed, kernels, tvm-ffi, etc).
+#
+# NOT included (auto-installed by baseline/scripts/install_backend.sh):
+#   * torch / torchvision / torchaudio (chosen via --torch-index-url
+#     auto from detect_cuda.py)
+#   * flash-attn 2 and/or 3 (resolved by install_flash_attention_wheels.py)
+
+transformers>=4.45
+accelerate
+datasets
+safetensors
+sentencepiece
+protobuf
+numpy
+
+megatron-core
+transformer-engine[pytorch]

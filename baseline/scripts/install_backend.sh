@@ -6,24 +6,39 @@ usage() {
 Usage:
   baseline/scripts/install_backend.sh --backend BACKEND [options]
 
-Backends:
-  megatrain, torchtitan, trl_deepspeed, deepspeed_arctic, megatron
+Backends and their target conda env (visible in `conda env list`):
+  trl_deepspeed, trl_fsdp, deepspeed_arctic, megatrain, torchtitan
+                                                  -> baseline_core
+  megatron                                        -> baseline_megatron
+
+The five "core" backends share one conda env because their pip deps
+are mutually compatible. Megatron is split out because
+transformer-engine pins torch tightly and historically conflicts with
+the deeper deps of the HF backends.
 
 Options:
-  --env-dir PATH          Virtualenv path. Default: baseline/envs/BACKEND
-  --python PYTHON         Python executable for venv creation. Default: python3
-  --torch-index-url URL   PyTorch wheel index. Default: https://download.pytorch.org/whl/cu126
-                           Use "auto" to select from the local CUDA version.
-  --torch-packages LIST   Torch packages to install before backend deps. Default: "torch torchvision torchaudio"
+  --env-name NAME         Conda env name. Default: baseline_core for all
+                          backends except megatron, which targets
+                          baseline_megatron.
+  --python-version VER    Python version for `conda create`. Default: 3.12
+                          (only used when the env is created from scratch).
+  --torch-index-url URL   PyTorch wheel index. Default: auto (detect
+                          from local CUDA via baseline/scripts/detect_cuda.py).
+                          Pass an explicit URL like
+                          https://download.pytorch.org/whl/cu130 to pin.
+  --torch-packages LIST   Torch packages to install before backend deps.
+                          Default: "torch torchvision torchaudio"
   --skip-torch            Do not install torch; useful for pre-provisioned envs.
   --flash MODE            Flash wheel install mode: both, fa2, fa3, none. Default: both
   --flash-version VERSION Require an exact FlashAttention wheel version.
-  --linear-attention MODE Install flash-linear-attention in every env; also install
-                          Qwen causal-conv1d deps where useful. auto, strict, none.
-                          Default: auto
+  --linear-attention MODE Install flash-linear-attention; also install
+                          Qwen causal-conv1d wheels where useful.
+                          auto, strict, none. Default: auto
   --causal-conv1d-torch-tag TAG
-                          Override causal-conv1d wheel Torch tag, e.g. torch2.10.
-  --recreate              Remove the env dir before creating it.
+                          Pin a specific causal-conv1d wheel torch tag
+                          (disables minor-version probing).
+  --recreate              Drop the conda env (`conda env remove`) before
+                          recreating it.
 EOF
 }
 
@@ -38,9 +53,9 @@ TORCHTITAN_REPO="${TORCHTITAN_REPO:-https://github.com/pytorch/torchtitan.git}"
 TORCHTITAN_REF="${TORCHTITAN_REF:-}"
 
 BACKEND=""
-ENV_DIR=""
-PYTHON_BIN="${PYTHON:-python3}"
-TORCH_INDEX_URL="${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu126}"
+ENV_NAME=""
+PYTHON_VERSION="${PYTHON_VERSION:-3.12}"
+TORCH_INDEX_URL="${TORCH_INDEX_URL:-auto}"
 TORCH_PACKAGES="${TORCH_PACKAGES:-torch torchvision torchaudio}"
 SKIP_TORCH=0
 FLASH_MODE="${FLASH_MODE:-both}"
@@ -70,18 +85,44 @@ ensure_git_checkout() {
   fi
 }
 
+# Source conda's shell hook so `conda activate` works inside this script.
+# Looks at $CONDA_EXE first (set by conda activate), then PATH, then a
+# couple of common install locations.
+init_conda() {
+  local conda_bin
+  if [[ -n "${CONDA_EXE:-}" ]] && [[ -x "${CONDA_EXE}" ]]; then
+    conda_bin="${CONDA_EXE}"
+  elif command -v conda >/dev/null 2>&1; then
+    conda_bin="$(command -v conda)"
+  elif [[ -x "${HOME}/miniconda3/bin/conda" ]]; then
+    conda_bin="${HOME}/miniconda3/bin/conda"
+  elif [[ -x "${HOME}/anaconda3/bin/conda" ]]; then
+    conda_bin="${HOME}/anaconda3/bin/conda"
+  else
+    echo "error: conda not found on PATH and not at \$CONDA_EXE / ~/miniconda3 / ~/anaconda3" >&2
+    echo "       install Miniconda first, or set CONDA_EXE to your conda binary." >&2
+    exit 2
+  fi
+  # shellcheck source=/dev/null
+  eval "$("${conda_bin}" shell.bash hook)"
+}
+
+env_exists() {
+  conda env list | awk 'NR>2 {print $1}' | grep -qx "$1"
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --backend)
       BACKEND="$2"
       shift 2
       ;;
-    --env-dir)
-      ENV_DIR="$2"
+    --env-name)
+      ENV_NAME="$2"
       shift 2
       ;;
-    --python)
-      PYTHON_BIN="$2"
+    --python-version)
+      PYTHON_VERSION="$2"
       shift 2
       ;;
     --torch-index-url)
@@ -142,17 +183,38 @@ case "${BACKEND}" in
     ;;
 esac
 
-if [[ -z "${ENV_DIR}" ]]; then
-  ENV_DIR="${BASELINE_DIR}/envs/${BACKEND}"
+# Map backend -> default conda env. Megatron lives alone because
+# transformer-engine doesn't compose well with the HF backends' deps.
+if [[ -z "${ENV_NAME}" ]]; then
+  case "${BACKEND}" in
+    megatron) ENV_NAME="baseline_megatron" ;;
+    *)        ENV_NAME="baseline_core" ;;
+  esac
 fi
 
-if [[ "${RECREATE}" == "1" ]]; then
-  rm -rf "${ENV_DIR}"
+# Map env -> consolidated requirements file. The five core backends
+# share baseline_core.txt (their deps are mutually compatible).
+case "${ENV_NAME}" in
+  baseline_core)     REQ_FILE="${BASELINE_DIR}/requirements/baseline_core.txt" ;;
+  baseline_megatron) REQ_FILE="${BASELINE_DIR}/requirements/baseline_megatron.txt" ;;
+  *)                 REQ_FILE="${BASELINE_DIR}/requirements/${ENV_NAME}.txt" ;;
+esac
+
+init_conda
+
+if [[ "${RECREATE}" == "1" ]] && env_exists "${ENV_NAME}"; then
+  echo "Removing existing conda env: ${ENV_NAME}"
+  conda env remove -n "${ENV_NAME}" -y
 fi
 
-"${PYTHON_BIN}" -m venv "${ENV_DIR}"
-# shellcheck source=/dev/null
-source "${ENV_DIR}/bin/activate"
+if env_exists "${ENV_NAME}"; then
+  echo "Reusing existing conda env: ${ENV_NAME}"
+else
+  echo "Creating conda env: ${ENV_NAME} (python=${PYTHON_VERSION})"
+  conda create -n "${ENV_NAME}" "python=${PYTHON_VERSION}" -y
+fi
+
+conda activate "${ENV_NAME}"
 
 python -m pip install --upgrade pip setuptools wheel packaging
 
@@ -169,21 +231,26 @@ if [[ "${SKIP_TORCH}" == "0" ]]; then
   fi
 fi
 
-REQ_FILE="${BASELINE_DIR}/requirements/${BACKEND}.txt"
 if [[ -f "${REQ_FILE}" ]]; then
   python -m pip install -r "${REQ_FILE}"
+else
+  echo "warning: no requirements file at ${REQ_FILE}; skipping pip install -r" >&2
 fi
 
-case "${BACKEND}" in
-  megatrain)
+# Editable installs of vendor checkouts (megatrain + torchtitan).
+# Only run for the core env since megatron has its own world.
+if [[ "${ENV_NAME}" == "baseline_core" ]]; then
+  if [[ "${BACKEND}" == "megatrain" ]] || [[ -d "${BASELINE_DIR}/MegaTrain" ]] || [[ -d "${VENDOR_DIR}/MegaTrain" ]]; then
     MEGATRAIN_ROOT="${BASELINE_DIR}/MegaTrain"
     if [[ ! -f "${MEGATRAIN_ROOT}/setup.py" ]]; then
       MEGATRAIN_ROOT="${VENDOR_DIR}/MegaTrain"
-      ensure_git_checkout "MegaTrain" "${MEGATRAIN_REPO}" "${MEGATRAIN_REF}" "${MEGATRAIN_ROOT}"
+      if [[ ! -f "${MEGATRAIN_ROOT}/setup.py" ]]; then
+        ensure_git_checkout "MegaTrain" "${MEGATRAIN_REPO}" "${MEGATRAIN_REF}" "${MEGATRAIN_ROOT}"
+      fi
     fi
     python -m pip install -e "${MEGATRAIN_ROOT}"
-    ;;
-  torchtitan)
+  fi
+  if [[ "${BACKEND}" == "torchtitan" ]] || [[ -d "${BASELINE_DIR}/TorchTitan/torchtitan" ]] || [[ -d "${VENDOR_DIR}/TorchTitan/torchtitan" ]]; then
     TORCHTITAN_ROOT="${BASELINE_DIR}/TorchTitan"
     if [[ ! -d "${TORCHTITAN_ROOT}/torchtitan" ]]; then
       TORCHTITAN_ROOT="${VENDOR_DIR}/TorchTitan"
@@ -197,10 +264,10 @@ case "${BACKEND}" in
     if [[ -d "${TORCHTITAN_ROOT}/torchtitan" ]]; then
       python -m pip install -e "${TORCHTITAN_ROOT}"
     else
-      echo "warning: no TorchTitan checkout found; place one in baseline/TorchTitan or orig/baseline/torchtitan" >&2
+      echo "warning: no TorchTitan checkout found; the torchtitan backend will not be importable in ${ENV_NAME}" >&2
     fi
-    ;;
-esac
+  fi
+fi
 
 case "${FLASH_MODE}" in
   both)
@@ -242,32 +309,35 @@ esac
 
 if [[ "${LINEAR_ATTENTION_MODE}" != "none" ]]; then
   python -m pip install flash-linear-attention
-  case "${BACKEND}" in
-    megatrain|trl_deepspeed|deepspeed_arctic|trl_fsdp)
-      # The wheel installer probes the detected torch tag first and then
-      # walks back through earlier torch minors (default 2) to find a
-      # prebuilt wheel. Override with --causal-conv1d-torch-tag only if
-      # you need to pin a specific known-good wheel.
-      CAUSAL_ARGS=()
-      if [[ -n "${CAUSAL_CONV1D_TORCH_TAG}" ]]; then
-        CAUSAL_ARGS+=(--torch-tag "${CAUSAL_CONV1D_TORCH_TAG}")
-      fi
-      if [[ "${LINEAR_ATTENTION_MODE}" == "auto" ]]; then
-        CAUSAL_ARGS+=(--optional)
-      fi
-      python "${BASELINE_DIR}/scripts/install_causal_conv1d_wheel.py" "${CAUSAL_ARGS[@]}"
-      ;;
-  esac
+  # causal-conv1d only matters for HF / Qwen-hybrid paths (not megatron).
+  if [[ "${ENV_NAME}" == "baseline_core" ]]; then
+    # The wheel installer probes the detected torch tag first and then
+    # walks back through earlier torch minors (default 2) to find a
+    # prebuilt wheel. Override with --causal-conv1d-torch-tag only if
+    # you need to pin a specific known-good wheel.
+    CAUSAL_ARGS=()
+    if [[ -n "${CAUSAL_CONV1D_TORCH_TAG}" ]]; then
+      CAUSAL_ARGS+=(--torch-tag "${CAUSAL_CONV1D_TORCH_TAG}")
+    fi
+    if [[ "${LINEAR_ATTENTION_MODE}" == "auto" ]]; then
+      CAUSAL_ARGS+=(--optional)
+    fi
+    python "${BASELINE_DIR}/scripts/install_causal_conv1d_wheel.py" "${CAUSAL_ARGS[@]}"
+  fi
 fi
 
 cat <<EOF
 
-Installed ${BACKEND} environment:
-  ${ENV_DIR}
+Installed backend "${BACKEND}" into conda env: ${ENV_NAME}
+Visible in: conda env list
 
 Activate it with:
-  source ${ENV_DIR}/bin/activate
+  conda activate ${ENV_NAME}
 
 Run this backend with:
+  conda activate ${ENV_NAME}
   python ${BASELINE_DIR}/run_baseline.py --backend ${BACKEND} ...
+
+Or use the dispatcher (auto-activates the right env per backend):
+  ${BASELINE_DIR}/scripts/run_in_backend_env.sh ${BACKEND} ...
 EOF

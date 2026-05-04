@@ -1,0 +1,50 @@
+# Pip deps for the "baseline_core" conda env. Covers all HF-loading
+# backends + torchtitan: trl_deepspeed, trl_fsdp, deepspeed_arctic,
+# megatrain, torchtitan.
+#
+# NOT included (you install these yourself before running pip install):
+#   * torch / torchvision / torchaudio (pick the wheel matching your CUDA)
+#   * flash-attn 2 and/or 3 (pick the wheel matching your torch + CUDA)
+#
+# Vendor checkouts (megatrain, torchtitan) need editable installs after
+# this requirements pass — see baseline/RUNBOOK_128K_MAX_MEMORY.md for
+# the conda + editable-install walkthrough.
+
+# Core HF stack used by every backend.
+transformers>=4.45
+accelerate>=1.0
+datasets
+safetensors
+sentencepiece
+protobuf
+numpy
+psutil
+pyyaml
+fsspec
+einops
+pillow
+
+# DeepSpeed (used by trl_deepspeed, deepspeed_arctic, megatrain).
+deepspeed
+
+# TRL stack (trl_deepspeed, trl_fsdp).
+trl
+liger-kernel
+
+# HF kernels loader + sonic-moe build deps (HF native MoE dispatch
+# uses kernels.lazy_load_kernel for kernels-community/sonic-moe).
+kernels
+tvm-ffi
+nvidia-cutlass-dsl
+
+# Linear / hybrid attention (Qwen3-Next, Qwen3.5-MoE).
+flash-linear-attention
+
+# torchtitan-specific extras.
+torchdata>=0.8.0
+tokenizers>=0.15.0
+tyro>=1.0.5
+
+# Logging / dashboards used by torchtitan.
+tensorboard
+wandb
