@@ -1,0 +1,90 @@
+# 128K-context maximum-memory-savings sweep for Qwen3-30B-A3B (single-GPU).
+#
+# Qwen3-30B-A3B is a sparse MoE model (30B params, 3B active).
+# ``moe_kernel_backend = "auto"`` engages HF transformers' native
+# ``model.set_experts_implementation("sonicmoe")`` dispatch on the
+# four HF-loading backends (trl_*, deepspeed_arctic, megatrain) and
+# silently no-ops on TorchTitan / Megatron. TorchTitan's registry
+# may not cover this model — that backend will surface as an OOM /
+# error in the sweep summary, which is a meaningful data point.
+#
+# Each [<backend>] section produces one run; the sweep launcher
+# (baseline/scripts/sweep.py) walks them in declaration order, advancing
+# past failures and writing a per-step throughput.csv at the end.
+
+[common]
+model_path = "models/Qwen3-30B-A3B"
+seq_length = 131072
+micro_batch_size = 1
+gradient_accumulation_steps = 1
+num_steps = 3
+num_gpus = 1
+moe_kernel_backend = "auto"
+
+# -----------------------------------------------------------------------
+# TRL + FSDP2 (TRL SFTTrainer + accelerate FSDP2 plugin).
+# -----------------------------------------------------------------------
+[trl_fsdp]
+fsdp_shard_degree = "${NUM_GPUS}"
+fsdp_replicate_degree = 1
+param_offload = "cpu"
+optimizer_offload = "cpu"
+activation_checkpointing = "full"
+activation_offload = "cpu"
+liger_kernel = "auto"
+
+# -----------------------------------------------------------------------
+# TRL + DeepSpeed (HF SFTTrainer + DeepSpeed ZeRO).
+# -----------------------------------------------------------------------
+[trl_deepspeed]
+zero_stage = 3
+param_offload = "cpu"
+optimizer_offload = "cpu"
+activation_checkpointing = "full"
+activation_offload = "cpu"
+liger_kernel = "auto"
+
+# -----------------------------------------------------------------------
+# DeepSpeed Arctic / ALST.
+# -----------------------------------------------------------------------
+[deepspeed_arctic]
+zero_stage = 3
+param_offload = "cpu"
+optimizer_offload = "cpu"
+activation_checkpointing = "full"
+activation_offload = "cpu"
+sequence_parallel_size = "${NUM_GPUS}"
+tiled_loss_shards = 16
+tiled_mlp = true
+
+# -----------------------------------------------------------------------
+# TorchTitan. The built-in registry may not cover Qwen3-30B-A3B
+# (sparse MoE, 30B). The launcher tries it anyway; expect a failure
+# row in the sweep summary if so.
+# -----------------------------------------------------------------------
+[torchtitan]
+activation_checkpointing = "full"
+activation_offload = "cpu"
+param_offload = "cpu"
+optimizer_offload = "cpu"
+fsdp_shard_degree = "${NUM_GPUS}"
+fsdp_replicate_degree = 1
+
+# -----------------------------------------------------------------------
+# Megatron-Core.
+# -----------------------------------------------------------------------
+[megatron]
+activation_checkpointing = "full"
+recompute_granularity = "full"
+recompute_method = "uniform"
+recompute_num_layers = 1
+activation_offload = "cpu"
+optimizer_offload = "cpu"
+
+# -----------------------------------------------------------------------
+# MegaTrain. Uses deepspeed_cpu_adam by default (set in
+# baseline/backends/megatrain/train_synthetic.py).
+# -----------------------------------------------------------------------
+[megatrain]
+activation_checkpoint_interval = 4
+num_grad_slabs = 12

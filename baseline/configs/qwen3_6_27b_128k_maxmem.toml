@@ -1,0 +1,85 @@
+# 128K-context maximum-memory-savings sweep for Qwen3.6-27B (single-GPU).
+#
+# Qwen3.6-27B is a dense 27B model — no MoE. ``moe_kernel_backend``
+# is left at the harness default ("hf" / model's own implementation);
+# changing it would no-op on dense models anyway.
+#
+# Each [<backend>] section produces one run; the sweep launcher
+# (baseline/scripts/sweep.py) walks them in declaration order, advancing
+# past failures and writing a per-step throughput.csv at the end.
+
+[common]
+model_path = "models/Qwen3.6-27B"
+seq_length = 131072
+micro_batch_size = 1
+gradient_accumulation_steps = 1
+num_steps = 3
+num_gpus = 1
+
+# -----------------------------------------------------------------------
+# TRL + FSDP2 (TRL SFTTrainer + accelerate FSDP2 plugin).
+# -----------------------------------------------------------------------
+[trl_fsdp]
+fsdp_shard_degree = "${NUM_GPUS}"
+fsdp_replicate_degree = 1
+param_offload = "cpu"
+optimizer_offload = "cpu"
+activation_checkpointing = "full"
+activation_offload = "cpu"
+liger_kernel = "auto"
+
+# -----------------------------------------------------------------------
+# TRL + DeepSpeed (HF SFTTrainer + DeepSpeed ZeRO).
+# -----------------------------------------------------------------------
+[trl_deepspeed]
+zero_stage = 3
+param_offload = "cpu"
+optimizer_offload = "cpu"
+activation_checkpointing = "full"
+activation_offload = "cpu"
+liger_kernel = "auto"
+
+# -----------------------------------------------------------------------
+# DeepSpeed Arctic / ALST.
+# -----------------------------------------------------------------------
+[deepspeed_arctic]
+zero_stage = 3
+param_offload = "cpu"
+optimizer_offload = "cpu"
+activation_checkpointing = "full"
+activation_offload = "cpu"
+sequence_parallel_size = "${NUM_GPUS}"
+tiled_loss_shards = 16
+tiled_mlp = true
+
+# -----------------------------------------------------------------------
+# TorchTitan. The built-in registry may not cover Qwen3.6-27B; the
+# launcher tries it anyway. Expect a failure row in the sweep summary
+# if the registry inference returns a debug-model fallback or errors.
+# -----------------------------------------------------------------------
+[torchtitan]
+activation_checkpointing = "full"
+activation_offload = "cpu"
+param_offload = "cpu"
+optimizer_offload = "cpu"
+fsdp_shard_degree = "${NUM_GPUS}"
+fsdp_replicate_degree = 1
+
+# -----------------------------------------------------------------------
+# Megatron-Core.
+# -----------------------------------------------------------------------
+[megatron]
+activation_checkpointing = "full"
+recompute_granularity = "full"
+recompute_method = "uniform"
+recompute_num_layers = 1
+activation_offload = "cpu"
+optimizer_offload = "cpu"
+
+# -----------------------------------------------------------------------
+# MegaTrain. Uses deepspeed_cpu_adam by default (set in
+# baseline/backends/megatrain/train_synthetic.py).
+# -----------------------------------------------------------------------
+[megatrain]
+activation_checkpoint_interval = 4
+num_grad_slabs = 12

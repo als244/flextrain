@@ -6,6 +6,10 @@
 /vendor/
 /MegaTrain/
 
+# Local-only paper-figure plotting (numbers in the script's DATA dict
+# stay private until the figure is finalized).
+/scripts/plot_128k_throughput.py
+
 # Python/build artifacts.
 __pycache__/
 *.py[cod]
