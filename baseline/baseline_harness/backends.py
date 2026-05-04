@@ -181,16 +181,30 @@ def _write_yaml(path: Path, payload: dict) -> Path:
 def _accelerate_fsdp_config(config: HarnessConfig) -> dict:
     """Generate an accelerate launch config that wraps the model with FSDP2.
 
-    bf16 master/grads/opt: ``mixed_precision: bf16`` plus FSDP2's
-    MixedPrecisionPolicy (param_dtype=bf16, reduce_dtype=bf16) keep params
-    sharded in bf16 with no fp32 master copy. This matches the bf16-master
-    semantics the DeepSpeed config establishes for trl_deepspeed.
+    bf16 master / grads / opt:
+      ``mixed_precision: "no"`` is intentional. With ``mixed_precision:
+      "bf16"``, accelerate upcasts the loaded bf16 parameters to fp32
+      master copies (logged at runtime as
+      "FSDP upcast of low precision parameters to fp32 ..."), giving
+      params=fp32 + grads=fp32 + opt=fp32 — the exact opposite of the
+      bf16-master invariant the harness enforces. With
+      ``mixed_precision: "no"``, accelerate adds no autocast layer; the
+      model loads in bf16 (``torch_dtype=torch.bfloat16``), FSDP2 keeps
+      the shards in their loaded dtype, and reductions happen in bf16
+      via FSDP2's reduce_dtype default. The trainer-side ``bf16=True``
+      flag is also dropped in train_synthetic.py for the same reason
+      (it would re-add the autocast we're disabling here).
 
-    Offloading: FSDP2 ties param/grad/opt offload together (they share the
-    sharded ``DTensor`` storage). Setting either ``--param-offload cpu`` or
-    ``--optimizer-offload cpu`` flips ``fsdp_offload_params: true`` — both
-    move with the params. We surface this in the launch plan ``notes``.
-    Activation offload is handled by SFTConfig's ``activation_offloading``.
+    Offloading: FSDP2 ties param/grad/opt offload together (they share
+    the sharded ``DTensor`` storage). Setting either
+    ``--param-offload cpu`` or ``--optimizer-offload cpu`` flips
+    ``fsdp_offload_params: true`` — both move with the params. We
+    surface this in the launch plan ``notes``. Activation offload is
+    handled by SFTConfig's ``activation_offloading``.
+
+    ``fsdp_backward_prefetch`` is omitted: FSDP2 dropped this knob and
+    accelerate logs a warning ("backward_prefetch is not supported in
+    FSDP2. Setting backward prefetch to None.") if you set it.
     """
     offload_params = (
         config.param_offload == "cpu" or config.optimizer_offload == "cpu"
@@ -207,7 +221,6 @@ def _accelerate_fsdp_config(config: HarnessConfig) -> dict:
         "fsdp_cpu_ram_efficient_loading": True,
         "fsdp_sync_module_states": True,
         "fsdp_forward_prefetch": False,
-        "fsdp_backward_prefetch": "BACKWARD_PRE",
         "fsdp_activation_checkpointing": config.activation_checkpointing != "none",
     }
     return {
@@ -217,7 +230,11 @@ def _accelerate_fsdp_config(config: HarnessConfig) -> dict:
         "fsdp_config": fsdp_block,
         "machine_rank": 0,
         "main_training_function": "main",
-        "mixed_precision": "bf16",
+        # Intentionally "no" — see docstring. The bf16-master invariant
+        # is enforced by loading the model in bf16 + FSDP2 keeping
+        # shards in their loaded dtype, NOT by accelerate's mixed-
+        # precision policy (which upcasts to fp32 master).
+        "mixed_precision": "no",
         "num_machines": 1,
         "num_processes": config.num_gpus,
         "rdzv_backend": "static",
@@ -560,21 +577,27 @@ def build_torchtitan(config: HarnessConfig, model: ModelInfo) -> LaunchPlan:
 
     ac_mode, _ac_option = _fractional_mode(config)
     # NOTE on flag stability: torchtitan has been refactoring its
-    # JobConfig schema between releases (the `__version__` string
+    # JobConfig schema between releases (the ``__version__`` string
     # currently lags behind main, so a pinned 0.2.2 install is often
     # actually a post-0.2.2 main checkout). We only emit flags that
-    # exist on both v0.2.2 and main. Specifically dropped:
-    #   - --activation_checkpoint.selective_ac_option (gone in main;
-    #     selective granularity is now controlled by per_op SAC FQNs)
+    # the user's vendored torchtitan has actually accepted on this
+    # box. Specifically dropped:
+    #   - --activation_checkpoint.selective_ac_option (gone in
+    #     post-v0.2.2 main; selective granularity is now controlled
+    #     by per_op SAC FQNs)
     #   - --training.enable_activation_offload (never existed; we
     #     leave activation offload to FSDP's own offload policy
     #     toggled via --training.enable_cpu_offload)
-    #   - --dataloader.vocab_size and --dataloader.seed (no longer
-    #     part of the public CLI — torchtitan reads vocab from the
-    #     HF assets, and seed defaults at the trainer level)
-    # ``--model.hf_assets_path`` and ``--job.dump_folder`` use the
-    # dotted form because those fields live on the Model and Job
-    # dataclasses respectively (not at JobConfig top-level).
+    #   - --dataloader.vocab_size / --dataloader.seed (no longer in
+    #     the public CLI — torchtitan reads vocab from the HF assets,
+    #     and seed defaults at the trainer level)
+    # ``--hf_assets_path`` and ``--dump_folder`` are TOP-LEVEL flags
+    # (no Model/Job dataclass prefix). On the live box, prefixed forms
+    # like ``--model.hf_assets_path`` are rejected with
+    # "Arguments similar to --job.dump_folder: --dump-folder" — i.e.
+    # the schema has flattened these out of their dataclasses. We use
+    # the underscore form; tyro accepts both ``_`` and ``-`` as
+    # separators for the same field.
     command = [
         "torchrun",
         f"--nproc_per_node={config.num_gpus}",
@@ -590,9 +613,9 @@ def build_torchtitan(config: HarnessConfig, model: ModelInfo) -> LaunchPlan:
         module,
         "--config",
         registry_config,
-        "--model.hf_assets_path",
+        "--hf_assets_path",
         str(model.path),
-        "--job.dump_folder",
+        "--dump_folder",
         str(out),
         "--training.local_batch_size",
         str(config.micro_batch_size),
