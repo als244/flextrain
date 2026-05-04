@@ -1,0 +1,1 @@
+"""TorchTitan synthetic registry package."""

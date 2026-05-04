@@ -1,0 +1,21 @@
+# Generated local state.
+/.pip-cache/
+/envs/
+/runs/*
+!/runs/.gitkeep
+/vendor/
+/MegaTrain/
+
+# Python/build artifacts.
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.egg-info/
+
+# Native extension build products in fetched vendor trees.
+*.so
+*.o
+.ninja_deps
+.ninja_log
+build.ninja

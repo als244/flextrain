@@ -1,0 +1,10 @@
+transformers>=4.45
+accelerate
+datasets
+safetensors
+sentencepiece
+protobuf
+deepspeed
+kernels
+tvm-ffi
+nvidia-cutlass-dsl
