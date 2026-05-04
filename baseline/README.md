@@ -40,7 +40,7 @@ baseline/scripts/install_backend.sh --backend megatron
 baseline/scripts/install_backend.sh --backend megatrain
 ```
 
-By default this creates `baseline/envs/<backend>`, installs Torch first from `https://download.pytorch.org/whl/cu126`, installs `baseline/requirements/<backend>.txt`, then installs matching prebuilt FlashAttention 2 and FlashAttention 3 wheels from `mjun0812/flash-attention-prebuild-wheels` when a wheel exists for the env's Python/CUDA/Torch/platform combination. It also installs `flash-linear-attention` in every backend env; HF-style/Qwen-hybrid backends additionally try a matching prebuilt `causal-conv1d` wheel from `Dao-AILab/causal-conv1d`.
+By default this creates `baseline/envs/<backend>`, installs Torch first from `https://download.pytorch.org/whl/cu126`, installs `baseline/requirements/<backend>.txt`, then installs matching prebuilt FlashAttention 2 and FlashAttention 3 wheels from `mjun0812/flash-attention-prebuild-wheels` when a wheel exists for the env's Python/CUDA/Torch/platform combination. It also installs `flash-linear-attention` in every backend env; HF-style/Qwen-hybrid backends additionally try a matching prebuilt `causal-conv1d` wheel from `Dao-AILab/causal-conv1d`. The `causal-conv1d` resolver probes the detected torch tag first and then walks back through earlier torch minors (default 2) so a fresh torch release lacking exact prebuilt wheels still picks up the most recent ABI-compatible one without manual flags.
 
 MegaTrain and TorchTitan source checkouts are not vendored in git. The installer uses an existing checkout in `baseline/MegaTrain` or `baseline/TorchTitan` when present; otherwise it fetches them into ignored `baseline/vendor/...` directories. Override the source with `MEGATRAIN_REPO`, `MEGATRAIN_REF`, `TORCHTITAN_REPO`, or `TORCHTITAN_REF`.
 
@@ -73,7 +73,7 @@ Useful install controls:
 
 - `--flash-version VERSION`: require an exact prebuilt FlashAttention package version, for example `--flash fa2 --flash-version 2.8.3`
 - `--linear-attention {auto,strict,none}`: install `flash-linear-attention` for all backends and Qwen hybrid-attention deps where useful; `auto` warns when no exact `causal-conv1d` wheel exists, `strict` fails
-- `--causal-conv1d-torch-tag TAG`: override the causal-conv1d wheel Torch tag; this is useful when an adjacent prebuilt wheel is known to work
+- `--causal-conv1d-torch-tag TAG`: pin a specific causal-conv1d wheel torch tag (disables the automatic minor-version probing); only needed when you want a wheel other than the latest ABI-compatible one
 
 Run one backend with its own env:
 
@@ -83,6 +83,8 @@ baseline/scripts/run_in_backend_env.sh trl_deepspeed \
   --seq-length 8192 \
   --num-gpus 4
 ```
+
+`run_in_backend_env.sh` runs `baseline/scripts/check_cuda_compat.py` before the backend launches, so a torch wheel built for a CUDA newer than the installed driver fails fast with an actionable message instead of an opaque CUDA error mid-run. Set `BASELINE_SKIP_CUDA_CHECK=1` to bypass (useful for CI installs done off-GPU) or `BASELINE_CUDA_CHECK_WARN_ONLY=1` to downgrade the failure to a warning.
 
 `--backend all` is still useful for dry-run command generation, but independent installs usually mean activating/running one backend env at a time.
 

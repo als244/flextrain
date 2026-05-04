@@ -139,15 +139,51 @@ def _install(asset: Asset, *, dry_run: bool) -> None:
     subprocess.check_call([sys.executable, "-m", "pip", "install", asset.url])
 
 
+def _torch_tag_fallbacks(torch_tag: str, max_minor_fallback: int) -> list[str]:
+    """Return ``[torch_tag, torch{maj}.{min-1}, ..., torch{maj}.{min-N}]``.
+
+    causal-conv1d publishes per-(torch minor, CUDA major) prebuilt wheels but
+    typically lags the latest torch release by 1-2 minors. Probing the
+    detected tag first and then walking down by minor versions avoids
+    hardcoding a brittle "if torch2.11+cu13 then torch2.10" fallback in the
+    install script. Stops once major would have to drop or minor would go
+    negative (whichever first).
+    """
+    match = re.match(r"torch(\d+)\.(\d+)$", torch_tag)
+    if match is None:
+        return [torch_tag]
+    major = int(match.group(1))
+    minor = int(match.group(2))
+    out = [torch_tag]
+    for delta in range(1, max_minor_fallback + 1):
+        if minor - delta < 0:
+            break
+        out.append(f"torch{major}.{minor - delta}")
+    return out
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo", default=REPO)
-    parser.add_argument("--torch-tag", default=None, help="Override detected torch tag, for example torch2.10")
+    parser.add_argument("--torch-tag", default=None, help="Override detected torch tag, for example torch2.10. Disables minor-version fallback probing.")
     parser.add_argument("--cuda-tag", default=None, help="Override detected CUDA major tag, for example cu13")
     parser.add_argument("--cxx11-abi", choices=["TRUE", "FALSE"], default=None)
     parser.add_argument("--python-tag", default=None, help="Override Python ABI tag, for example cp312-cp312")
     parser.add_argument("--platform-tag", default=None, help="Override platform tag, for example linux_x86_64")
     parser.add_argument("--version", default=None, help="Require an exact causal-conv1d version, for example 1.6.1")
+    parser.add_argument(
+        "--max-torch-minor-fallback",
+        type=int,
+        default=2,
+        help=(
+            "If no wheel matches the detected torch tag, also probe "
+            "torch{major}.{minor-1}, torch{major}.{minor-2}, ... up to this "
+            "many minors back. causal-conv1d's prebuilt wheels typically "
+            "lag the latest torch release; older-minor wheels are usually "
+            "ABI-compatible. Set to 0 to disable. Ignored when --torch-tag "
+            "is given (caller has chosen explicitly)."
+        ),
+    )
     parser.add_argument("--optional", action="store_true", help="Skip when no matching wheel exists instead of failing.")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
@@ -163,37 +199,67 @@ def main() -> int:
             return 0
         raise
 
-    torch_tag = args.torch_tag or detected_torch_tag
     cuda_tag = args.cuda_tag or detected_cuda_tag
     cxx11_abi = args.cxx11_abi or detected_cxx11_abi
     python_tag = args.python_tag or _python_tag()
     platform_tag = args.platform_tag or _platform_tag()
 
-    print(
-        "causal_conv1d_wheel_query "
-        f"repo={args.repo} torch={torch_tag} cuda={cuda_tag} cxx11abi={cxx11_abi} "
-        f"python={python_tag} platform={platform_tag}",
-        flush=True,
-    )
-    asset = _find_asset(
-        repo=args.repo,
-        torch_tag=torch_tag,
-        cuda_tag=cuda_tag,
-        cxx11_abi=cxx11_abi,
-        python_tag=python_tag,
-        platform_tag=platform_tag,
-        version=args.version,
-    )
+    if args.torch_tag is not None:
+        # Caller pinned a specific torch tag; respect it without probing
+        # adjacent minors (probing would silently install a different
+        # tag than the one the caller asked for).
+        torch_tags_to_try = [args.torch_tag]
+    else:
+        torch_tags_to_try = _torch_tag_fallbacks(
+            detected_torch_tag, args.max_torch_minor_fallback
+        )
+
+    asset: Asset | None = None
+    chosen_tag: str | None = None
+    for candidate_tag in torch_tags_to_try:
+        print(
+            "causal_conv1d_wheel_query "
+            f"repo={args.repo} torch={candidate_tag} cuda={cuda_tag} cxx11abi={cxx11_abi} "
+            f"python={python_tag} platform={platform_tag}",
+            flush=True,
+        )
+        asset = _find_asset(
+            repo=args.repo,
+            torch_tag=candidate_tag,
+            cuda_tag=cuda_tag,
+            cxx11_abi=cxx11_abi,
+            python_tag=python_tag,
+            platform_tag=platform_tag,
+            version=args.version,
+        )
+        if asset is not None:
+            chosen_tag = candidate_tag
+            break
+        if len(torch_tags_to_try) > 1:
+            print(
+                f"  no wheel for torch={candidate_tag}; trying next fallback...",
+                flush=True,
+            )
+
     if asset is None:
         version_label = f", version={args.version}" if args.version else ""
+        tags_label = " or ".join(torch_tags_to_try)
         message = (
-            f"No prebuilt causal-conv1d wheel found for torch={torch_tag}, cuda={cuda_tag}, "
-            f"cxx11abi={cxx11_abi}, python={python_tag}, platform={platform_tag}{version_label}"
+            f"No prebuilt causal-conv1d wheel found for torch={tags_label}, "
+            f"cuda={cuda_tag}, cxx11abi={cxx11_abi}, python={python_tag}, "
+            f"platform={platform_tag}{version_label}"
         )
         if args.optional:
             print(f"warning: {message}", flush=True)
             return 0
         raise SystemExit(message)
+    if chosen_tag != detected_torch_tag and args.torch_tag is None:
+        print(
+            f"note: using torch={chosen_tag} causal-conv1d wheel "
+            f"(detected torch={detected_torch_tag}; older-minor wheel is "
+            f"typically ABI-compatible).",
+            flush=True,
+        )
     _install(asset, dry_run=args.dry_run)
     return 0
 

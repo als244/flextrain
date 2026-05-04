@@ -6,16 +6,21 @@ Use a Llama checkpoint whose config actually supports 128K context, such as Llam
 
 ## 0. Set Run Variables
 
-Run from the repo root:
+Run from the repo root. The first line takes you there from anywhere inside the
+checkout; the rest derive from `$PWD` so the same block works on any machine
+without edits.
 
 ```bash
-cd /home/shein/Documents/grad_school/research/flextrain
+cd "$(git rev-parse --show-toplevel)"
 
 export MODEL_PATH="$PWD/models/Llama-3.1-8B"
 export SEQ_LEN=131072
 export NUM_GPUS="$(nvidia-smi -L | wc -l)"
 export NUM_STEPS=5
-export PYTHON_FOR_ENVS=/home/shein/miniconda3/bin/python
+# Python used to seed each backend env (`python3 -m venv`). The default works
+# on most machines; override only if you need a specific interpreter (e.g. a
+# conda one). `command -v python3` resolves whatever `python3` is on PATH.
+export PYTHON_FOR_ENVS="${PYTHON_FOR_ENVS:-$(command -v python3)}"
 export PIP_CACHE_DIR="$PWD/baseline/.pip-cache"
 export RUN_ROOT="$PWD/baseline/runs/llama3_128k_maxmem_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$RUN_ROOT"
@@ -45,16 +50,16 @@ for backend in megatrain trl_deepspeed deepspeed_arctic torchtitan megatron; do
     --python "$PYTHON_FOR_ENVS" \
     --torch-index-url auto \
     --flash fa2 \
-    --flash-version 2.8.3 \
-    --causal-conv1d-torch-tag torch2.10
+    --flash-version 2.8.3
 done
 ```
 
 Notes:
 
-- The FlashAttention resolver should select `flash_attn-2.8.3+cu130torch2.11-cp312-cp312-linux_x86_64.whl` on this machine.
+- `--torch-index-url auto` picks the right wheel index for the local CUDA (cu130 for CUDA 13.x, cu126 for CUDA 12.6+, etc).
+- The FlashAttention resolver requests an exact wheel for the env's torch + CUDA + Python + ABI; if you don't pin `--flash-version`, it picks the latest compatible one.
 - `flash-linear-attention` is installed in every backend env.
-- `causal-conv1d` is only relevant for HF/Qwen-hybrid paths. There is no exact `torch2.11/cu13` causal-conv1d wheel at the moment, so this uses the tested `torch2.10/cu13` prebuilt fallback.
+- `causal-conv1d` is only relevant for HF/Qwen-hybrid paths. The installer first tries the exact `torch{X}.{Y}` wheel for the env's torch, then falls back to adjacent torch minors automatically (no `--causal-conv1d-torch-tag` override required). Pass `--causal-conv1d-torch-tag torch2.10` only if you need to pin a specific known-good wheel.
 
 ## 2. Run Dry-Runs First
 

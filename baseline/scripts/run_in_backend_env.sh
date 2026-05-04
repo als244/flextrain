@@ -20,4 +20,17 @@ fi
 
 # shellcheck source=/dev/null
 source "${ENV_DIR}/bin/activate"
+
+# Pre-flight: surface driver/torch CUDA mismatches before the backend
+# allocates a model. ``BASELINE_SKIP_CUDA_CHECK=1`` opts out (useful in
+# CI where the GPU isn't available at install time but is at run time).
+# ``BASELINE_CUDA_CHECK_WARN_ONLY=1`` downgrades a hard fail to a warning.
+if [[ "${BASELINE_SKIP_CUDA_CHECK:-0}" != "1" ]]; then
+  CUDA_CHECK_ARGS=()
+  if [[ "${BASELINE_CUDA_CHECK_WARN_ONLY:-0}" == "1" ]]; then
+    CUDA_CHECK_ARGS+=(--warn-only)
+  fi
+  python "${BASELINE_DIR}/scripts/check_cuda_compat.py" "${CUDA_CHECK_ARGS[@]}"
+fi
+
 exec python "${BASELINE_DIR}/run_baseline.py" --backend "${BACKEND}" "$@"

@@ -70,23 +70,6 @@ ensure_git_checkout() {
   fi
 }
 
-apply_git_patch_if_needed() {
-  local checkout="$1"
-  local patch="$2"
-
-  if [[ ! -f "${patch}" ]]; then
-    return
-  fi
-  if git -C "${checkout}" apply --reverse --check "${patch}" >/dev/null 2>&1; then
-    echo "Patch already applied: ${patch}"
-  elif git -C "${checkout}" apply --check "${patch}" >/dev/null 2>&1; then
-    git -C "${checkout}" apply "${patch}"
-    echo "Applied patch: ${patch}"
-  else
-    echo "warning: could not apply patch ${patch}; continuing with checkout as-is" >&2
-  fi
-}
-
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --backend)
@@ -198,7 +181,6 @@ case "${BACKEND}" in
       MEGATRAIN_ROOT="${VENDOR_DIR}/MegaTrain"
       ensure_git_checkout "MegaTrain" "${MEGATRAIN_REPO}" "${MEGATRAIN_REF}" "${MEGATRAIN_ROOT}"
     fi
-    apply_git_patch_if_needed "${MEGATRAIN_ROOT}" "${BASELINE_DIR}/patches/megatrain_cpu_master_mask.patch"
     python -m pip install -e "${MEGATRAIN_ROOT}"
     ;;
   torchtitan)
@@ -262,6 +244,10 @@ if [[ "${LINEAR_ATTENTION_MODE}" != "none" ]]; then
   python -m pip install flash-linear-attention
   case "${BACKEND}" in
     megatrain|trl_deepspeed|deepspeed_arctic)
+      # The wheel installer probes the detected torch tag first and then
+      # walks back through earlier torch minors (default 2) to find a
+      # prebuilt wheel. Override with --causal-conv1d-torch-tag only if
+      # you need to pin a specific known-good wheel.
       CAUSAL_ARGS=()
       if [[ -n "${CAUSAL_CONV1D_TORCH_TAG}" ]]; then
         CAUSAL_ARGS+=(--torch-tag "${CAUSAL_CONV1D_TORCH_TAG}")
@@ -270,19 +256,6 @@ if [[ "${LINEAR_ATTENTION_MODE}" != "none" ]]; then
         CAUSAL_ARGS+=(--optional)
       fi
       python "${BASELINE_DIR}/scripts/install_causal_conv1d_wheel.py" "${CAUSAL_ARGS[@]}"
-      if ! python -c "import causal_conv1d" >/dev/null 2>&1; then
-        if python - <<'PY' >/dev/null 2>&1
-import torch
-raise SystemExit(0 if torch.__version__.startswith("2.11.") and str(torch.version.cuda).startswith("13.") else 1)
-PY
-        then
-          FALLBACK_ARGS=(--torch-tag torch2.10)
-          if [[ "${LINEAR_ATTENTION_MODE}" == "auto" ]]; then
-            FALLBACK_ARGS+=(--optional)
-          fi
-          python "${BASELINE_DIR}/scripts/install_causal_conv1d_wheel.py" "${FALLBACK_ARGS[@]}"
-        fi
-      fi
       ;;
   esac
 fi
