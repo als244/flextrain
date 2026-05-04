@@ -12,7 +12,7 @@ model_path = "models/Llama-3.1-8B"
 seq_length = 131072
 micro_batch_size = 1
 gradient_accumulation_steps = 1
-num_steps = 5
+num_steps = 3
 num_gpus = 1
 # attn_implementation defaults to "auto" (FA3 -> FA2 -> SDPA -> eager).
 # Override per-backend if you want a strict pin (e.g. megatrain doesn't

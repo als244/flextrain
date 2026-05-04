@@ -204,14 +204,28 @@ def _resolve_backends(
     return requested
 
 
+def _fmt_duration(seconds: float) -> str:
+    """Render seconds as e.g. ``3s``, ``1m 24s``, or ``2h 13m 05s``."""
+    s = int(round(seconds))
+    h, rem = divmod(s, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h {m:02d}m {s:02d}s"
+    if m:
+        return f"{m}m {s:02d}s"
+    return f"{s}s"
+
+
 def _run_one_backend(
     backend: str,
     cli_args: list[str],
     backend_run_dir: Path,
     *,
     dry_run: bool,
-) -> tuple[str, int, str]:
-    """Run a single backend. Returns (backend, returncode, status_str).
+    run_idx: int,
+    total_runs: int,
+) -> tuple[str, int, str, float]:
+    """Run a single backend. Returns (backend, returncode, status, duration_s).
 
     Status is one of:
       - 'ok'           : exited 0
@@ -229,17 +243,23 @@ def _run_one_backend(
         *cli_args,
     ]
 
-    print(f"\n[sweep] === {backend} ===", flush=True)
-    print(f"[sweep] cmd: {' '.join(cmd)}", flush=True)
-    if dry_run:
-        return backend, 0, "skipped_dry"
-
     log_path = backend_run_dir / "run.log"
     err_path = backend_run_dir / "run.err"
+    progress = f"[{run_idx}/{total_runs}]"
+
+    start_dt = datetime.datetime.now()
+    print(f"\n[sweep] {progress} === {backend} ===", flush=True)
+    print(f"[sweep]   start: {start_dt.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
+    print(f"[sweep]   log:   {log_path}", flush=True)
+    print(f"[sweep]   err:   {err_path}", flush=True)
+    print(f"[sweep]   cmd:   {' '.join(cmd)}", flush=True)
+    if dry_run:
+        return backend, 0, "skipped_dry", 0.0
+
     # Stream stdout and stderr into separate files so the user can
     # find traceback / pip resolver / conda activation errors in
-    # run.err without grepping through training stdout.
-    # ``# command:`` preamble is duplicated in both so each file is
+    # run.err without grepping through training stdout. Both files
+    # carry a ``# command / cwd / start`` preamble so each is
     # self-describing when read in isolation.
     #
     # Pin cwd=REPO_ROOT so any relative paths in the config (the
@@ -251,6 +271,7 @@ def _run_one_backend(
         for f in (log_file, err_file):
             f.write(f"# command: {' '.join(cmd)}\n")
             f.write(f"# cwd:     {REPO_ROOT}\n")
+            f.write(f"# start:   {start_dt.isoformat(timespec='seconds')}\n")
             f.flush()
         try:
             proc = subprocess.run(
@@ -258,34 +279,62 @@ def _run_one_backend(
                 cwd=REPO_ROOT,
             )
         except Exception as exc:  # noqa: BLE001 — surface any launcher failure
+            duration = (datetime.datetime.now() - start_dt).total_seconds()
             err_file.write(f"\n# launcher exception: {exc!r}\n")
             print(f"[sweep] {backend} launcher raised: {exc!r}", flush=True)
-            return backend, 1, "failed"
+            return backend, 1, "failed", duration
+
+    end_dt = datetime.datetime.now()
+    duration = (end_dt - start_dt).total_seconds()
     rc = proc.returncode
     status = "ok" if rc == 0 else "failed"
-    print(f"[sweep] {backend} -> rc={rc} ({status})", flush=True)
+    # Append the stop timestamp + duration to both log and err so the
+    # files are still self-describing after the run.
+    for path in (log_path, err_path):
+        try:
+            with path.open("a") as f:
+                f.write(f"# stop:    {end_dt.isoformat(timespec='seconds')}\n")
+                f.write(f"# rc:      {rc}\n")
+                f.write(f"# elapsed: {_fmt_duration(duration)}\n")
+        except OSError:
+            pass
+    print(f"[sweep] {progress} {backend} done  rc={rc} ({status})", flush=True)
+    print(f"[sweep]   stop:     {end_dt.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
+    print(f"[sweep]   duration: {_fmt_duration(duration)}", flush=True)
     if status == "failed":
         # Tail of run.err is usually where the real error lives — point
         # the user at the file directly so they don't have to fish.
         try:
             err_tail = err_path.read_text().splitlines()[-5:]
             if err_tail:
-                print(f"[sweep] {backend} run.err tail:", flush=True)
+                print(f"[sweep]   run.err tail:", flush=True)
                 for line in err_tail:
-                    print(f"           {line}", flush=True)
-            print(f"[sweep] full logs: {log_path} / {err_path}", flush=True)
+                    print(f"             {line}", flush=True)
+            print(f"[sweep]   full logs: {log_path} / {err_path}", flush=True)
         except OSError:
             pass
-    return backend, rc, status
+    return backend, rc, status, duration
 
 
-def _print_summary(results: list[tuple[str, int, str]]) -> None:
-    print("\n" + "=" * 60, flush=True)
+def _print_summary(
+    results: list[tuple[str, int, str, float]], total_duration: float
+) -> None:
+    print("\n" + "=" * 72, flush=True)
     print("[sweep] summary", flush=True)
-    print("=" * 60, flush=True)
-    width = max((len(b) for b, _, _ in results), default=8)
-    for backend, rc, status in results:
-        print(f"  {backend.ljust(width)}  rc={rc:<5} {status}", flush=True)
+    print("=" * 72, flush=True)
+    width = max((len(b) for b, _, _, _ in results), default=8)
+    for backend, rc, status, duration in results:
+        dur_str = _fmt_duration(duration) if duration > 0 else "-"
+        print(
+            f"  {backend.ljust(width)}  rc={rc:<3} {status:<11} elapsed={dur_str}",
+            flush=True,
+        )
+    print("-" * 72, flush=True)
+    print(
+        f"  {'total'.ljust(width)}  ({len(results)} runs)         "
+        f"elapsed={_fmt_duration(total_duration)}",
+        flush=True,
+    )
 
 
 def _run_throughput_extraction(sweep_root: Path) -> None:
@@ -341,30 +390,43 @@ def main() -> int:
         )
     sweep_root.mkdir(parents=True, exist_ok=True)
     shutil.copy2(args.config, sweep_root / args.config.name)
-    print(f"[sweep] config: {args.config}", flush=True)
+    sweep_start = datetime.datetime.now()
+    print(f"[sweep] config:     {args.config}", flush=True)
     print(f"[sweep] sweep_root: {sweep_root}", flush=True)
-    print(f"[sweep] num_gpus: {num_gpus}", flush=True)
-    print(f"[sweep] backends: {', '.join(backends_to_run)}", flush=True)
+    print(f"[sweep] num_gpus:   {num_gpus}", flush=True)
+    print(
+        f"[sweep] backends:   {', '.join(backends_to_run)} "
+        f"({len(backends_to_run)} run{'s' if len(backends_to_run) != 1 else ''})",
+        flush=True,
+    )
+    print(
+        f"[sweep] start:      {sweep_start.strftime('%Y-%m-%d %H:%M:%S')}",
+        flush=True,
+    )
 
-    results: list[tuple[str, int, str]] = []
-    for backend in backends_to_run:
+    results: list[tuple[str, int, str, float]] = []
+    total_runs = len(backends_to_run)
+    for idx, backend in enumerate(backends_to_run, start=1):
         section = dict(payload.get(backend, {}))
         cli_args = build_args(common, section, ctx)
         backend_run_dir = sweep_root / backend
         result = _run_one_backend(
-            backend, cli_args, backend_run_dir, dry_run=args.dry_run
+            backend, cli_args, backend_run_dir,
+            dry_run=args.dry_run,
+            run_idx=idx,
+            total_runs=total_runs,
         )
         results.append(result)
 
-    _print_summary(results)
+    sweep_end = datetime.datetime.now()
+    total_duration = (sweep_end - sweep_start).total_seconds()
+    _print_summary(results, total_duration)
 
     if not args.dry_run:
         _run_throughput_extraction(sweep_root)
 
-    # Exit non-zero if any backend failed (excluding ones where env was
-    # missing — those are "operator did not install yet" and arguably
-    # should be a soft fail). Matches CI-friendly semantics.
-    bad = [b for b, _, status in results if status == "failed"]
+    # Exit non-zero if any backend failed. Matches CI-friendly semantics.
+    bad = [b for b, _, status, _ in results if status == "failed"]
     return 1 if bad else 0
 
 
