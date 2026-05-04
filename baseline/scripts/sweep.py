@@ -18,6 +18,12 @@ and continues to the next backend; a summary of pass/fail is printed at
 the end. The intent: when running a sweep across 5 backends, you don't
 want a single OOM to abort the comparison.
 
+Each backend's stdout streams to ``run.log`` and stderr to ``run.err``
+(in the same per-backend dir) so the user can find traceback / pip /
+conda activation errors quickly without grepping training stdout. On
+failure the launcher prints the tail of ``run.err`` to the sweep
+console with the full paths.
+
 After the sweep, the launcher invokes
 ``baseline/scripts/extract_step_throughput.py`` over the per-backend
 ``run.log`` files to produce ``throughput.csv`` in the sweep root.
@@ -220,20 +226,39 @@ def _run_one_backend(
         return backend, 0, "skipped_dry"
 
     log_path = backend_run_dir / "run.log"
-    with log_path.open("w") as log_file:
-        log_file.write(f"# command: {' '.join(cmd)}\n")
-        log_file.flush()
+    err_path = backend_run_dir / "run.err"
+    # Stream stdout and stderr into separate files so the user can
+    # find traceback / pip resolver / conda activation errors in
+    # run.err without grepping through training stdout.
+    # ``# command:`` preamble is duplicated in both so each file is
+    # self-describing when read in isolation.
+    with log_path.open("w") as log_file, err_path.open("w") as err_file:
+        for f in (log_file, err_file):
+            f.write(f"# command: {' '.join(cmd)}\n")
+            f.flush()
         try:
             proc = subprocess.run(
-                cmd, stdout=log_file, stderr=subprocess.STDOUT, check=False
+                cmd, stdout=log_file, stderr=err_file, check=False
             )
         except Exception as exc:  # noqa: BLE001 — surface any launcher failure
-            log_file.write(f"\n# launcher exception: {exc!r}\n")
+            err_file.write(f"\n# launcher exception: {exc!r}\n")
             print(f"[sweep] {backend} launcher raised: {exc!r}", flush=True)
             return backend, 1, "failed"
     rc = proc.returncode
     status = "ok" if rc == 0 else "failed"
     print(f"[sweep] {backend} -> rc={rc} ({status})", flush=True)
+    if status == "failed":
+        # Tail of run.err is usually where the real error lives — point
+        # the user at the file directly so they don't have to fish.
+        try:
+            err_tail = err_path.read_text().splitlines()[-5:]
+            if err_tail:
+                print(f"[sweep] {backend} run.err tail:", flush=True)
+                for line in err_tail:
+                    print(f"           {line}", flush=True)
+            print(f"[sweep] full logs: {log_path} / {err_path}", flush=True)
+        except OSError:
+            pass
     return backend, rc, status
 
 

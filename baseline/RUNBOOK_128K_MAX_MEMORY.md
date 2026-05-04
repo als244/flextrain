@@ -84,11 +84,13 @@ baseline/runs/llama3_128k_maxmem_<timestamp>/
   trl_fsdp/
     accelerate_fsdp.yaml      # generated launch config
     launch_plan.json
-    run.log
+    run.log                   # backend stdout
+    run.err                   # backend stderr (look here first on failure)
   trl_deepspeed/
     deepspeed_bf16.json
     launch_plan.json
     run.log
+    run.err
   ...
   throughput.csv              # combined per-step throughput
   llama3_128k_maxmem.toml     # snapshot of the sweep config
@@ -98,10 +100,12 @@ baseline/runs/llama3_128k_maxmem_<timestamp>/
 
 `throughput.csv` columns: `backend, step, loss, step_time_s, tokens_per_s, log, line`.
 
-- An OOM produces a `run.log` with no per-step lines — check the tail
-  for `CUDA out of memory`. An OOM is itself a meaningful result
-  ("this backend cannot fit 128K @ 1 GPU at these settings"); keep
-  the log.
+- A non-zero exit prints the last few lines of `run.err` to the sweep
+  console; the full log + err pair are at
+  `<sweep-root>/<backend>/{run.log,run.err}`. An OOM produces a
+  `run.log` with no per-step lines and a `CUDA out of memory` near
+  the end of `run.err` — itself a meaningful "this backend cannot
+  fit 128K @ 1 GPU at these settings" result, keep the log.
 - `trl_fsdp` vs `trl_deepspeed` is the apples-to-apples FSDP2 vs ZeRO-3
   comparison (same TRL training loop, only the parallelism plugin
   differs).
