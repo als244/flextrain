@@ -979,9 +979,22 @@ def determine_working_set_config(
     # If memory genuinely can't fit max_seq_len in min-save mode, that
     # is a real configuration error and we still raise.
     if min_save_tokens_per_round < max_seq_len:
+        # Aggregate (GPU + host) memory cannot hold even a single
+        # max_seq_len chunk at the minimum-save activation level. GPU
+        # is typically a small fraction of aggregate (tens of GiB vs.
+        # hundreds), so the bottleneck is host capacity — surface that
+        # explicitly so users know to raise --max-host-mem-gib (or to
+        # reduce --max-seq-len) rather than chasing the GPU budget.
+        needed_bytes = min_act_bpt * max_seq_len
         raise ValueError(
-            f"Error: Could not find a valid configuration for seq len {max_seq_len}; "
-            f"estimated max tokens with min activations to be {min_save_tokens_per_round}"
+            f"Host memory capacity bound: aggregate (GPU + host) memory of "
+            f"{remaining_total_mem / (1 << 30):.2f} GiB cannot hold one "
+            f"{max_seq_len}-token chunk at the minimum-save activation level "
+            f"({needed_bytes / (1 << 30):.2f} GiB needed across "
+            f"{num_local_layers} layers, {min_act_bpt:,} bytes/token). "
+            f"Increase --max-host-mem-gib or reduce --max-seq-len. "
+            f"(Estimated max tokens with min activations: "
+            f"{min_save_tokens_per_round})"
         )
     if target_tokens_per_round < max_seq_len:
         target_tokens_per_round = max_seq_len
@@ -1088,9 +1101,13 @@ def determine_working_set_config(
     merged = set(chunk_size_options) | set(batch_divs)
     chunk_size_options = sorted(merged, reverse=True)
 
-    chunk_size_options = [
-        d for d in chunk_size_options if d >= init_target_min_chunk
-    ]
+    # The AI-bound floor (init_target_min_chunk) is applied as a *soft*
+    # floor inside _pick_chunk_size: the picker first searches at-or-
+    # above the floor, and only drops it if no healthy option (>= 2 on
+    # all four pipelining axes) is found there. Don't pre-filter
+    # chunk_size_options here — the picker needs the full set to fall
+    # back to memory-bound chunks when the AI-healthy regime can't
+    # produce a healthy pipeline.
 
     if verbose:
         print(f"[Working Set Log] Chunk Size Options: {chunk_size_options}", flush=True)
@@ -1117,15 +1134,32 @@ def determine_working_set_config(
         num_local_layers=num_local_layers,
         max_chunk_size=max_chunk_size,
         min_chunk_size=min_chunk_size,
+        ai_bound_min=init_target_min_chunk,
         verbose=verbose,
         min_act_slot_fn=_min_act_slot_bytes,
         full_act_slot_fn=_full_act_slot_bytes,
     )
 
     if best_option is None:
+        # Aggregate memory is sufficient (we passed the host-bound check
+        # above), so the bottleneck must be the on-device working set:
+        # GPU memory can't simultaneously hold weights + grads + ≥ 1
+        # activation slot for any candidate chunk size that satisfies
+        # max_chunk_size / min_chunk_size. Surface the GPU-side numbers
+        # so the user can size --max-gpu-mem-gib appropriately.
+        backbone = baseline.backbone
+        one_layer_gpu_bytes = backbone.weight_bytes + backbone.grad_bytes
         raise ValueError(
-            "Error: Not enough GPU memory to fit any valid chunk size large "
-            "enough to fit at least 1 additional complete layer"
+            f"GPU memory capacity bound: cannot fit a working set with >= 1 "
+            f"complete layer plus an activation slot on-device. GPU has "
+            f"{remaining_gpu_mem_bytes / (1 << 30):.2f} GiB available "
+            f"(after baseline embed/head/KV reservations); one backbone "
+            f"layer alone needs "
+            f"{one_layer_gpu_bytes / (1 << 30):.2f} GiB (weights + grads), "
+            f"and an activation slot at the smallest considered chunk size "
+            f"costs additional GPU. Increase --max-gpu-mem-gib, lower "
+            f"--max-seq-len, or set --max-chunk-size smaller to shrink "
+            f"the activation slot."
         )
 
     if verbose:
@@ -1270,6 +1304,7 @@ def _pick_chunk_size(
     num_local_layers: int,
     max_chunk_size: int | None,
     min_chunk_size: int | None,
+    ai_bound_min: float | int | None = None,
     verbose: bool,
     min_act_slot_fn=None,
     full_act_slot_fn=None,
@@ -1287,10 +1322,29 @@ def _pick_chunk_size(
     Stops as soon as we find an option that fits a second full layer
     (the engine's overlap relies on at least 2 layers' worth of
     weights+grads being on-device at any time).
+
+    ``ai_bound_min`` is a *soft* floor (the arithmetic-intensity
+    heuristic): the picker first searches at-or-above it, and drops
+    it if no healthy option (>= 2 on all four pipelining axes) is
+    found. ``min_chunk_size`` remains a hard floor (caller-supplied,
+    never bypassed). ``max_chunk_size`` is always a hard ceiling.
     """
     backbone = baseline.backbone
 
-    def _search(tail_filter_enabled: bool) -> dict | None:
+    def _is_healthy(option) -> bool:
+        if option is None:
+            return False
+        return (
+            option["n_gpu_layers"] >= 2
+            and option["n_gpu_grad_layers"] >= 2
+            and option["n_gpu_opt_layers"] >= 2
+            and option["gpu_act_slots"] >= 2
+        )
+
+    def _search(
+        tail_filter_enabled: bool,
+        ai_floor: float | int | None,
+    ) -> dict | None:
       best_option: dict | None = None
 
       for chunk_size in chunk_size_options:
@@ -1298,6 +1352,10 @@ def _pick_chunk_size(
         if max_chunk_size is not None and chunk_size > max_chunk_size:
             continue
         if min_chunk_size is not None and chunk_size < min_chunk_size:
+            break
+        if ai_floor is not None and chunk_size < ai_floor:
+            # chunk_size_options is descending; once we drop below the
+            # soft floor, all remaining candidates are below too.
             break
 
         # Pick ``target_num_chunks``. The default is
@@ -1597,20 +1655,51 @@ def _pick_chunk_size(
 
       return best_option
 
-    # First pass: tail filter on (orig behavior).
-    chosen = _search(tail_filter_enabled=True)
-    if chosen is not None:
+    # Pass 1: tail filter on, AI floor on (canonical preferred path).
+    chosen = _search(tail_filter_enabled=True, ai_floor=ai_bound_min)
+    if _is_healthy(chosen):
         return chosen
-    # Fallback: every option's tail tripped clause-(a) of the filter
-    # against an enormous compute_lim. Retry with the filter disabled
-    # so we accept a tail-inefficient round rather than fail outright.
-    # ``chunk_size_options`` is already filtered by the AI-bound floor
-    # upstream, so the fallback still respects ``init_target_min_chunk``.
-    if verbose:
+
+    # Pass 2: tail filter off, AI floor on. The tail filter rejects
+    # configs whose final round is small in absolute terms but whose
+    # per-step amortized cost is fine; on hardware where every option
+    # trips clause-(a), this fallback recovers a tail-inefficient
+    # round rather than failing outright.
+    if verbose and chosen is None:
         print(
             "[Working Set Log] All chunk options rejected by tail-round "
             "filter; retrying with tail filter disabled (will accept "
             "smallest chunk above the arithmetic-intensity floor).",
             flush=True,
         )
-    return _search(tail_filter_enabled=False)
+    chosen2 = _search(tail_filter_enabled=False, ai_floor=ai_bound_min)
+    if _is_healthy(chosen2):
+        return chosen2
+
+    # Pass 3: tail filter off, AI floor off. No chunk at-or-above the
+    # AI-bound floor produced healthy pipelining (>= 2 weights, grads,
+    # opt slots, act slots on GPU). The floor is a throughput hint, not
+    # a hard constraint — drop it and accept a smaller, possibly
+    # memory-bound MLP in exchange for healthy two-deep overlap. Smaller
+    # chunks have smaller activation slots, so the picker can typically
+    # fit ≥ 2 of each without exceeding budget. Two cases trigger this:
+    #   (a) max_chunk_size is set below the AI floor (user's hard cap),
+    #   (b) the AI floor is feasible but the resulting slots are too
+    #       big for ≥ 2 of each to fit on the GPU.
+    if verbose:
+        print(
+            "[Working Set Log] No healthy chunk option at or above the "
+            "AI-bound floor; retrying without the floor (will pick a "
+            "smaller, possibly memory-bound chunk to achieve >= 2 GPU "
+            "layers / grads / opt slots / act slots for healthy pipelining).",
+            flush=True,
+        )
+    chosen3 = _search(tail_filter_enabled=False, ai_floor=None)
+    if _is_healthy(chosen3):
+        return chosen3
+
+    # No healthy option anywhere. Return the most-restrictive non-None
+    # fallback (canonical path first), preserving the original
+    # behavior when no healthy chunk is reachable. None propagates and
+    # the caller raises.
+    return chosen or chosen2 or chosen3
