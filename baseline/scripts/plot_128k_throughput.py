@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Plot 128K-context training-throughput figure for the paper.
 
-4 panels (one per model) x 7 bars per panel (one per baseline). Y-axis is
-tokens/second at sequence length 128K. The "FlexTrain @ 40G" bar is the
-GPU-memory-constrained variant of our system (rendered with diagonal
-hatching to mark it as the constrained twin of "FlexTrain"); both
-FlexTrain bars are coloured the same to read as "ours".
+1x4 grid (one panel per model) x 7 bars per panel (one per baseline).
+Sized for the top-of-page-1 NeurIPS figure that spans the full text
+width. Y-axis is tokens/second at sequence length 128K. The
+"FlexTrain @ 40G" bar is the GPU-memory-constrained variant of our
+system (rendered with diagonal hatching to mark it as the constrained
+twin of "FlexTrain"); both FlexTrain bars are coloured the same so
+"ours" reads as one cluster at the right edge of every panel.
 
 Edit `DATA` below with measurements pulled from
 `baseline/runs/<sweep>/throughput.csv`. Use `None` for any (model,
@@ -122,6 +124,50 @@ DATA: dict[str, dict[str, float | None]] = {
     },
 }
 
+# Plausible-looking placeholder numbers so ``--demo`` produces a
+# preview that exercises every visual feature (colored bars, hatched
+# FlexTrain @ 40G, OOM placeholders, value labels, per-panel y-scale).
+# These are NOT real measurements; replace ``DATA`` above with the
+# actual sweep results before publishing the figure.
+DEMO_DATA: dict[str, dict[str, float | None]] = {
+    "Llama3-8B": {
+        "TorchTitan":      8500,
+        "MegaTrain":       7200,
+        "ALST":            9100,
+        "TRL_DeepSpeed":   6800,
+        "TRL_FSDP":        7500,
+        "FlexTrain @ 40G": 12400,
+        "FlexTrain":       14200,
+    },
+    "Qwen3-30B-A3B": {
+        "TorchTitan":      None,
+        "MegaTrain":       3800,
+        "ALST":            4100,
+        "TRL_DeepSpeed":   None,
+        "TRL_FSDP":        3950,
+        "FlexTrain @ 40G": 6200,
+        "FlexTrain":       7800,
+    },
+    "Qwen3.6-27B": {
+        "TorchTitan":      4200,
+        "MegaTrain":       3600,
+        "ALST":            None,
+        "TRL_DeepSpeed":   3100,
+        "TRL_FSDP":        3500,
+        "FlexTrain @ 40G": 5400,
+        "FlexTrain":       6800,
+    },
+    "Qwen3.6-35B-A3B": {
+        "TorchTitan":      None,
+        "MegaTrain":       2800,
+        "ALST":            3100,
+        "TRL_DeepSpeed":   None,
+        "TRL_FSDP":        None,
+        "FlexTrain @ 40G": 4900,
+        "FlexTrain":       6100,
+    },
+}
+
 # ---------------------------------------------------------------------------
 # Figure rendering.
 # ---------------------------------------------------------------------------
@@ -139,6 +185,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--demo",
+        action="store_true",
+        help=(
+            "Render with hard-coded sample numbers (DEMO_DATA) so you can "
+            "preview the layout without editing DATA. Sample numbers are "
+            "plausible but NOT real measurements; do not use for the paper."
+        ),
+    )
+    parser.add_argument(
         "--show", action="store_true", help="Display interactively after saving.",
     )
     parser.add_argument(
@@ -147,18 +202,29 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _validate_data() -> None:
-    """Fail loud if DATA is missing keys we'll dereference during render."""
+def _validate_data(data: dict[str, dict[str, float | None]]) -> None:
+    """Fail loud if ``data`` is missing keys we'll dereference during render."""
     for model in MODELS:
-        if model not in DATA:
-            raise SystemExit(f"DATA missing model key: {model!r}")
+        if model not in data:
+            raise SystemExit(f"data missing model key: {model!r}")
         for b in BASELINES:
-            if b not in DATA[model]:
-                raise SystemExit(f"DATA[{model!r}] missing baseline key: {b!r}")
+            if b not in data[model]:
+                raise SystemExit(f"data[{model!r}] missing baseline key: {b!r}")
 
 
-def _bar_panel(ax: plt.Axes, model: str, values: dict[str, float | None]) -> None:
-    """Render one panel: bar chart of tokens/sec across BASELINES for ``model``."""
+def _bar_panel(
+    ax: plt.Axes,
+    model: str,
+    values: dict[str, float | None],
+) -> None:
+    """Render one panel: bar chart of tokens/sec across BASELINES for ``model``.
+
+    Y-axis is scaled independently per model (model sizes give very
+    different absolute throughputs at 128K, so a shared scale would
+    squash the smaller-throughput panels). Each panel keeps its own
+    "tokens / sec" label and tick numbers so cross-panel comparisons
+    require reading the scale, not eyeballing bar heights.
+    """
     x = np.arange(len(BASELINES))
     heights = [values[b] for b in BASELINES]
 
@@ -178,7 +244,7 @@ def _bar_panel(ax: plt.Axes, model: str, values: dict[str, float | None]) -> Non
             )
             ax.text(
                 xi, oom_height + visible_max * 0.01, "OOM",
-                ha="center", va="bottom", fontsize=8, color="#666",
+                ha="center", va="bottom", fontsize=7, color="#666",
             )
             continue
         hatch = "//" if b in HATCHED else None
@@ -190,29 +256,47 @@ def _bar_panel(ax: plt.Axes, model: str, values: dict[str, float | None]) -> Non
         # Numeric value above each bar — paper readers want the number.
         ax.text(
             xi, h + visible_max * 0.01, f"{h:,.0f}",
-            ha="center", va="bottom", fontsize=8,
+            ha="center", va="bottom", fontsize=7,
         )
 
-    ax.set_title(model, fontsize=12)
-    ax.set_ylabel("tokens / sec")
+    ax.set_title(model, fontsize=11)
+    ax.set_ylabel("tokens / sec", fontsize=9)
     ax.set_xticks(x)
-    ax.set_xticklabels(BASELINES, rotation=35, ha="right", fontsize=9)
+    ax.set_xticklabels(BASELINES, rotation=40, ha="right", fontsize=8)
     ax.set_ylim(0, visible_max * 1.20)  # headroom for value labels.
+    ax.tick_params(axis="y", labelsize=8)
     ax.grid(axis="y", linestyle=":", alpha=0.5)
     ax.set_axisbelow(True)
 
 
 def main() -> int:
     args = parse_args()
-    _validate_data()
+    data = DEMO_DATA if args.demo else DATA
+    if args.demo:
+        print(
+            "[plot] --demo: rendering with placeholder DEMO_DATA "
+            "(NOT real measurements)",
+            flush=True,
+        )
+    _validate_data(data)
 
-    fig, axes = plt.subplots(2, 2, figsize=(11, 8), constrained_layout=True)
-    for ax, model in zip(axes.flat, MODELS):
-        _bar_panel(ax, model, DATA[model])
+    # 1x4 row sized for a NeurIPS top-of-page figure: aim for the
+    # final \\includegraphics[width=\\textwidth]{...} to render with
+    # ~1:4 aspect. Each panel ~3.5in wide gives 7 bars + rotated
+    # labels enough room without overflowing.
+    #
+    # sharey=False is explicit: each model has its own y-axis scale
+    # because the absolute throughputs differ ~3x across the lineup
+    # (Llama3-8B vs Qwen3.6-35B-A3B at 128K context).
+    fig, axes = plt.subplots(
+        1, 4, figsize=(14, 3.8), constrained_layout=True, sharey=False,
+    )
+    for ax, model in zip(axes, MODELS):
+        _bar_panel(ax, model, data[model])
 
     fig.suptitle(
-        "Single-GPU training throughput at 128K context length",
-        fontsize=14, y=1.02,
+        "Single-GPU training throughput at 128K context length (tokens/sec)",
+        fontsize=12, y=1.04,
     )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
