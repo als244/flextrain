@@ -23,7 +23,7 @@ from baseline.backends.common.attention import (
     load_causal_lm_with_attention,
     pick_attention_implementation,
 )
-from baseline.backends.common.sonic_moe import apply_sonic_moe_to_hf_model
+from baseline.backends.common.moe_kernel import apply_moe_kernel_backend
 from baseline.backends.common.synthetic import (
     RandomTokenMapDataset,
     SyntheticTokenConfig,
@@ -165,7 +165,7 @@ def main() -> None:
         trust_remote_code=True,
     )
     model.config.use_cache = False
-    apply_sonic_moe_to_hf_model(model, args.moe_kernel_backend)
+    apply_moe_kernel_backend(model, args.moe_kernel_backend)
     if _use_gradient_checkpointing(args) and hasattr(model, "gradient_checkpointing_enable"):
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 

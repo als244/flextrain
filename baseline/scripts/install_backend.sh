@@ -135,7 +135,7 @@ if [[ -z "${BACKEND}" ]]; then
 fi
 
 case "${BACKEND}" in
-  megatrain|torchtitan|trl_deepspeed|deepspeed_arctic|megatron) ;;
+  megatrain|torchtitan|trl_deepspeed|deepspeed_arctic|megatron|trl_fsdp) ;;
   *)
     echo "Unknown backend: ${BACKEND}" >&2
     exit 2
@@ -243,7 +243,7 @@ esac
 if [[ "${LINEAR_ATTENTION_MODE}" != "none" ]]; then
   python -m pip install flash-linear-attention
   case "${BACKEND}" in
-    megatrain|trl_deepspeed|deepspeed_arctic)
+    megatrain|trl_deepspeed|deepspeed_arctic|trl_fsdp)
       # The wheel installer probes the detected torch tag first and then
       # walks back through earlier torch minors (default 2) to find a
       # prebuilt wheel. Override with --causal-conv1d-torch-tag only if

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""TRL SFTTrainer over synthetic random token IDs with DeepSpeed."""
+"""TRL SFTTrainer over synthetic random token IDs with FSDP2 (via accelerate)."""
 
 from __future__ import annotations
 
@@ -29,7 +29,6 @@ from baseline.backends.common.synthetic import (
 _ALLOC_CONF = "pinned_use_cuda_host_register:True,expandable_segments:True"
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", _ALLOC_CONF)
 os.environ.setdefault("PYTORCH_ALLOC_CONF", _ALLOC_CONF)
-os.environ.setdefault("DS_SKIP_CUDA_CHECK", "1")
 
 
 def parse_args() -> argparse.Namespace:
@@ -44,10 +43,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--deepspeed-config", type=Path, required=True)
-    parser.add_argument("--attn-implementation", choices=["auto", "flash_attention_3", "flash_attention_2", "sdpa", "eager"], default="flash_attention_2")
+    parser.add_argument(
+        "--attn-implementation",
+        choices=["auto", "flash_attention_3", "flash_attention_2", "sdpa", "eager"],
+        default="auto",
+    )
     parser.add_argument("--moe-kernel-backend", choices=["hf", "auto", "sonic"], default="hf")
-    parser.add_argument("--activation-checkpointing", choices=["none", "selective", "full", "memory_budget"], default="full")
+    parser.add_argument(
+        "--activation-checkpointing",
+        choices=["none", "selective", "full", "memory_budget"],
+        default="full",
+    )
     parser.add_argument("--activation-checkpoint-fraction", type=float, default=None)
     parser.add_argument("--activation-offload", choices=["none", "cpu"], default="none")
     parser.add_argument("--liger-kernel", choices=["auto", "on", "off"], default="auto")
@@ -136,7 +142,7 @@ def main() -> None:
         from trl import SFTConfig, SFTTrainer
     except ImportError as exc:
         raise SystemExit(
-            "TRL is not installed. Install the TRL baseline environment first, "
+            "TRL is not installed. Install the FSDP baseline environment first, "
             "then rerun this launcher."
         ) from exc
 
@@ -154,6 +160,7 @@ def main() -> None:
     apply_moe_kernel_backend(model, args.moe_kernel_backend)
     use_builtin_checkpointing = _use_gradient_checkpointing(args)
     if use_builtin_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
+        # use_reentrant=False is required for FSDP2 + checkpointing.
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
     num_samples = max(args.num_steps * args.gradient_accumulation_steps * args.micro_batch_size * 2, 8)
@@ -169,6 +176,10 @@ def main() -> None:
     )
 
     use_liger_kernel = _resolve_liger_kernel(args, SFTConfig)
+    # FSDP plugin is configured externally by ``accelerate launch
+    # --config_file`` (see baseline_harness.backends._accelerate_fsdp_config).
+    # SFTConfig itself only needs the bf16 + checkpointing + liger flags;
+    # accelerate handles the FSDP wrapping at trainer construction time.
     sft_kwargs = _filtered_kwargs(
         SFTConfig,
         {
@@ -185,7 +196,6 @@ def main() -> None:
             "save_strategy": "no",
             "report_to": "none",
             "remove_unused_columns": False,
-            "deepspeed": str(args.deepspeed_config),
             "gradient_checkpointing": use_builtin_checkpointing,
             "gradient_checkpointing_kwargs": {"use_reentrant": False},
             "dataset_kwargs": {"skip_prepare_dataset": True},

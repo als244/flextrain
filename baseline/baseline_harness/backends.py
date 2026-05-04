@@ -111,6 +111,123 @@ def _write_json(path: Path, payload: dict) -> Path:
     return path
 
 
+def _write_yaml(path: Path, payload: dict) -> Path:
+    """Tiny in-tree YAML dumper — accelerate launch reads its config as YAML.
+
+    Limited to the value types we actually emit (str, int, float, bool, dict,
+    list of scalars, None). Avoids pulling PyYAML into the harness env just
+    for one config file.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    def _emit(value, indent: int) -> str:
+        pad = "  " * indent
+        if value is None:
+            return "null"
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, (int, float)):
+            return str(value)
+        if isinstance(value, str):
+            # Quote strings that contain YAML metacharacters, look like
+            # other types (number/bool/null), or match YAML 1.1 reserved
+            # boolean spellings. ``downcast_bf16: no`` would otherwise be
+            # decoded as Python ``False`` by accelerate's YAML 1.1 loader.
+            yaml11_reserved = {
+                "y", "Y", "yes", "Yes", "YES", "n", "N", "no", "No", "NO",
+                "true", "True", "TRUE", "false", "False", "FALSE",
+                "on", "On", "ON", "off", "Off", "OFF",
+                "null", "Null", "NULL", "~",
+            }
+            try:
+                float(value)
+                looks_numeric = True
+            except ValueError:
+                looks_numeric = False
+            needs_quote = (
+                value == ""
+                or value in yaml11_reserved
+                or looks_numeric
+                or any(c in value for c in ":#{}[]&*!|>'\"%@`,")
+            )
+            if needs_quote:
+                escaped = value.replace("\\", "\\\\").replace("\"", "\\\"")
+                return f"\"{escaped}\""
+            return value
+        if isinstance(value, list):
+            if not value:
+                return "[]"
+            return "\n" + "\n".join(f"{pad}- {_emit(item, indent + 1)}" for item in value)
+        if isinstance(value, dict):
+            if not value:
+                return "{}"
+            lines = []
+            for k, v in value.items():
+                rendered = _emit(v, indent + 1)
+                if isinstance(v, (dict, list)) and rendered and rendered[0] == "\n":
+                    lines.append(f"{pad}{k}:{rendered}")
+                else:
+                    lines.append(f"{pad}{k}: {rendered}")
+            return "\n" + "\n".join(lines)
+        raise TypeError(f"Unsupported YAML value type: {type(value).__name__}")
+
+    body = _emit(payload, 0)
+    if body.startswith("\n"):
+        body = body[1:]
+    path.write_text(body + "\n")
+    return path
+
+
+def _accelerate_fsdp_config(config: HarnessConfig) -> dict:
+    """Generate an accelerate launch config that wraps the model with FSDP2.
+
+    bf16 master/grads/opt: ``mixed_precision: bf16`` plus FSDP2's
+    MixedPrecisionPolicy (param_dtype=bf16, reduce_dtype=bf16) keep params
+    sharded in bf16 with no fp32 master copy. This matches the bf16-master
+    semantics the DeepSpeed config establishes for trl_deepspeed.
+
+    Offloading: FSDP2 ties param/grad/opt offload together (they share the
+    sharded ``DTensor`` storage). Setting either ``--param-offload cpu`` or
+    ``--optimizer-offload cpu`` flips ``fsdp_offload_params: true`` — both
+    move with the params. We surface this in the launch plan ``notes``.
+    Activation offload is handled by SFTConfig's ``activation_offloading``.
+    """
+    offload_params = (
+        config.param_offload == "cpu" or config.optimizer_offload == "cpu"
+    )
+    fsdp_block = {
+        "fsdp_version": 2,
+        "fsdp_auto_wrap_policy": "TRANSFORMER_BASED_WRAP",
+        "fsdp_sharding_strategy": "FULL_SHARD"
+        if config.fsdp_replicate_degree <= 1
+        else "HYBRID_SHARD",
+        "fsdp_state_dict_type": "SHARDED_STATE_DICT",
+        "fsdp_use_orig_params": True,
+        "fsdp_offload_params": offload_params,
+        "fsdp_cpu_ram_efficient_loading": True,
+        "fsdp_sync_module_states": True,
+        "fsdp_forward_prefetch": False,
+        "fsdp_backward_prefetch": "BACKWARD_PRE",
+        "fsdp_activation_checkpointing": config.activation_checkpointing != "none",
+    }
+    return {
+        "compute_environment": "LOCAL_MACHINE",
+        "distributed_type": "FSDP",
+        "downcast_bf16": "no",
+        "fsdp_config": fsdp_block,
+        "machine_rank": 0,
+        "main_training_function": "main",
+        "mixed_precision": "bf16",
+        "num_machines": 1,
+        "num_processes": config.num_gpus,
+        "rdzv_backend": "static",
+        "same_network": True,
+        "tpu_use_cluster": False,
+        "tpu_use_sudo": False,
+        "use_cpu": False,
+    }
+
+
 def _deepspeed_config(config: HarnessConfig, *, include_sequence_parallel: bool) -> dict:
     ds_config = {
         "train_micro_batch_size_per_gpu": config.micro_batch_size,
@@ -320,6 +437,8 @@ def build_megatrain(config: HarnessConfig, model: ModelInfo) -> LaunchPlan:
         str(config.num_grad_slabs),
         "--attn-implementation",
         config.attn_implementation,
+        "--moe-kernel-backend",
+        config.moe_kernel_backend,
     ]
     command.extend(config.backend_extra_args)
     return LaunchPlan(
@@ -508,12 +627,77 @@ def build_torchtitan(config: HarnessConfig, model: ModelInfo) -> LaunchPlan:
     )
 
 
+def build_trl_fsdp(config: HarnessConfig, model: ModelInfo) -> LaunchPlan:
+    _reject_true_fraction(config, "trl_fsdp/HF/TRL")
+    out = _output_dir(config, model)
+    accel_path = _write_yaml(
+        out / "accelerate_fsdp.yaml", _accelerate_fsdp_config(config)
+    )
+    script = repo_root() / "baseline" / "backends" / "trl_fsdp" / "train_synthetic.py"
+    checkpointing_mode = _binary_checkpointing_mode(config)
+    command = [
+        "accelerate",
+        "launch",
+        "--config_file",
+        str(accel_path),
+        "--main_process_port",
+        str(config.master_port),
+        str(script),
+        "--model-path",
+        str(model.path),
+        "--seq-length",
+        str(config.seq_length),
+        "--vocab-size",
+        str(model.vocab_size),
+        "--micro-batch-size",
+        str(config.micro_batch_size),
+        "--gradient-accumulation-steps",
+        str(config.gradient_accumulation_steps),
+        "--num-steps",
+        str(config.num_steps),
+        "--learning-rate",
+        str(config.learning_rate),
+        "--weight-decay",
+        str(config.weight_decay),
+        "--seed",
+        str(config.seed),
+        "--output-dir",
+        str(out),
+        "--attn-implementation",
+        config.attn_implementation,
+        "--moe-kernel-backend",
+        config.moe_kernel_backend,
+        "--activation-checkpointing",
+        checkpointing_mode,
+        "--activation-offload",
+        config.activation_offload,
+        "--liger-kernel",
+        config.liger_kernel,
+    ]
+    command.extend(config.backend_extra_args)
+    notes = [
+        "FSDP2 ties param + grad + optimizer-state offload together; "
+        "--param-offload cpu and --optimizer-offload cpu both map to "
+        "fsdp_offload_params=true.",
+    ]
+    return LaunchPlan(
+        backend="trl_fsdp",
+        command=command,
+        cwd=repo_root(),
+        env=_base_env(),
+        output_dir=out,
+        generated_files=[accel_path],
+        notes=notes,
+    )
+
+
 BUILDERS = {
     "megatrain": build_megatrain,
     "torchtitan": build_torchtitan,
     "trl_deepspeed": build_trl_deepspeed,
     "deepspeed_arctic": build_deepspeed_arctic,
     "megatron": build_megatron,
+    "trl_fsdp": build_trl_fsdp,
 }
 
 

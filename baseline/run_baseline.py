@@ -20,6 +20,7 @@ BACKENDS: tuple[BackendName, ...] = (
     "trl_deepspeed",
     "deepspeed_arctic",
     "megatron",
+    "trl_fsdp",
 )
 
 
@@ -55,8 +56,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--attn-implementation",
         choices=["auto", "flash_attention_3", "flash_attention_2", "sdpa", "eager"],
-        default="flash_attention_2",
-        help="Attention backend for HF-based trainers. Default is strict FlashAttention 2; pass sdpa/eager explicitly to compare fallbacks.",
+        default="auto",
+        help=(
+            "Attention backend for HF-based trainers. Default is auto: probe "
+            "FlashAttention 3 first, then FA2, then SDPA, then eager. Pass a "
+            "specific implementation to pin (e.g. flash_attention_2 or sdpa) "
+            "for fallback comparisons."
+        ),
     )
     parser.add_argument(
         "--moe-kernel-backend",

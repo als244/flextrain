@@ -1,0 +1,97 @@
+# 128K-context maximum-memory-savings sweep for Llama-3.1-8B (single-GPU).
+#
+# Each [<backend>] section produces one run; the sweep launcher
+# (baseline/scripts/sweep.py) walks them in declaration order, advancing
+# past failures and writing a summary at the end.
+#
+# Replace MODEL_PATH with the local checkpoint you want to evaluate. The
+# launcher detects num_gpus from `nvidia-smi -L` if not set in [common].
+
+[common]
+model_path = "models/Llama-3.1-8B"
+seq_length = 131072
+micro_batch_size = 1
+gradient_accumulation_steps = 1
+num_steps = 5
+num_gpus = 1
+# attn_implementation defaults to "auto" (FA3 -> FA2 -> SDPA -> eager).
+# Override per-backend if you want a strict pin (e.g. megatrain doesn't
+# expose FA3, but auto handles that automatically).
+
+# -----------------------------------------------------------------------
+# TRL + FSDP2 (TRL SFTTrainer + accelerate FSDP2 plugin). The
+# parallelism-only counterpart of trl_deepspeed: same SFTTrainer loop,
+# FSDP2 instead of DeepSpeed ZeRO. Used for HF model families TorchTitan
+# does not cover. bf16 master/grads/opt via MixedPrecisionPolicy; param +
+# grad + opt offloading is unified by fsdp_offload_params.
+# -----------------------------------------------------------------------
+[trl_fsdp]
+fsdp_shard_degree = "${NUM_GPUS}"
+fsdp_replicate_degree = 1
+param_offload = "cpu"
+optimizer_offload = "cpu"
+activation_checkpointing = "full"
+activation_offload = "cpu"
+liger_kernel = "auto"
+
+# -----------------------------------------------------------------------
+# TRL + DeepSpeed (HF SFTTrainer + DeepSpeed ZeRO). Apples-to-apples
+# parallelism comparison vs. trl_fsdp.
+# -----------------------------------------------------------------------
+[trl_deepspeed]
+zero_stage = 3
+param_offload = "cpu"
+optimizer_offload = "cpu"
+activation_checkpointing = "full"
+activation_offload = "cpu"
+liger_kernel = "auto"
+
+# -----------------------------------------------------------------------
+# DeepSpeed Arctic / ALST (custom HF + Ulysses sequence parallelism).
+# Sequence-parallel size matches NUM_GPUS so 128K shards across all
+# devices when NUM_GPUS > 1; on single GPU this collapses to plain DS.
+# -----------------------------------------------------------------------
+[deepspeed_arctic]
+zero_stage = 3
+param_offload = "cpu"
+optimizer_offload = "cpu"
+activation_checkpointing = "full"
+activation_offload = "cpu"
+sequence_parallel_size = "${NUM_GPUS}"
+tiled_loss_shards = 16
+tiled_mlp = true
+
+# -----------------------------------------------------------------------
+# TorchTitan (FSDP2 + activation/CPU offload, native model registry).
+# Only works for model families in TorchTitan's registry; Qwen3.5* and
+# Qwen3.5-MoE are NOT covered (use the trl_fsdp backend for those).
+# -----------------------------------------------------------------------
+[torchtitan]
+activation_checkpointing = "full"
+activation_offload = "cpu"
+param_offload = "cpu"
+optimizer_offload = "cpu"
+fsdp_shard_degree = "${NUM_GPUS}"
+fsdp_replicate_degree = 1
+
+# -----------------------------------------------------------------------
+# Megatron-Core (TE + Megatron parallelism). Generates model_dims.json
+# from the HF config; full uniform recompute + TE offloads.
+# -----------------------------------------------------------------------
+[megatron]
+activation_checkpointing = "full"
+recompute_granularity = "full"
+recompute_method = "uniform"
+recompute_num_layers = 1
+activation_offload = "cpu"
+optimizer_offload = "cpu"
+
+# -----------------------------------------------------------------------
+# MegaTrain (CPU-master, deepspeed_cpu_adam optimizer). Vendor default
+# checkpoint_interval=4 is a good baseline; sweep 1/2/4/8 if you need
+# the tightest fit.
+# -----------------------------------------------------------------------
+[megatrain]
+activation_checkpoint_interval = 4
+num_grad_slabs = 12
+extra_args = ["--optimizer", "deepspeed_cpu_adam"]

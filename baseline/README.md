@@ -1,18 +1,26 @@
 # Baseline Harness
 
-This directory now has a unified launcher for synthetic-token training runs across:
+Unified launcher for synthetic-token training across these backends:
 
-- `megatrain`
-- `torchtitan`
-- `trl_deepspeed`
-- `deepspeed_arctic`
-- `megatron`
+| Backend | Parallelism | Trainer / framework |
+|---|---|---|
+| `trl_deepspeed` | DeepSpeed ZeRO | TRL SFTTrainer (HF) |
+| `trl_fsdp` | accelerate FSDP2 | TRL SFTTrainer (HF) |
+| `deepspeed_arctic` | DeepSpeed + Ulysses SP | Custom HF + DeepSpeed loop |
+| `megatrain` | CPU-master + grad slabs | MegaTrain (HF model wrapped in CPUMasterModel) |
+| `torchtitan` | TorchTitan FSDP2 | TorchTitan native (registry-based) |
+| `megatron` | Megatron-Core + TE | Megatron-Core native |
 
-The top-level API is:
+`trl_fsdp` is the apples-to-apples FSDP2 counterpart of `trl_deepspeed`:
+identical SFTTrainer loop, only the parallelism plugin differs. Use it
+for HF model families TorchTitan does not cover (e.g. Qwen3.5,
+Qwen3.5-MoE).
+
+The top-level launcher:
 
 ```bash
 python baseline/run_baseline.py \
-  --backend deepspeed_arctic \
+  --backend trl_deepspeed \
   --model-path models/Llama-3.1-8B-Instruct \
   --seq-length 8192 \
   --micro-batch-size 1 \
@@ -22,27 +30,80 @@ python baseline/run_baseline.py \
   --dry-run
 ```
 
-Use `--backend all` to emit or run every backend command. Every run writes a `launch_plan.json`, generated backend configs, and `run.log` under `baseline/runs/...`.
+For a complete Llama-3-family 128K maximum-memory-savings sweep with
+per-step throughput extraction, see
+[`RUNBOOK_128K_MAX_MEMORY.md`](RUNBOOK_128K_MAX_MEMORY.md).
 
-For a complete Llama 3-family 128K maximum-memory-savings sweep with per-step throughput extraction, see `baseline/RUNBOOK_128K_MAX_MEMORY.md`.
+## Sweeps
+
+Multi-backend evaluation sweeps are TOML-driven. Each sweep config has a
+`[common]` section with run-wide settings (model path, sequence length,
+num steps, num GPUs) and one `[<backend>]` section per backend with that
+backend's memory-feature knobs (offloading, activation checkpointing,
+sequence-parallel size, etc). The launcher walks the sections in order,
+records failures without aborting the sweep, and emits a per-step
+`throughput.csv` at the end.
+
+```bash
+# Run every backend section in the config:
+python baseline/scripts/sweep.py baseline/configs/llama3_128k_maxmem.toml
+
+# Subset of backends:
+python baseline/scripts/sweep.py baseline/configs/llama3_128k_maxmem.toml \
+    --backends trl_fsdp,trl_deepspeed
+
+# Smoke-test commands without running them:
+python baseline/scripts/sweep.py baseline/configs/llama3_128k_maxmem.toml \
+    --num-steps 1 --dry-run
+```
+
+Templating: any string value containing `${NUM_GPUS}` is substituted at
+launch time (the launcher detects num_gpus from `nvidia-smi -L`, or you
+can pass `--num-gpus N`). See
+[`configs/llama3_128k_maxmem.toml`](configs/llama3_128k_maxmem.toml) for
+the canonical example.
 
 ## Installation Model
 
-Running baselines does not require installing `flextrain` as a Python package. The launcher and synthetic datasets are repo-local source files; `baseline/run_baseline.py` adds the repo root to `PYTHONPATH`, and generated backend commands do the same. Each backend can therefore live in its own virtualenv with only that backend's dependencies installed.
+Running baselines does not require installing `flextrain` as a Python
+package. The launcher and synthetic datasets are repo-local source
+files; `baseline/run_baseline.py` adds the repo root to `PYTHONPATH`,
+and generated backend commands do the same. Each backend can therefore
+live in its own virtualenv with only that backend's dependencies
+installed.
 
 Create an independent backend env with:
 
 ```bash
 baseline/scripts/install_backend.sh --backend trl_deepspeed
+baseline/scripts/install_backend.sh --backend trl_fsdp
 baseline/scripts/install_backend.sh --backend deepspeed_arctic
 baseline/scripts/install_backend.sh --backend torchtitan
 baseline/scripts/install_backend.sh --backend megatron
 baseline/scripts/install_backend.sh --backend megatrain
 ```
 
-By default this creates `baseline/envs/<backend>`, installs Torch first from `https://download.pytorch.org/whl/cu126`, installs `baseline/requirements/<backend>.txt`, then installs matching prebuilt FlashAttention 2 and FlashAttention 3 wheels from `mjun0812/flash-attention-prebuild-wheels` when a wheel exists for the env's Python/CUDA/Torch/platform combination. It also installs `flash-linear-attention` in every backend env; HF-style/Qwen-hybrid backends additionally try a matching prebuilt `causal-conv1d` wheel from `Dao-AILab/causal-conv1d`. The `causal-conv1d` resolver probes the detected torch tag first and then walks back through earlier torch minors (default 2) so a fresh torch release lacking exact prebuilt wheels still picks up the most recent ABI-compatible one without manual flags.
+By default this creates `baseline/envs/<backend>`, installs Torch first
+from `https://download.pytorch.org/whl/cu126`, installs
+`baseline/requirements/<backend>.txt`, then installs matching prebuilt
+FlashAttention 2 and FlashAttention 3 wheels from
+[`mjun0812/flash-attention-prebuild-wheels`](https://github.com/mjun0812/flash-attention-prebuild-wheels)
+when a wheel exists for the env's Python/CUDA/Torch/platform
+combination. It also installs `flash-linear-attention` in every backend
+env; HF-style/Qwen-hybrid backends additionally try a matching prebuilt
+`causal-conv1d` wheel from
+[`Dao-AILab/causal-conv1d`](https://github.com/Dao-AILab/causal-conv1d/releases).
+The `causal-conv1d` resolver probes the detected torch tag first and
+then walks back through earlier torch minors (default 2) so a fresh
+torch release lacking exact prebuilt wheels still picks up the most
+recent ABI-compatible one without manual flags.
 
-MegaTrain and TorchTitan source checkouts are not vendored in git. The installer uses an existing checkout in `baseline/MegaTrain` or `baseline/TorchTitan` when present; otherwise it fetches them into ignored `baseline/vendor/...` directories. Override the source with `MEGATRAIN_REPO`, `MEGATRAIN_REF`, `TORCHTITAN_REPO`, or `TORCHTITAN_REF`.
+MegaTrain and TorchTitan source checkouts are not vendored in git. The
+installer uses an existing checkout in `baseline/MegaTrain` or
+`baseline/TorchTitan` when present; otherwise it fetches them into
+ignored `baseline/vendor/...` directories. Override the source with
+`MEGATRAIN_REPO`, `MEGATRAIN_REF`, `TORCHTITAN_REPO`, or
+`TORCHTITAN_REF`.
 
 Detect the local CUDA version with:
 
@@ -50,7 +111,7 @@ Detect the local CUDA version with:
 baseline/scripts/detect_cuda.py
 ```
 
-On this machine, CUDA detection reports CUDA 13.1, which maps to PyTorch's `cu130` wheel tag. Use the detected CUDA wheel index when that is what you want:
+Use the detected CUDA wheel index when that is what you want:
 
 ```bash
 baseline/scripts/install_backend.sh --backend trl_deepspeed --torch-index-url auto --recreate
@@ -84,15 +145,22 @@ baseline/scripts/run_in_backend_env.sh trl_deepspeed \
   --num-gpus 4
 ```
 
-`run_in_backend_env.sh` runs `baseline/scripts/check_cuda_compat.py` before the backend launches, so a torch wheel built for a CUDA newer than the installed driver fails fast with an actionable message instead of an opaque CUDA error mid-run. Set `BASELINE_SKIP_CUDA_CHECK=1` to bypass (useful for CI installs done off-GPU) or `BASELINE_CUDA_CHECK_WARN_ONLY=1` to downgrade the failure to a warning.
+`run_in_backend_env.sh` runs `baseline/scripts/check_cuda_compat.py`
+before the backend launches, so a torch wheel built for a CUDA newer
+than the installed driver fails fast with an actionable message instead
+of an opaque CUDA error mid-run. Set `BASELINE_SKIP_CUDA_CHECK=1` to
+bypass (useful for CI installs done off-GPU) or
+`BASELINE_CUDA_CHECK_WARN_ONLY=1` to downgrade the failure to a warning.
 
-`--backend all` is still useful for dry-run command generation, but independent installs usually mean activating/running one backend env at a time.
+`--backend all` is still useful for dry-run command generation, but
+independent installs usually mean activating/running one backend env at
+a time.
 
 ## Common Arguments
 
 Required:
 
-- `--backend {megatrain,torchtitan,trl_deepspeed,deepspeed_arctic,megatron,all}`
+- `--backend {megatrain,torchtitan,trl_deepspeed,deepspeed_arctic,megatron,trl_fsdp,all}`
 - `--model-path`: local HuggingFace model directory, for example `models/Qwen3-1.7B`
 - `--seq-length`: synthetic token sequence length
 
@@ -130,16 +198,31 @@ Memory/recompute knobs exposed by the unified API:
 - `--num-grad-slabs`
 - `--tiled-loss-shards`
 - `--tiled-mlp`
-- `--attn-implementation {flash_attention_2,auto,flash_attention_3,sdpa,eager}`: default is strict FlashAttention 2; pass `sdpa`/`eager` explicitly for fallback comparisons. MegaTrain only supports `flash_attention_2`, `sdpa`, and `eager`; `auto` skips FlashAttention 3 for that backend.
-- `--moe-kernel-backend {hf,auto,sonic}`: for HF sparse MoE models, `sonic` replaces compatible HF MoE blocks with `kernels-community/sonic-moe`
+- `--attn-implementation {auto,flash_attention_3,flash_attention_2,sdpa,eager}`: default is `auto` — probes FA3 first, then FA2, then SDPA, then eager. Pass an explicit implementation to pin (e.g. `flash_attention_2` or `sdpa`) for fallback comparisons. MegaTrain only supports `flash_attention_2`, `sdpa`, and `eager`; under `auto` MegaTrain skips FA3 automatically.
+- `--moe-kernel-backend {hf,auto,sonic}`: HF MoE expert kernel. `hf` keeps the model's default; `auto` enables HF's native [SonicMoE](https://huggingface.co/kernels-community/sonic-moe) via `model.set_experts_implementation("sonicmoe")` and falls back to `hf` if the model class doesn't expose it; `sonic` is strict and raises on failure. Applies to all four HF-loading backends (`trl_deepspeed`, `deepspeed_arctic`, `trl_fsdp`, `megatrain`); `torchtitan` and `megatron` use their own native MoE-kernel selection.
 - `--liger-kernel {auto,on,off}`: TRL Liger mode; `auto` enables it when `liger-kernel` and TRL support are installed
 - `--use-liger-kernel`: legacy alias for `--liger-kernel on`
 
-All generated DeepSpeed configs enable bf16 computation and, for ZeRO stages 1-3, bf16 master weights/gradients, bf16 optimizer states, and `optimizer.fp32_optimizer_states=false`. CPU optimizer/parameter offload entries use `pin_memory=true`. DeepSpeed launches also set `DS_SKIP_CUDA_CHECK=1` and `PYTORCH_CUDA_ALLOC_CONF=pinned_use_cuda_host_register:True,expandable_segments:True` unless those env vars are already set. TorchTitan is launched with `training.dtype=bfloat16` and `training.mixed_precision_param=bfloat16`. MegaTrain’s synthetic entrypoint constructs `CPUMasterConfig(dtype=torch.bfloat16)`.
+### bf16 master weights / grads / optimizer states
 
-Fractional activation checkpointing support is backend-dependent:
+Every backend in this harness defaults to **bf16 throughout** — bf16
+parameters, bf16 gradients, bf16 optimizer states, no fp32 master copy.
+Concretely:
+
+- `trl_deepspeed`, `deepspeed_arctic`: generated DeepSpeed configs set `bf16.enabled=true`, `bf16.bf16_master_weights_and_grads=true`, `bf16.bf16_optimizer_states=true`, `optimizer.fp32_optimizer_states=false`. CPU optimizer/parameter offload entries use `pin_memory=true`.
+- `trl_fsdp`: generated `accelerate_fsdp.yaml` sets `mixed_precision: bf16` and `fsdp_version: 2`; FSDP2's MixedPrecisionPolicy stores params/grads/opt in bf16 with no fp32 master.
+- `torchtitan`: launched with `training.dtype=bfloat16` and `training.mixed_precision_param=bfloat16`.
+- `megatron`: train script defaults `use_precision_aware_optimizer=True`, giving bf16 main_params + bf16 exp_avg + bf16 exp_avg_sq.
+- `megatrain`: synthetic entrypoint constructs `CPUMasterConfig(dtype=torch.bfloat16)`.
+
+DeepSpeed launches also set `DS_SKIP_CUDA_CHECK=1` and
+`PYTORCH_CUDA_ALLOC_CONF=pinned_use_cuda_host_register:True,expandable_segments:True`
+unless those env vars are already set.
+
+### Fractional activation checkpointing support
 
 - `trl_deepspeed`: HF/TRL does not expose supported fractional layer checkpointing. The launcher rejects true fractional values (`0 < f < 1`); use `--activation-checkpointing none/full`.
+- `trl_fsdp`: same as `trl_deepspeed` — HF gradient_checkpointing is binary; rejected for `0 < f < 1`.
 - `deepspeed_arctic`: this path is still a HuggingFace model path, so true fractional values (`0 < f < 1`) are rejected. Use `--activation-checkpointing none/full` plus ALST knobs such as sequence parallelism, tiled loss, tiled MLP, and activation offload.
 - `torchtitan`: fractional values are approximated by TorchTitan selective checkpointing every `round(1/f)` layers. `f=1` maps to full, `f=0` maps to none.
 - `megatron`: fractional values map to Megatron full block recompute for `floor(num_layers * f)` layers. `f=1` maps to full uniform recompute, `f=0` maps to no recompute.
@@ -147,7 +230,11 @@ Fractional activation checkpointing support is backend-dependent:
 
 ## Synthetic Data
 
-Synthetic examples are generated as random integer token IDs in `[0, vocab_size)`, where `vocab_size` is read from the model’s `config.json`. This avoids benchmarking tokenizer throughput or text-packing behavior. Labels are shaped to match each backend’s causal-LM API:
+Synthetic examples are generated as random integer token IDs in
+`[0, vocab_size)`, where `vocab_size` is read from the model's
+`config.json`. This avoids benchmarking tokenizer throughput or
+text-packing behavior. Labels are shaped to match each backend's
+causal-LM API:
 
 - HuggingFace/TRL/DeepSpeed/MegaTrain receive unshifted labels and let the model/backend shift.
 - TorchTitan receives pre-shifted labels because its dataloader contract yields `(input, next_token_label)`.
@@ -155,44 +242,7 @@ Synthetic examples are generated as random integer token IDs in `[0, vocab_size)
 
 ## Backend Notes
 
-### MegaTrain
-
-Entrypoint:
-
-```bash
-python baseline/run_baseline.py --backend megatrain ...
-```
-
-Uses `baseline/MegaTrain` as the vendor tree and `baseline/backends/megatrain/train_synthetic.py` as the synthetic entrypoint. Extra knobs:
-
-- `--activation-checkpoint-interval`: maps to MegaTrain `checkpoint_interval` (vendor default `4`, meaning checkpoint every N layers)
-- `--activation-checkpoint-fraction`: true fractional values are rejected; prefer `--activation-checkpoint-interval`
-- `--num-grad-slabs`: maps to MegaTrain gradient slab pool size
-- `--backend-extra-arg --optimizer --backend-extra-arg deepspeed_cpu_adam`
-
-### TorchTitan
-
-Entrypoint:
-
-```bash
-python baseline/run_baseline.py --backend torchtitan ...
-```
-
-The harness looks for `baseline/TorchTitan`, then `baseline/vendor/TorchTitan`, then `baseline/torchtitan`, then the old `orig/baseline/torchtitan`. The synthetic registry is `baseline.backends.torchtitan.synthetic_registry` and currently covers TorchTitan’s built-in `llama3_8b`, `qwen3_1_7b`, `qwen3_32b`, and debug specs. For custom specs:
-
-```bash
---torchtitan-module your.package.registry --torchtitan-config your_config
-```
-
-Important mappings:
-
-- `--activation-checkpointing` -> `--activation_checkpoint.mode`
-- `--activation-checkpoint-fraction` -> approximate selective interval via `--activation_checkpoint.selective_ac_option`
-- `--activation-offload cpu` -> `--training.enable_activation_offload`
-- `--optimizer-offload cpu` or `--param-offload cpu` -> `--training.enable_cpu_offload`
-- tensor/pipeline/context/FSDP flags map to `--parallelism.*`
-
-### TRL + DeepSpeed
+### TRL + DeepSpeed (`trl_deepspeed`)
 
 Entrypoint:
 
@@ -200,18 +250,39 @@ Entrypoint:
 python baseline/run_baseline.py --backend trl_deepspeed ...
 ```
 
-Uses `SFTTrainer` with `dataset_kwargs={"skip_prepare_dataset": True}` so the token-native synthetic dataset is passed through directly. Important mappings:
+Uses TRL `SFTTrainer` with `dataset_kwargs={"skip_prepare_dataset":
+True}` so the token-native synthetic dataset is passed through directly.
+Important mappings:
 
-- `--zero-stage`, `--optimizer-offload`, `--param-offload` -> generated DeepSpeed JSON
-- `--activation-checkpointing` -> HF gradient checkpointing
-- `--activation-checkpoint-fraction`: true fractional values are rejected because HF/TRL does not expose supported fractional layer checkpointing
-- `--activation-offload cpu` -> TRL `activation_offloading` when available
-- `--attn-implementation flash_attention_2` -> strict default for HF/TRL runs; `auto` may try FlashAttention 3 first and then fall back through FlashAttention 2, SDPA, and eager
-- `--moe-kernel-backend sonic` -> loads `kernels-community/sonic-moe` through the Hugging Face `kernels` package and swaps compatible HF sparse MoE blocks
-- `--liger-kernel auto` -> sets TRL `use_liger_kernel=True` only when `liger-kernel` is installed and the local TRL `SFTConfig` exposes the option
-- Install with `baseline/scripts/install_backend.sh --backend trl_deepspeed`; this creates an isolated TRL/DeepSpeed env and installs Liger plus matching prebuilt FlashAttention wheels after Torch.
+- `--zero-stage`, `--optimizer-offload`, `--param-offload` → generated DeepSpeed JSON
+- `--activation-checkpointing` → HF gradient checkpointing
+- `--activation-offload cpu` → TRL `activation_offloading` when available
+- `--moe-kernel-backend sonic` → `model.set_experts_implementation("sonicmoe")` (HF native dispatch)
+- `--liger-kernel auto` → sets TRL `use_liger_kernel=True` only when `liger-kernel` is installed and the local TRL `SFTConfig` exposes the option
 
-### DeepSpeed Arctic / ALST
+### TRL + FSDP2 (`trl_fsdp`)
+
+Entrypoint:
+
+```bash
+python baseline/run_baseline.py --backend trl_fsdp ...
+```
+
+Same TRL `SFTTrainer` loop as `trl_deepspeed`; the harness writes an
+`accelerate_fsdp.yaml` (FSDP2 plugin: `fsdp_version=2`,
+`fsdp_auto_wrap_policy=TRANSFORMER_BASED_WRAP`,
+`fsdp_sharding_strategy=FULL_SHARD` or `HYBRID_SHARD` depending on
+`--fsdp-replicate-degree`) and launches via `accelerate launch
+--config_file=...`. Important mappings:
+
+- `--param-offload cpu` OR `--optimizer-offload cpu` → `fsdp_offload_params: true` (FSDP2 ties param + grad + opt offload together; both flags map to the same setting)
+- `--activation-checkpointing != none` → `fsdp_activation_checkpointing: true` and HF `gradient_checkpointing`
+- `--activation-offload cpu` → TRL `activation_offloading` when available
+- `--fsdp-shard-degree`, `--fsdp-replicate-degree` → FSDP plugin sharding strategy
+- `--moe-kernel-backend sonic` → `model.set_experts_implementation("sonicmoe")` (HF native dispatch)
+- `--liger-kernel auto` → TRL `use_liger_kernel` when supported
+
+### DeepSpeed Arctic / ALST (`deepspeed_arctic`)
 
 Entrypoint:
 
@@ -219,16 +290,66 @@ Entrypoint:
 python baseline/run_baseline.py --backend deepspeed_arctic --sequence-parallel-size 4 ...
 ```
 
-Uses a custom HF + DeepSpeed loop in `baseline/backends/deepspeed_arctic/train_synthetic.py`. Important mappings:
+Uses a custom HF + DeepSpeed loop in
+`baseline/backends/deepspeed_arctic/train_synthetic.py`. Important
+mappings:
 
 - `--sequence-parallel-size > 1` enables DeepSpeed Ulysses SP registration and dataloader adaptation
-- `--activation-checkpoint-fraction`: true fractional values are rejected because this path uses HuggingFace model checkpointing APIs
-- `--zero-stage`, `--optimizer-offload`, `--param-offload` -> generated DeepSpeed JSON
-- `--moe-kernel-backend sonic` -> loads `kernels-community/sonic-moe` through the Hugging Face `kernels` package and swaps compatible HF sparse MoE blocks
+- `--zero-stage`, `--optimizer-offload`, `--param-offload` → generated DeepSpeed JSON
+- `--moe-kernel-backend sonic` → `model.set_experts_implementation("sonicmoe")` (HF native dispatch)
 - `--activation-offload cpu` attempts the Arctic Training activation checkpoint offload monkey patch if installed
 - `--tiled-mlp` attempts the DeepSpeed ALST Llama MLP tiling hook
 
-### Megatron Core
+### MegaTrain (`megatrain`)
+
+Entrypoint:
+
+```bash
+python baseline/run_baseline.py --backend megatrain ...
+```
+
+Uses `baseline/MegaTrain` as the vendor tree (or fetches into
+`baseline/vendor/MegaTrain` on first install) and
+`baseline/backends/megatrain/train_synthetic.py` as the synthetic
+entrypoint, which loads an HF model, optionally swaps in SonicMoE, then
+wraps with `CPUMasterModel`. Extra knobs:
+
+- `--activation-checkpoint-interval`: maps to MegaTrain `checkpoint_interval` (vendor default `4`, meaning checkpoint every N layers)
+- `--num-grad-slabs`: maps to MegaTrain gradient slab pool size
+- `--moe-kernel-backend sonic` → `model.set_experts_implementation("sonicmoe")` on the underlying HF model before wrapping
+- `--backend-extra-arg --optimizer --backend-extra-arg deepspeed_cpu_adam`
+
+### TorchTitan (`torchtitan`)
+
+Entrypoint:
+
+```bash
+python baseline/run_baseline.py --backend torchtitan ...
+```
+
+The harness looks for `baseline/TorchTitan`, then
+`baseline/vendor/TorchTitan`, then the old
+`orig/baseline/torchtitan`. The synthetic registry is
+`baseline.backends.torchtitan.synthetic_registry` and currently covers
+TorchTitan's built-in `llama3_8b`, `qwen3_1_7b`, `qwen3_32b`, and debug
+specs. For custom specs:
+
+```bash
+--torchtitan-module your.package.registry --torchtitan-config your_config
+```
+
+Important mappings:
+
+- `--activation-checkpointing` → `--activation_checkpoint.mode`
+- `--activation-checkpoint-fraction` → approximate selective interval via `--activation_checkpoint.selective_ac_option`
+- `--activation-offload cpu` → `--training.enable_activation_offload`
+- `--optimizer-offload cpu` or `--param-offload cpu` → `--training.enable_cpu_offload`
+- tensor/pipeline/context/FSDP flags map to `--parallelism.*`
+
+TorchTitan does not load HF model objects, so `--moe-kernel-backend
+sonic` does not apply (TorchTitan has its own MoE-kernel selection).
+
+### Megatron-Core (`megatron`)
 
 Entrypoint:
 
@@ -236,13 +357,37 @@ Entrypoint:
 python baseline/run_baseline.py --backend megatron ...
 ```
 
-The harness generates a per-run `model_dims.json` from the HuggingFace config and launches the Megatron script. It prefers `baseline/backends/megatron/train.py` if present and otherwise falls back to `orig/baseline/megatron/train.py`. Important mappings:
+The harness generates a per-run `model_dims.json` from the HuggingFace
+config and launches the Megatron script. It prefers
+`baseline/backends/megatron/train.py` if present and otherwise falls
+back to `orig/baseline/megatron/train.py`. Important mappings:
 
 - `--recompute-granularity`, `--recompute-method`, `--recompute-num-layers`, `--recompute-modules`
-- `--activation-checkpoint-fraction` -> Megatron block recompute count
-- `--activation-offload cpu` -> TE layer CPU offload flags
-- `--offload-modules` -> Megatron fine-grained activation offload
-- `--optimizer-offload cpu` -> Megatron optimizer CPU offload
+- `--activation-checkpoint-fraction` → Megatron block recompute count
+- `--activation-offload cpu` → TE layer CPU offload flags
+- `--offload-modules` → Megatron fine-grained activation offload
+- `--optimizer-offload cpu` → Megatron optimizer CPU offload
+
+Megatron-Core builds models from `model_dims.json`, not from HF model
+classes, so `--moe-kernel-backend sonic` does not apply (Megatron-Core
+has its own MoE-kernel selection).
+
+## MoE kernel routing (HF native)
+
+For the four HF-loading backends, the SonicMoE kernel is reached through
+HF's native dispatch — the harness no longer ships a custom
+adapter/module-replacer. The path is:
+
+1. Backend-specific train script loads the HF model via `AutoModelForCausalLM.from_pretrained`.
+2. `baseline.backends.common.moe_kernel.apply_moe_kernel_backend(model, mode)` calls `model.set_experts_implementation("sonicmoe")` (introduced in [HF transformers PR #45433](https://github.com/huggingface/transformers/pull/45433)).
+3. HF's modular `Experts` module rebinds its forward to `transformers.integrations.sonicmoe.sonicmoe_experts_forward`, which dispatches the [`kernels-community/sonic-moe`](https://huggingface.co/kernels-community/sonic-moe) kernel via `kernels.lazy_load_kernel("sonic-moe")`.
+
+This route preserves the model's own router (no router replacement), is
+DTensor-safe under FSDP2/EP, supports biased experts, and gracefully
+no-ops for non-MoE configs. `mode="auto"` falls back to the model's
+default kernel on any failure (transformers too old, model class without
+`set_experts_implementation`, kernel can't load on this GPU/CUDA combo);
+`mode="sonic"` is strict.
 
 ## References Used For API Choices
 
@@ -250,6 +395,8 @@ The harness generates a per-run `model_dims.json` from the HuggingFace config an
 - DeepSpeed Arctic/ALST Ulysses integration: https://www.deepspeed.ai/tutorials/ulysses-alst-sequence-parallelism/
 - Hugging Face Transformers DeepSpeed ALST guide: https://huggingface.co/docs/transformers/main/deepspeed_alst
 - TRL SFTTrainer/SFTConfig: https://huggingface.co/docs/trl/en/sft_trainer
+- accelerate FSDP plugin (FSDP2): https://huggingface.co/docs/accelerate/usage_guides/fsdp
+- HF transformers ExpertsInterface (sonicmoe dispatch): https://github.com/huggingface/transformers/pull/45433
 - FlashAttention prebuilt wheels: https://github.com/mjun0812/flash-attention-prebuild-wheels
 - causal-conv1d prebuilt wheels: https://github.com/Dao-AILab/causal-conv1d/releases
 - Flash Linear Attention: https://github.com/fla-org/flash-linear-attention

@@ -17,6 +17,7 @@ adaws_research_prototype.pdf
 docs/qwen3_5_status.md
 docs/lora_perf_notes.md
 external_moe_impl/
+texput.log
 
 # Large data + model files: never commit
 models/
@@ -39,5 +40,17 @@ orig/awsm_transformer/ops/**/build/
 orig/awsm_transformer/ops/**/*.so
 orig/awsm_transformer/ops/**/*.egg-info/
 
-# Megatrain workspace
-megatrain/
+# Main paper build artifacts
+main_paper/*.aux
+main_paper/*.bbl
+main_paper/*.blg
+main_paper/*.fdb_latexmk
+main_paper/*.fls
+main_paper/*.log
+main_paper/*.out
+main_paper/*.toc
+main_paper/evaluation/runs/
+
+# Megatrain workspace at the repo root. Anchored so it does not
+# shadow the nested baseline/backends/megatrain/ adapter directory.
+/megatrain/

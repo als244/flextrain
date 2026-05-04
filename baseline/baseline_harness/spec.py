@@ -14,6 +14,7 @@ BackendName = Literal[
     "trl_deepspeed",
     "deepspeed_arctic",
     "megatron",
+    "trl_fsdp",
 ]
 
 
@@ -50,7 +51,7 @@ class HarnessConfig:
     seed: int = 42
     output_dir: Path | None = None
     dry_run: bool = False
-    attn_implementation: str = "flash_attention_2"
+    attn_implementation: str = "auto"
     moe_kernel_backend: Literal["hf", "auto", "sonic"] = "hf"
     activation_checkpointing: Literal["none", "selective", "full", "memory_budget"] = "full"
     activation_checkpoint_fraction: float | None = None
