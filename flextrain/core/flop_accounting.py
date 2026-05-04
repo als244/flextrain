@@ -379,32 +379,24 @@ def round_compute_flops(
     return fwd_total, recompute_total
 
 
-def flash_attn_recompute_flops(
+def flash_attn_fwd_flops(
     layers: Sequence[Any],
     chunks: Sequence[Any],
 ) -> int:
-    """Hardware-only correction: flash-attention bwd always recomputes
-    the attention scan (it saves logsumexp per row, not the full
-    S×S softmax matrix). At any save tier, dense-attention bwd spends
-    ~50% of its fwd attention FLOPs on this recomputation.
+    """Sum of dense-attention forward FLOPs across all (layer, chunk, seq).
 
-    The per-block ``avoided_recompute_flops[≥1]`` says "tier 1 saves
-    attn_result so attention isn't recomputed", which is true for the
-    *attention output* tensor but not for the attention compute kernel
-    itself — flash bwd still runs the scan to get dQ/dK/dV. So we
-    add 0.5 × attn-fwd-flops back to the hardware-side total
-    regardless of the plan.
+    Per-(s, prior) cost: ``4·s·prior·attn_dim + 2·s·s·attn_dim`` (causal)
+    or ``4·s·prior·attn_dim + 4·s·s·attn_dim`` (non-causal). Same formula
+    GQAAttentionBlock.compute_cost uses for the attention term.
+
+    Linear-attn layers contribute 0 (no per-step quadratic kernel).
 
     Detection: a layer is dense-attention if it has a ``self.attn``
     attribute pointing at a block with ``cfg.attn_dim`` and
-    ``cfg.is_causal``. Linear-attn layers use ``self.lin_attn``
-    instead and skip this correction (they don't run a per-step
-    quadratic kernel).
-
-    Under ``--mode lora`` the backbone layers are wrapped by
-    :class:`LoRAWrapperLayer`, which delegates ``compute_cost`` but
-    does NOT re-expose the base layer's ``self.attn``. Unwrap via
-    the wrapper's ``self.base`` chain before checking.
+    ``cfg.is_causal``. Under ``--mode lora`` the backbone layers are
+    wrapped by :class:`LoRAWrapperLayer`, which delegates
+    ``compute_cost`` but does NOT re-expose the base layer's
+    ``self.attn``; unwrap via the wrapper's ``self.base`` chain.
     """
     total = 0
     for layer in layers:
@@ -420,9 +412,6 @@ def flash_attn_recompute_flops(
             continue
         is_causal = bool(getattr(cfg, "is_causal", True))
         attn_factor = 0.5 if is_causal else 1.0
-        # 0.5 × fwd attention FLOPs. fwd is 4 · S · prior · attn_dim
-        # (cross with prior context) + 2 · S · S · attn_dim (causal
-        # current) — same formula GQAAttentionBlock.compute_cost uses.
         for chunk in chunks:
             for s, prior in zip(
                 chunk.meta.seq_lens_host,
@@ -434,12 +423,30 @@ def flash_attn_recompute_flops(
                     if not is_causal
                     else 2 * s * s * attn_dim
                 )
-                fwd_attn = attn_prior + attn_current
-                # Bwd recompute: ~0.5× fwd. (Half because flash bwd
-                # reads logsumexp; the matmul-equivalent cost is one
-                # full attn-pass.)
-                total += fwd_attn // 2
+                total += attn_prior + attn_current
     return total
+
+
+def flash_attn_recompute_flops(
+    layers: Sequence[Any],
+    chunks: Sequence[Any],
+) -> int:
+    """Hardware-only correction: flash-attention bwd always recomputes
+    the attention scan (it saves logsumexp per row, not the full
+    S×S softmax matrix). At any save tier, dense-attention bwd spends
+    ~50% of its fwd attention FLOPs on this recomputation.
+
+    The per-block ``avoided_recompute_flops[≥1]`` says "tier 1 saves
+    attn_result so attention isn't recomputed", which is true for the
+    *attention output* tensor but not for the attention compute kernel
+    itself — flash bwd still runs the scan to get dQ/dK/dV. So we
+    add 0.5 × attn-fwd-flops back to the hardware-side total
+    regardless of the plan.
+    """
+    # Per-iteration attn_fwd is always even (4·s·prior·d and
+    # 2·s²·d / 4·s²·d both have factor 2), so summing then halving
+    # matches per-iteration ``fwd_attn // 2`` exactly.
+    return flash_attn_fwd_flops(layers, chunks) // 2
 
 
 __all__ = (
@@ -448,5 +455,6 @@ __all__ = (
     "opt_flops_per_step",
     "step_flops",
     "round_compute_flops",
+    "flash_attn_fwd_flops",
     "flash_attn_recompute_flops",
 )

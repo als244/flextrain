@@ -65,6 +65,7 @@ from flextrain.core.activation_schema import (
     fetch_home,
 )
 from flextrain.core.flop_accounting import (
+    flash_attn_fwd_flops,
     flash_attn_recompute_flops,
     round_compute_flops,
 )
@@ -2120,6 +2121,26 @@ class ActiveModel:
         flash_frac = (
             (round_recompute + flash_extra) / round_fwd if round_fwd else 0.0
         )
+        # Flash-attn share of backbone hardware FLOPs. Numerator covers
+        # the entire attention kernel cost the GPU executes per round:
+        #   - flash fwd                  : 1× attn_fwd
+        #   - flash bwd matmul (dgrad+wgrad equiv on attn matmuls)
+        #                                 : 2× attn_fwd
+        #   - flash bwd recompute scan   : 0.5× attn_fwd (= flash_extra)
+        # Denominator is the full backbone hardware FLOP budget the
+        # round will execute:
+        #   - useful fwd                 : round_fwd
+        #   - bwd matmul (full mode)     : 2× round_fwd
+        #   - DP-decided recompute       : round_recompute
+        #   - flash recompute scan       : flash_extra
+        # Both sides use the full-mode 2× bwd multiplier (matches the
+        # planning-time ``flash_frac`` above; mode is unknown at log time).
+        flash_fwd = flash_attn_fwd_flops(self.backbone, prepared.chunks)
+        flash_attn_total = 3 * flash_fwd + flash_extra
+        backbone_hw_total = 3 * round_fwd + round_recompute + flash_extra
+        flash_share = (
+            flash_attn_total / backbone_hw_total if backbone_hw_total else 0.0
+        )
         print(
             f"[Save Level Plan] "
             f"{len(prepared.chunks)} chunks x {len(self.backbone)} layers; "
@@ -2129,7 +2150,8 @@ class ActiveModel:
             f"Final Recompute Time: {plan.estimated_recompute_time_ms:.2f}ms / "
             f"{plan.estimated_fwd_time_ms:.2f}ms, "
             f"Final Recompute Frac: {plan.recompute_fraction:.4f} "
-            f"(with flash-attn: {flash_frac:.4f})",
+            f"(with flash-attn: {flash_frac:.4f}). "
+            f"Flash-attn share of HW FLOPs: {flash_share:.2%}",
             flush=True,
         )
 
