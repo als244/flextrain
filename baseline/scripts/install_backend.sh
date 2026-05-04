@@ -352,6 +352,20 @@ if [[ "${LINEAR_ATTENTION_MODE}" != "none" ]]; then
   fi
 fi
 
+# Pre-fetch HF kernel-hub kernels (sonic-moe today) into the local
+# HF cache. The compute node may have no internet, in which case the
+# kernels' lazy-load path falls back to whatever it finds in
+# ~/.cache/huggingface/. Skip when the caller is already offline (the
+# fetch would just fail) or when the user explicitly opts out via
+# BASELINE_SKIP_KERNEL_PREFETCH=1. Errors are non-fatal; the runtime
+# fallback for missing kernels is to use --moe-kernel-backend hf.
+if [[ "${ENV_NAME}" == "baseline_core" ]] && \
+   [[ "${HF_HUB_OFFLINE:-0}" != "1" ]] && \
+   [[ "${BASELINE_SKIP_KERNEL_PREFETCH:-0}" != "1" ]]; then
+  python "${BASELINE_DIR}/scripts/prefetch_kernels.py" || \
+    echo "warning: kernel prefetch failed; sonic-moe path may need internet at first run" >&2
+fi
+
 cat <<EOF
 
 Installed backend "${BACKEND}" into conda env: ${ENV_NAME}

@@ -449,6 +449,36 @@ default kernel on any failure (transformers too old, model class without
 `set_experts_implementation`, kernel can't load on this GPU/CUDA combo);
 `mode="sonic"` is strict.
 
+### Offline compute nodes
+
+`kernels.lazy_load_kernel("sonic-moe")` queries the HuggingFace API for
+available revisions on every first call — even when a local cache
+exists. On a compute node with no internet access (typical SLURM
+allocations under `HF_HUB_OFFLINE=1`), this fails with
+`OfflineModeIsEnabled: Cannot reach https://huggingface.co/api/models/kernels-community/sonic-moe/refs`.
+
+Workflow for offline runs:
+
+```bash
+# 1. On a node WITH internet (login / head node):
+conda activate baseline_core
+python baseline/scripts/prefetch_kernels.py
+# Caches kernels-community/sonic-moe into ~/.cache/huggingface/.
+
+# 2. On the offline compute node, ensure HF_HOME / HF_HUB_CACHE
+#    resolves to the same directory the prefetch wrote to (usually
+#    automatic if your cluster shares $HOME across nodes).
+```
+
+`baseline/scripts/install_backend.sh` runs `prefetch_kernels.py`
+automatically at the end of the `baseline_core` env install when
+`HF_HUB_OFFLINE != "1"`. Set `BASELINE_SKIP_KERNEL_PREFETCH=1` to
+skip it (e.g. when re-running the installer behind a firewall).
+
+If sonic-moe simply can't be cached for an offline run, fall back to
+`--moe-kernel-backend hf` and the model uses its default eager MoE
+implementation — slower but doesn't require the kernel hub.
+
 ## References Used For API Choices
 
 - DeepSpeed bf16 config keys: https://www.deepspeed.ai/docs/config-json/
