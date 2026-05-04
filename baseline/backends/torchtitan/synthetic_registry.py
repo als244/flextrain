@@ -15,6 +15,19 @@ from torchtitan.components.optimizer import OptimizersContainer
 from torchtitan.config import ActivationCheckpointConfig, ParallelismConfig, TrainingConfig
 from torchtitan.trainer import Trainer
 
+# Loss config: post-v0.2.2 torchtitan main moved loss selection onto
+# Trainer.Config.loss (a concrete subclass of the abstract BaseLoss).
+# Without setting it, ``Trainer.__init__`` raises
+# ``TypeError: Can't instantiate abstract class BaseLoss``. The
+# pre-v0.2.2 orig path went through ``model_spec.build_loss_fn`` so
+# this didn't surface there. We import the new concrete class lazily
+# and only add the field when present, so the registry stays usable
+# against both old and new torchtitan checkouts.
+try:
+    from torchtitan.components.loss import CrossEntropyLoss as _CrossEntropyLoss
+except ImportError:  # orig API, no concrete CrossEntropyLoss class
+    _CrossEntropyLoss = None
+
 
 class _SyntheticTitanDataset(IterableDataset):
     def __init__(self, vocab_size: int, seq_len: int, seed: int):
@@ -70,6 +83,13 @@ class SyntheticTokenDataLoader(ParallelAwareDataloader):
 
 
 def _base_config(model_spec, *, batch_size: int = 1, seq_len: int = 2048) -> Trainer.Config:
+    extra: dict = {}
+    if _CrossEntropyLoss is not None:
+        # post-v0.2.2 torchtitan main: must specify a concrete loss
+        # (BaseLoss is abstract). CrossEntropyLoss is the standard
+        # next-token loss the orig path used implicitly via
+        # model_spec.build_loss_fn.
+        extra["loss"] = _CrossEntropyLoss.Config()
     return Trainer.Config(
         hf_assets_path="./tests/assets/tokenizer",
         model_spec=model_spec,
@@ -88,6 +108,7 @@ def _base_config(model_spec, *, batch_size: int = 1, seq_len: int = 2048) -> Tra
         parallelism=ParallelismConfig(),
         checkpoint=CheckpointManager.Config(enable=False, interval=500),
         activation_checkpoint=ActivationCheckpointConfig(mode="full"),
+        **extra,
     )
 
 

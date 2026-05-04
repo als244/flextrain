@@ -190,8 +190,14 @@ def main() -> None:
     use_liger_kernel = _resolve_liger_kernel(args, SFTConfig)
     # FSDP plugin is configured externally by ``accelerate launch
     # --config_file`` (see baseline_harness.backends._accelerate_fsdp_config).
-    # SFTConfig itself only needs the bf16 + checkpointing + liger flags;
-    # accelerate handles the FSDP wrapping at trainer construction time.
+    # SFTConfig itself needs ``bf16=False, fp16=False`` here:
+    # SFTConfig(bf16=True) makes HF Trainer construct its own
+    # Accelerator with mixed_precision="bf16", which OVERRIDES the YAML's
+    # ``mixed_precision: "no"`` and re-enables the FSDP fp32 upcast we
+    # are explicitly disabling. With both mixed_precision knobs set to
+    # "no" *and* the model loaded with ``torch_dtype=torch.bfloat16``,
+    # FSDP2 keeps the shards bf16 throughout — params, grads, opt
+    # state — without any fp32 master copy.
     sft_kwargs = _filtered_kwargs(
         SFTConfig,
         {
@@ -202,7 +208,12 @@ def main() -> None:
             "max_steps": args.num_steps,
             "learning_rate": args.learning_rate,
             "weight_decay": args.weight_decay,
-            "bf16": True,
+            # Intentional: see comment above. ``bf16=True`` here would
+            # cause HF Trainer to override the YAML's
+            # ``mixed_precision: "no"`` and re-trigger the fp32 upcast
+            # warning ("FSDP upcast of low precision parameters to fp32
+            # ...") that blew the 80 GiB budget on Llama3-8B @ 128K.
+            "bf16": False,
             "fp16": False,
             "logging_steps": 1,
             "save_strategy": "no",
