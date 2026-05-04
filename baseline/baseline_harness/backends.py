@@ -558,7 +558,23 @@ def build_torchtitan(config: HarnessConfig, model: ModelInfo) -> LaunchPlan:
         torchtitan_candidates[0],
     )
 
-    ac_mode, ac_option = _fractional_mode(config)
+    ac_mode, _ac_option = _fractional_mode(config)
+    # NOTE on flag stability: torchtitan has been refactoring its
+    # JobConfig schema between releases (the `__version__` string
+    # currently lags behind main, so a pinned 0.2.2 install is often
+    # actually a post-0.2.2 main checkout). We only emit flags that
+    # exist on both v0.2.2 and main. Specifically dropped:
+    #   - --activation_checkpoint.selective_ac_option (gone in main;
+    #     selective granularity is now controlled by per_op SAC FQNs)
+    #   - --training.enable_activation_offload (never existed; we
+    #     leave activation offload to FSDP's own offload policy
+    #     toggled via --training.enable_cpu_offload)
+    #   - --dataloader.vocab_size and --dataloader.seed (no longer
+    #     part of the public CLI — torchtitan reads vocab from the
+    #     HF assets, and seed defaults at the trainer level)
+    # ``--model.hf_assets_path`` and ``--job.dump_folder`` use the
+    # dotted form because those fields live on the Model and Job
+    # dataclasses respectively (not at JobConfig top-level).
     command = [
         "torchrun",
         f"--nproc_per_node={config.num_gpus}",
@@ -574,9 +590,9 @@ def build_torchtitan(config: HarnessConfig, model: ModelInfo) -> LaunchPlan:
         module,
         "--config",
         registry_config,
-        "--hf_assets_path",
+        "--model.hf_assets_path",
         str(model.path),
-        "--dump_folder",
+        "--job.dump_folder",
         str(out),
         "--training.local_batch_size",
         str(config.micro_batch_size),
@@ -592,8 +608,6 @@ def build_torchtitan(config: HarnessConfig, model: ModelInfo) -> LaunchPlan:
         "float32",
         "--activation_checkpoint.mode",
         ac_mode,
-        "--activation_checkpoint.selective_ac_option",
-        ac_option,
         "--parallelism.data_parallel_replicate_degree",
         str(config.fsdp_replicate_degree),
         "--parallelism.data_parallel_shard_degree",
@@ -604,15 +618,10 @@ def build_torchtitan(config: HarnessConfig, model: ModelInfo) -> LaunchPlan:
         str(config.pipeline_parallel_size),
         "--parallelism.context_parallel_degree",
         str(config.context_parallel_size),
-        "--dataloader.vocab_size",
-        str(model.vocab_size),
-        "--dataloader.seed",
-        str(config.seed),
         "--metrics.log_freq",
         "1",
     ]
     _bool_flag(command, config.optimizer_offload == "cpu" or config.param_offload == "cpu", "--training.enable_cpu_offload")
-    _bool_flag(command, config.activation_offload == "cpu", "--training.enable_activation_offload")
     command.extend(config.backend_extra_args)
     return LaunchPlan(
         backend="torchtitan",

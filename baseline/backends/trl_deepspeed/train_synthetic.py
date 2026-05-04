@@ -53,6 +53,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--liger-kernel", choices=["auto", "on", "off"], default="auto")
     parser.add_argument("--use-liger-kernel", action="store_true", help="Legacy alias for --liger-kernel on")
     parser.add_argument("--no-use-liger-kernel", action="store_true", help="Legacy alias for --liger-kernel off")
+    # The DeepSpeed launcher injects ``--local_rank=N`` into every
+    # spawned process. Absorb it here so argparse doesn't reject it
+    # as an unrecognized argument; we don't actually use the value
+    # (deepspeed.initialize handles distributed setup).
+    parser.add_argument("--local_rank", type=int, default=-1)
     return parser.parse_args()
 
 

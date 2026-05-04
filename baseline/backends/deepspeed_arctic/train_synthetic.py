@@ -158,12 +158,34 @@ def main() -> None:
             seq_length_is_variable=False,
         )
 
+    # Critical for ZeRO-3 to work as advertised: instantiate
+    # HfDeepSpeedConfig BEFORE from_pretrained. transformers detects
+    # this on the global stack and partitions the model across
+    # ZeRO-3 ranks (and offloads to CPU when configured) during
+    # construction. Without it, from_pretrained materializes the full
+    # model on a single rank's GPU first, then deepspeed.initialize
+    # tries to partition it after the fact — works for small models,
+    # OOMs at 128K context for 8B+.
+    # See: https://huggingface.co/docs/transformers/main_classes/deepspeed#nontrainer-deepspeed-integration
+    zero_stage = int(ds_config.get("zero_optimization", {}).get("stage", 0))
+    hf_ds_handle = None
+    if zero_stage == 3:
+        from transformers.integrations import HfDeepSpeedConfig
+
+        # Bind to a name so it stays alive on the stack until
+        # from_pretrained returns; transformers checks
+        # is_deepspeed_zero3_enabled() which inspects the most-recent
+        # live HfDeepSpeedConfig.
+        hf_ds_handle = HfDeepSpeedConfig(ds_config)
+
     model, _ = load_causal_lm_with_attention(
         args.model_path,
         attn_implementation,
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
     )
+    # Keep the handle live until after the model is fully constructed.
+    del hf_ds_handle
     model.config.use_cache = False
     apply_moe_kernel_backend(model, args.moe_kernel_backend)
     if _use_gradient_checkpointing(args) and hasattr(model, "gradient_checkpointing_enable"):

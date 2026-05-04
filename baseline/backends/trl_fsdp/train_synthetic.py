@@ -158,10 +158,22 @@ def main() -> None:
     )
     model.config.use_cache = False
     apply_moe_kernel_backend(model, args.moe_kernel_backend)
-    use_builtin_checkpointing = _use_gradient_checkpointing(args)
-    if use_builtin_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
-        # use_reentrant=False is required for FSDP2 + checkpointing.
-        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    # NOTE: under accelerate's FSDP2 plugin we let
+    # ``fsdp_activation_checkpointing`` (set in
+    # baseline_harness.backends._accelerate_fsdp_config) own
+    # checkpointing — HF Trainer raises
+    # "The activation_checkpointing in FSDP config and the
+    # gradient_checkpointing in training arg can't be set to True
+    # simultaneously" when both are on. We therefore do NOT call
+    # model.gradient_checkpointing_enable() and pass
+    # gradient_checkpointing=False to SFTConfig below. The FSDP plugin
+    # handles activation checkpointing on the wrapped layers directly.
+    # ``--activation-checkpointing none`` skips both paths uniformly.
+    # Validate fractional-ckpt args even though we don't use the
+    # return value — _use_gradient_checkpointing raises SystemExit on
+    # unsupported 0 < f < 1 values, surfacing the "use full/none for
+    # FSDP" error early rather than mid-training.
+    _use_gradient_checkpointing(args)
 
     num_samples = max(args.num_steps * args.gradient_accumulation_steps * args.micro_batch_size * 2, 8)
     dataset = RandomTokenMapDataset(
@@ -196,8 +208,10 @@ def main() -> None:
             "save_strategy": "no",
             "report_to": "none",
             "remove_unused_columns": False,
-            "gradient_checkpointing": use_builtin_checkpointing,
-            "gradient_checkpointing_kwargs": {"use_reentrant": False},
+            # FSDP plugin owns activation checkpointing — see comment
+            # above. Setting gradient_checkpointing=True here would
+            # collide with fsdp_activation_checkpointing.
+            "gradient_checkpointing": False,
             "dataset_kwargs": {"skip_prepare_dataset": True},
             "max_length": args.seq_length,
             "packing": False,
