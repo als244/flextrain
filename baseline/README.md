@@ -70,19 +70,35 @@ package. The launcher and synthetic datasets are repo-local source
 files; `baseline/run_baseline.py` adds the repo root to `PYTHONPATH`,
 and generated backend commands do the same.
 
-The harness installs into **two conda envs** that you'll see in
-`conda env list`:
+### Where the conda envs live, and which backend uses which
 
-| Conda env | Backends |
-|---|---|
-| `baseline_core` | `trl_deepspeed`, `trl_fsdp`, `deepspeed_arctic`, `megatrain`, `torchtitan` |
-| `baseline_megatron` | `megatron` |
+The harness installs into **exactly two conda envs**. You'll see both
+in `conda env list` after install. The default location is wherever
+your conda installation puts envs (typically
+`~/miniconda3/envs/<name>/` or `~/anaconda3/envs/<name>/`).
 
-The five "core" backends share one env because their pip deps are
-mutually compatible. Megatron lives alone because `transformer-engine`
-pins torch tightly and historically conflicts with the deeper deps of
-the HF backends. Override env names with `--env-name NAME` if you want
-something else.
+| Conda env | Backends that use it | Why |
+|---|---|---|
+| `baseline_core` | `trl_deepspeed`, `trl_fsdp`, `deepspeed_arctic`, `megatrain`, `torchtitan` | These five backends' pip deps are mutually compatible, so one env covers all of them. |
+| `baseline_megatron` | `megatron` | `transformer-engine[pytorch]` pins torch tightly and historically conflicts with the HF backends' deeper deps (deepspeed, kernels, tvm-ffi, etc), so megatron is split out. |
+
+Both `install_backend.sh` and `run_in_backend_env.sh` apply the same
+backend→env mapping. The decision is hard-coded based on the
+`--backend` flag — there's no separate "which env" argument to
+remember. You can override the env names globally with
+`BASELINE_CORE_ENV` / `BASELINE_MEGATRON_ENV` env vars, or per-call
+with `--env-name NAME`.
+
+`install_backend.sh` prints a banner before any install work showing
+the resolved decision, so you can confirm at runtime:
+
+```
+================================================================
+[install_backend] backend  : trl_fsdp
+                  conda env: baseline_core    <-- visible in `conda env list`
+                  reqs file: baseline/requirements/baseline_core.txt
+================================================================
+```
 
 Set up the envs:
 

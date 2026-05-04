@@ -183,38 +183,64 @@ case "${BACKEND}" in
     ;;
 esac
 
-# Map backend -> default conda env. Megatron lives alone because
-# transformer-engine doesn't compose well with the HF backends' deps.
+# =============================================================
+# Decide which conda env owns this backend.
+# =============================================================
+# All backends except megatron share one env (baseline_core) because
+# their pip deps are mutually compatible. Megatron is split into its
+# own env (baseline_megatron) because transformer-engine pins torch
+# tightly and historically conflicts with the HF backends' deeper
+# deps (deepspeed, kernels, tvm-ffi, etc).
+#
+# Override either with --env-name NAME (or set the
+# BASELINE_CORE_ENV / BASELINE_MEGATRON_ENV env vars).
 if [[ -z "${ENV_NAME}" ]]; then
   case "${BACKEND}" in
-    megatron) ENV_NAME="baseline_megatron" ;;
-    *)        ENV_NAME="baseline_core" ;;
+    megatron) ENV_NAME="${BASELINE_MEGATRON_ENV:-baseline_megatron}" ;;
+    *)        ENV_NAME="${BASELINE_CORE_ENV:-baseline_core}" ;;
   esac
 fi
 
 # Map env -> consolidated requirements file. The five core backends
-# share baseline_core.txt (their deps are mutually compatible).
+# share baseline_core.txt; megatron has its own.
 case "${ENV_NAME}" in
   baseline_core)     REQ_FILE="${BASELINE_DIR}/requirements/baseline_core.txt" ;;
   baseline_megatron) REQ_FILE="${BASELINE_DIR}/requirements/baseline_megatron.txt" ;;
   *)                 REQ_FILE="${BASELINE_DIR}/requirements/${ENV_NAME}.txt" ;;
 esac
 
+# =============================================================
+# Banner: surface the env decision before any install work.
+# =============================================================
+cat <<BANNER
+
+================================================================
+[install_backend] backend  : ${BACKEND}
+                  conda env: ${ENV_NAME}    <-- visible in \`conda env list\`
+                  reqs file: $(realpath --relative-to="${REPO_ROOT}" "${REQ_FILE}" 2>/dev/null || echo "${REQ_FILE}")
+================================================================
+
+BANNER
+
+# =============================================================
+# Create or reuse the conda env.
+# =============================================================
 init_conda
 
 if [[ "${RECREATE}" == "1" ]] && env_exists "${ENV_NAME}"; then
-  echo "Removing existing conda env: ${ENV_NAME}"
+  echo "[install_backend] --recreate: removing existing conda env '${ENV_NAME}'"
   conda env remove -n "${ENV_NAME}" -y
 fi
 
 if env_exists "${ENV_NAME}"; then
-  echo "Reusing existing conda env: ${ENV_NAME}"
+  echo "[install_backend] reusing existing conda env '${ENV_NAME}' (no create)"
 else
-  echo "Creating conda env: ${ENV_NAME} (python=${PYTHON_VERSION})"
+  echo "[install_backend] creating new conda env '${ENV_NAME}' with python=${PYTHON_VERSION}"
   conda create -n "${ENV_NAME}" "python=${PYTHON_VERSION}" -y
 fi
 
 conda activate "${ENV_NAME}"
+echo "[install_backend] activated conda env '${ENV_NAME}' at ${CONDA_PREFIX}"
 
 python -m pip install --upgrade pip setuptools wheel packaging
 

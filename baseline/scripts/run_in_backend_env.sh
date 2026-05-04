@@ -25,6 +25,10 @@ shift
 CORE_ENV="${BASELINE_CORE_ENV:-baseline_core}"
 MEGATRON_ENV="${BASELINE_MEGATRON_ENV:-baseline_megatron}"
 
+# Same backend->env map as install_backend.sh:
+#   megatron                                     -> baseline_megatron
+#   trl_deepspeed, trl_fsdp, deepspeed_arctic,
+#     megatrain, torchtitan                      -> baseline_core
 case "${BACKEND}" in
   megatron) ENV_NAME="${MEGATRON_ENV}" ;;
   trl_deepspeed|trl_fsdp|deepspeed_arctic|megatrain|torchtitan) ENV_NAME="${CORE_ENV}" ;;
@@ -33,6 +37,8 @@ case "${BACKEND}" in
     exit 2
     ;;
 esac
+
+echo "[run_in_backend_env] backend=${BACKEND} -> conda env=${ENV_NAME}"
 
 # Source conda's shell hook so `conda activate` works inside this script.
 init_conda() {
@@ -63,6 +69,7 @@ if ! conda env list | awk 'NR>2 {print $1}' | grep -qx "${ENV_NAME}"; then
 fi
 
 conda activate "${ENV_NAME}"
+echo "[run_in_backend_env] activated '${ENV_NAME}' at ${CONDA_PREFIX}"
 
 # Pre-flight: surface driver/torch CUDA mismatches before the backend
 # allocates a model. ``BASELINE_SKIP_CUDA_CHECK=1`` opts out (useful in
