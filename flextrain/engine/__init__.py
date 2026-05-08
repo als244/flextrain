@@ -26,7 +26,7 @@ first -- the engine calls into Layer.forward / Layer.backward, and those
 methods are still stubs in Phase 2. Until then this package publishes the
 API shapes so downstream code (io/, optim/, tests) has something to import.
 
-Review docs/PLAN.md "Phase 3 -- Engine port" for the landing order.
+Review docs/internal/PLAN.md "Phase 3 -- Engine port" for the landing order.
 """
 
 from .buffers import BufferManager, KVContextWindow, ScratchPool

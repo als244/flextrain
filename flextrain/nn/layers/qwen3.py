@@ -25,7 +25,7 @@ Build a Qwen3-style backbone by mixing them per ``max_window_layers``::
     ]
 
 The engine iterates the list with zero layer-type branches -- exactly the
-pattern docs/PLAN.md "Multi-architecture strategy" describes.
+pattern docs/internal/PLAN.md "Multi-architecture strategy" describes.
 
 Qwen3 MoE is a separate (forthcoming) layer that composes with
 :class:`MoESwiGLUFFN` instead of :class:`SwiGLUFFN`.

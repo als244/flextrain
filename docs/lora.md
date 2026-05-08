@@ -451,5 +451,5 @@ packing under different working sets).
 * **Dropout**. PEFT supports `lora_dropout`; FT doesn't yet. Easy to
   add as a config field on `LoRAWrapperLayer` if needed.
 
-See [docs/SESSION_NOTES.md](SESSION_NOTES.md) for the running design
+See [docs/internal/SESSION_NOTES.md](internal/SESSION_NOTES.md) for the running design
 log and any open questions.

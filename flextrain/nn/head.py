@@ -97,7 +97,7 @@ class LMHead:
     schema
         Empty :class:`ActivationSchema` (max_tier=0). The head owns no
         per-chunk activation slot — all intermediates live and die in
-        the inner loop. See [DECISION 11] in docs/NOTES.md.
+        the inner loop. See [DECISION 11] in docs/internal/NOTES.md.
     param_spec
         Two tensors: ``w_final_norm (d_model,)`` and ``w_head_proj
         (d_model, vocab_size)``.

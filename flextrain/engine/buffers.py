@@ -12,7 +12,7 @@ Design constraints
 * **Heterogeneous backbones supported**: the GPU param / grad / act
   rings are sized to the MAX across layer types. A layer with
   smaller tensors leaves the tail of its slot unused. See
-  [DECISION 10] in docs/NOTES.md.
+  [DECISION 10] in docs/internal/NOTES.md.
 * **Host pinning uses cudaHostRegister** on a regular torch.zeros
   buffer, not ``pin_memory=True``. Matches orig (``active_model.py:
   266-273``) and sidesteps the "pin_memory only allocates in powers

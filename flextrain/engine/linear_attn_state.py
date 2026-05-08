@@ -17,7 +17,7 @@ The state itself lives in two engine-managed structures, NOT here:
 This module just produces the small Python data structure that tells
 the engine and the linear-attn block which packed-seqs in each chunk
 participate in cross-chunk state. See
-``docs/multi_chunk_seq_handling.md`` for the full design.
+``docs/internal/multi_chunk_seq_handling.md`` for the full design.
 """
 from __future__ import annotations
 

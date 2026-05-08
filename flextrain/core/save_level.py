@@ -9,7 +9,7 @@ parallel NumPy arrays -- ``compute_times``, ``saved_option_values``,
 pulled from ``self.model_layers[0].max_saved_activations_level + 1``. That
 assumption (all layers share the same tier count) breaks the moment we support
 heterogeneous backbones (GPT-OSS dense+MoE alternation, Qwen3-Next linear+full
-attention -- see docs/PLAN.md "Multi-architecture strategy").
+attention -- see docs/internal/PLAN.md "Multi-architecture strategy").
 
 What this module gives instead
 ------------------------------

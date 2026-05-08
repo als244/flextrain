@@ -13,7 +13,7 @@ of the kernels raises on sm_80 and below.
 API mirrors :class:`MoESwiGLUFFN` so layer composition is identical:
 swap one for the other at construction time based on hardware.
 
-Design notes — see ``docs/NOTES.md`` [SonicMoE integration plan]:
+Design notes — see ``docs/internal/NOTES.md`` [SonicMoE integration plan]:
 
 * Weight layout is DIFFERENT from orig:
   - orig (our current default): ``w_up: (E, H, 2*F)``, ``w_down: (E, F, H)``.
@@ -179,7 +179,7 @@ class MoESwiGLUSonicFFN:
     **Status: SKELETON ONLY.** The ``fwd`` / ``bwd`` bodies below are
     placeholders documenting the intended dispatch. Fill them in
     once we have H100 CI access. See
-    ``docs/NOTES.md`` [SonicMoE integration plan] for the full
+    ``docs/internal/NOTES.md`` [SonicMoE integration plan] for the full
     design.
     """
 

@@ -1,6 +1,6 @@
 """IO layer: HF safetensors, native checkpoints, token sources.
 
-The guiding rule is the one from docs/PLAN.md "Multi-architecture strategy":
+The guiding rule is the one from docs/internal/PLAN.md "Multi-architecture strategy":
 HuggingFace is a CONFIG + WEIGHTS + TOKENIZER source, not a compute path. We
 do not instantiate ``AutoModelForCausalLM`` to run forward passes -- we
 translate a ``PretrainedConfig`` into a :class:`ModelConfig` and a

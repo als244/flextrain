@@ -707,7 +707,7 @@ def test_llama32_1b_e2e_parity() -> None:
             "PyTorch reference does the same, so the two are directly "
             "comparable — but both drift from a properly-tied Llama "
             "finetune as training proceeds. Fixing this (shared param "
-            "with shared gradient) is flagged as a TODO in docs/NOTES.md.\n"
+            "with shared gradient) is flagged as a TODO in docs/internal/NOTES.md.\n"
         )
     print(f"Summary written to {md_path}")
 

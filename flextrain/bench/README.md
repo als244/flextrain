@@ -207,7 +207,7 @@ math, not a port of FlexTrain or orig kernels. This means:
   `rsqrt(pow(2).mean(-1))`, SwiGLU via `F.silu() * up`).
 - RoPE uses the **pair-interleave** convention (matches Triton kernel;
   NOT HuggingFace's halved-split convention — see
-  [`docs/NOTES.md`](../../docs/NOTES.md) [FINDING 6]).
+  [`docs/internal/NOTES.md`](../../docs/internal/NOTES.md) [FINDING 6]).
 - Attention is causal-masked SDPA in fp32.
 - AdamW is `torch.optim.AdamW` (canonical PyTorch implementation).
 
@@ -215,7 +215,7 @@ If naive and FlexTrain agree on a real dataset's loss trajectory,
 both are computing the same thing. Orig's kernels or scheduling
 could have a subtle bug that FlexTrain inherited; the naive reference
 catches that — this is how we found the RoPE convention hazard and
-the stream-context leakage (see `NOTES.md` findings list).
+the stream-context leakage (see `docs/internal/NOTES.md` findings list).
 
 ## Known bf16 drift characteristics
 
