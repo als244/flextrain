@@ -24,8 +24,8 @@ seconds, then return the **second-half average** so the steady-state
 dominates the answer (the first half captures the boost-to-base
 transition; throwing it out gives a cleaner sustained number).
 
-Defaults run for ~3-4 seconds total; pass ``matmul_target_seconds`` to
-trade speed for precision.
+Defaults run for ~10 seconds total (7s matmul + 3s mem-bw); pass
+``matmul_target_seconds`` to trade speed for precision.
 """
 
 from __future__ import annotations
@@ -249,8 +249,8 @@ def probe_hardware(
     matmul_n: int = 4096,
     mem_bw_n: int = 8192,
     transfer_mib: int = 256,
-    matmul_target_seconds: float = 10.0,
-    mem_bw_target_seconds: float = 4.0,
+    matmul_target_seconds: float = 7.0,
+    mem_bw_target_seconds: float = 3.0,
     n_matmul_warmup: int = 5,
     n_mem_bw_warmup: int = 5,
     min_matmul_reps_per_half: int = 50,
@@ -261,7 +261,7 @@ def probe_hardware(
     """Probe sustained (post-throttle) compute + memory + PCIe bandwidth.
 
     Total wall time is roughly ``matmul_target_seconds + mem_bw_target_seconds``
-    plus a small PCIe component (defaults: ~14s). Tuned so consumer GPUs
+    plus a small PCIe component (defaults: ~10s). Tuned so consumer GPUs
     have time to drop from boost clocks to sustained clocks before the
     measurement window closes -- if you only ran for ~50ms you'd see
     boost-clock TFLOPS, which is misleading for sizing the DP solver.

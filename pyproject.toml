@@ -11,26 +11,37 @@ dependencies = [
     "torch>=2.5",
     "triton>=3.0",
     "numpy",
+    "packaging",
     "datasets",
     "pyyaml",
     "safetensors",
     "transformers",
     "accelerate",
+    # Linear-attention path (Qwen3-Next, Qwen3.5 hybrid layers use
+    # Gated DeltaNet via FLA). Default-installed so those archs work
+    # out of the box.
+    "flash-linear-attention",
 ]
 
 [project.optional-dependencies]
-linear-attention = ["flash-linear-attention", "causal-conv1d"]
+# Mamba-style state-space layers (not currently used by any in-tree
+# arch, but kept as an extra for future state-space ports). The
+# Dao-AILab causal-conv1d package ships prebuilt wheels for common
+# (torch, cuda) combinations on PyPI; on misses, source compile takes
+# 5-15 minutes.
+causal-conv1d = ["causal-conv1d"]
 # tilelang is required only on Hopper (sm90+) with Triton >= 3.4.0 to
 # work around FLA issue #640 (default Triton chunk_bwd_dqkwg has a
 # correctness bug under that combination). Harmless on other GPUs;
 # linear_attn.py only imports it when the bug condition is detected.
-linear-attention-hopper = [
-    "flash-linear-attention",
-    "causal-conv1d",
-    "tilelang",
-]
-flash-attn = ["flash_attn_interface"]
+hopper = ["tilelang"]
 peft = ["peft"]
+# flash-attention 2 (and flash-attention 3 on Hopper) is fetched as
+# prebuilt wheels by setup.py during ``pip install -e .`` — see
+# ``helpers/install_flash_attn_wheels.py``. The ``flash-attn-build``
+# extra is only for users who want to build flash-attn from source
+# (slow; can take 30+ minutes on first install).
+flash-attn-build = ["flash_attn_interface"]
 
 [tool.setuptools.packages.find]
 include = ["flextrain*"]

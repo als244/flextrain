@@ -6,7 +6,7 @@
 # NOT included (auto-installed by baseline/scripts/install_backend.sh):
 #   * torch / torchvision / torchaudio (chosen via --torch-index-url
 #     auto from detect_cuda.py)
-#   * flash-attn 2 and/or 3 (resolved by install_flash_attention_wheels.py)
+#   * flash-attn 2 and/or 3 (resolved by install_flash_attn_wheels.py)
 
 transformers>=4.45
 accelerate

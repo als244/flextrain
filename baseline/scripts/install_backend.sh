@@ -301,21 +301,21 @@ case "${FLASH_MODE}" in
     if [[ -n "${FLASH_VERSION}" ]]; then
       FLASH_ARGS+=(--version "${FLASH_VERSION}")
     fi
-    python "${BASELINE_DIR}/scripts/install_flash_attention_wheels.py" "${FLASH_ARGS[@]}"
+    python "${BASELINE_DIR}/../helpers/install_flash_attn_wheels.py" "${FLASH_ARGS[@]}"
     ;;
   fa2)
     FLASH_ARGS=(--package flash_attn --optional)
     if [[ -n "${FLASH_VERSION}" ]]; then
       FLASH_ARGS+=(--version "${FLASH_VERSION}")
     fi
-    python "${BASELINE_DIR}/scripts/install_flash_attention_wheels.py" "${FLASH_ARGS[@]}"
+    python "${BASELINE_DIR}/../helpers/install_flash_attn_wheels.py" "${FLASH_ARGS[@]}"
     ;;
   fa3)
     FLASH_ARGS=(--package flash_attn_3 --optional)
     if [[ -n "${FLASH_VERSION}" ]]; then
       FLASH_ARGS+=(--version "${FLASH_VERSION}")
     fi
-    python "${BASELINE_DIR}/scripts/install_flash_attention_wheels.py" "${FLASH_ARGS[@]}"
+    python "${BASELINE_DIR}/../helpers/install_flash_attn_wheels.py" "${FLASH_ARGS[@]}"
     ;;
   none)
     ;;

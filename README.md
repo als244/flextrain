@@ -27,11 +27,26 @@ pip install torch triton
 pip install -e .
 ```
 
-The install builds two in-tree C/CUDA helpers (`matmul_dispatcher`,
-`transmission_scheduler`); set `FLEXTRAIN_SKIP_HELPERS=1` to skip them
-when iterating on Python-only code. Optional extras:
-`-e ".[flash-attn]"` (Hopper/Blackwell), `-e ".[linear-attention]"`
-(Qwen3-Next).
+The install also:
+
+* Builds two in-tree C/CUDA helpers (`matmul_dispatcher`,
+  `transmission_scheduler`). Set `FLEXTRAIN_SKIP_HELPERS=1` to skip
+  when iterating on Python-only code.
+* Fetches prebuilt flash-attention wheels matching your
+  (python, torch, CUDA) tuple from
+  [mjun0812/flash-attention-prebuild-wheels](https://github.com/mjun0812/flash-attention-prebuild-wheels).
+  flash-attn 2 always; flash-attn 3 added on Hopper (sm 90+). Set
+  `FLEXTRAIN_SKIP_FLASH_ATTN=1` to skip. Wheel-install failures are
+  non-fatal — the rest of the install proceeds.
+* Pulls in `flash-linear-attention` so Qwen3-Next / Qwen3.5 hybrid
+  layers (Gated DeltaNet) work out of the box.
+
+Optional extras: `-e ".[hopper]"` (`tilelang` for FLA on Hopper +
+Triton ≥ 3.4 — works around a correctness bug in the default Triton
+chunk_bwd kernel), `-e ".[causal-conv1d]"` (Mamba-style state-space
+support — not used by current archs), `-e ".[peft]"` (HF PEFT for
+LoRA parity tests), `-e ".[flash-attn-build]"` (build flash-attn
+from source instead of the prebuilt wheel — slow; minutes-to-hours).
 
 ## Quickstart
 
@@ -147,18 +162,18 @@ For LoRA, pass `lora_targets="all"` (and optionally `lora_rank`,
 `lora_alpha`). For full fine-tuning with Muon on dense projections,
 swap the optimizer for `flextrain.optim.HybridMuonAdamW`.
 
-**Better save-tier plans.** The default `hw_cost` is a conservative
-60 TFLOPS / 20 GB/s placeholder; on a real GPU this inflates compute
-times and the planner ends up skipping recompute. For accurate plans,
-probe once and pass the result:
+**Hardware probe.** `from_pretrained` runs `probe_hardware()` on the
+first call (~10s) when `hw_cost` isn't provided, so the save-level DP
+solver gets accurate TFLOPS / PCIe numbers. To avoid re-probing
+across calls, cache the result and pass it explicitly:
 
 ```python
 from flextrain.core.hw_probe import probe_hardware
-probe = probe_hardware()  # ~14s; sustained TFLOPS / PCIe / mem-bw
+probe = probe_hardware()  # ~10s; sustained TFLOPS / PCIe / mem-bw
 am = from_pretrained(..., hw_cost=probe.hw_cost, mem_bw_gbps=probe.mem_bw_gbps)
 ```
 
-`train.py` does this for you automatically.
+`train.py` does this once at startup and reuses the result.
 
 ## Layout
 
