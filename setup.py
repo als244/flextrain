@@ -73,170 +73,42 @@ def _build_all_helpers() -> None:
     _write_helper_pth()
 
 
-def _install_flash_attn_wheels() -> None:
-    """Best-effort fetch of prebuilt flash-attn wheels.
-
-    flash-attention from-source builds take 30+ minutes; the wheels at
-    https://github.com/mjun0812/flash-attention-prebuild-wheels are
-    keyed by (python, torch, cuda) and skip the build entirely. This
-    hook delegates to ``helpers/install_flash_attn_wheels.py``:
-
-    * Always tries to install ``flash_attn`` (FA2). The wheel match is
-      keyed on torch + CUDA + python detected at install time.
-    * Tries to install ``flash_attn_3`` (FA3) only when the local GPU
-      reports ``compute_capability[0] >= 9`` (Hopper sm_90+).
-
-    Failures are non-fatal — the install proceeds without flash-attn.
-    Set ``FLEXTRAIN_SKIP_FLASH_ATTN=1`` to skip this entirely.
-    """
-    if os.environ.get("FLEXTRAIN_SKIP_FLASH_ATTN") == "1":
-        print(
-            "[flextrain setup] FLEXTRAIN_SKIP_FLASH_ATTN=1, "
-            "skipping flash-attn wheel install"
-        )
-        return
-
-    try:
-        import torch
-    except ImportError:
-        print(
-            "[flextrain setup] torch not importable; skipping flash-attn "
-            "wheel install (re-run pip install -e . after torch lands)",
-            flush=True,
-        )
-        return
-
-    if not torch.cuda.is_available():
-        print(
-            "[flextrain setup] no CUDA GPU detected; skipping flash-attn "
-            "wheel install. Set FLEXTRAIN_SKIP_FLASH_ATTN=1 to silence.",
-            flush=True,
-        )
-        return
-
-    is_hopper = False
-    try:
-        cap = torch.cuda.get_device_capability(0)
-        is_hopper = cap[0] >= 9
-        print(
-            f"[flextrain setup] detected sm_{cap[0]}{cap[1]}; "
-            f"flash-attn 3 = {'enabled' if is_hopper else 'skipped (not Hopper sm90+)'}",
-            flush=True,
-        )
-    except Exception as e:  # noqa: BLE001
-        print(
-            f"[flextrain setup] could not query GPU capability ({e}); "
-            "installing flash-attn 2 only",
-            flush=True,
-        )
-
-    installer = HELPERS_DIR / "install_flash_attn_wheels.py"
-    if not installer.exists():
-        print(
-            f"[flextrain setup] {installer} missing; skipping flash-attn install"
-        )
-        return
-
-    packages = ["flash_attn"]
-    if is_hopper:
-        packages.append("flash_attn_3")
-    for pkg in packages:
-        cmd = [sys.executable, str(installer), "--package", pkg, "--optional"]
-        try:
-            subprocess.check_call(cmd)
-        except subprocess.CalledProcessError as e:
-            print(
-                f"[flextrain setup] flash-attn ({pkg}) wheel install failed "
-                f"({e}); proceeding without it. Install manually via "
-                f"`python {installer} --package {pkg}`.",
-                flush=True,
-            )
-
-
-def _install_causal_conv1d_wheel() -> None:
-    """Best-effort fetch of a prebuilt causal-conv1d wheel.
-
-    causal-conv1d (Dao-AILab/causal-conv1d) ships prebuilt wheels on
-    its GitHub releases keyed by (python, torch, cuda, cxx11-abi).
-    Source builds compile CUDA kernels and take ~5-15 minutes; the
-    wheel skips that. Used by FLA's Mamba-style state-space layers.
-
-    Failures are non-fatal — the install proceeds without
-    causal-conv1d. Set ``FLEXTRAIN_SKIP_CAUSAL_CONV1D=1`` to skip
-    entirely.
-    """
-    if os.environ.get("FLEXTRAIN_SKIP_CAUSAL_CONV1D") == "1":
-        print(
-            "[flextrain setup] FLEXTRAIN_SKIP_CAUSAL_CONV1D=1, "
-            "skipping causal-conv1d wheel install"
-        )
-        return
-
-    try:
-        import torch
-    except ImportError:
-        print(
-            "[flextrain setup] torch not importable; skipping "
-            "causal-conv1d wheel install",
-            flush=True,
-        )
-        return
-
-    if not torch.cuda.is_available():
-        print(
-            "[flextrain setup] no CUDA GPU detected; skipping "
-            "causal-conv1d wheel install",
-            flush=True,
-        )
-        return
-
-    installer = HELPERS_DIR / "install_causal_conv1d_wheel.py"
-    if not installer.exists():
-        print(
-            f"[flextrain setup] {installer} missing; skipping "
-            "causal-conv1d install"
-        )
-        return
-
-    cmd = [sys.executable, str(installer), "--optional"]
-    try:
-        subprocess.check_call(cmd)
-    except subprocess.CalledProcessError as e:
-        print(
-            f"[flextrain setup] causal-conv1d wheel install failed ({e}); "
-            f"proceeding without it. Install manually via "
-            f"`python {installer}`.",
-            flush=True,
-        )
-
-
 class _BuildPyWithHelpers(build_py):
     def run(self) -> None:
         _build_all_helpers()
         super().run()
 
 
+def _print_post_install_hint() -> None:
+    print(
+        "[flextrain setup] To fetch prebuilt flash-attn and causal-conv1d "
+        "wheels (matched on python/torch/cuda/compute-cap), run:\n"
+        "    flextrain-post-install\n"
+        "after pip install completes. The build-isolation env pip uses "
+        "for editable installs cannot reach the user environment, so "
+        "wheel installs must happen as a separate user-env step.",
+        flush=True,
+    )
+
+
 class _DevelopWithHelpers(develop):
     def run(self) -> None:
         _build_all_helpers()
-        _install_flash_attn_wheels()
-        _install_causal_conv1d_wheel()
+        _print_post_install_hint()
         super().run()
 
 
 class _InstallWithHelpers(install):
     def run(self) -> None:
         _build_all_helpers()
-        _install_flash_attn_wheels()
-        _install_causal_conv1d_wheel()
+        _print_post_install_hint()
         super().run()
 
 
 class _EditableWheelWithHelpers(editable_wheel):
     def run(self) -> None:
         _build_all_helpers()
-        _install_flash_attn_wheels()
-        _install_causal_conv1d_wheel()
+        _print_post_install_hint()
         super().run()
 
 

@@ -23,6 +23,16 @@ dependencies = [
     "flash-linear-attention",
 ]
 
+[project.scripts]
+# One-time post-install: fetch prebuilt flash-attn and causal-conv1d
+# wheels matched to the local (python, torch, cuda, compute-cap) tuple.
+# Modern pip default-isolates the build env for editable installs, so
+# wheel installs cannot be run from setup.py — the user runs this once
+# after `pip install -e .` and gets both libraries via pre-built wheels
+# (no source compile). See helpers/install_flash_attn_wheels.py and
+# helpers/install_causal_conv1d_wheel.py for the underlying logic.
+flextrain-post-install = "flextrain.scripts.post_install:main"
+
 [project.optional-dependencies]
 # tilelang is required only on Hopper (sm90+) with Triton >= 3.4.0 to
 # work around FLA issue #640 (default Triton chunk_bwd_dqkwg has a

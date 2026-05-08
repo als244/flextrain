@@ -25,25 +25,35 @@ conda create -n flextrain python=3.12
 conda activate flextrain
 pip install torch triton
 pip install -e .
+flextrain-post-install            # fetch prebuilt flash-attn + causal-conv1d wheels
 ```
 
-The install also:
+`pip install -e .` builds the two in-tree C/CUDA helpers
+(`matmul_dispatcher`, `transmission_scheduler`) and pulls in
+`flash-linear-attention` so Qwen3-Next / Qwen3.5 hybrid layers
+(Gated DeltaNet) work out of the box. Set `FLEXTRAIN_SKIP_HELPERS=1`
+to skip the helper builds when iterating on Python-only code.
 
-* Builds two in-tree C/CUDA helpers (`matmul_dispatcher`,
-  `transmission_scheduler`). Set `FLEXTRAIN_SKIP_HELPERS=1` to skip
-  when iterating on Python-only code.
-* Fetches prebuilt flash-attention wheels matching your
+`flextrain-post-install` runs once after the editable install and
+fetches:
+
+* **flash-attention** prebuilt wheels matching your
   (python, torch, CUDA) tuple from
   [mjun0812/flash-attention-prebuild-wheels](https://github.com/mjun0812/flash-attention-prebuild-wheels).
-  flash-attn 2 always; flash-attn 3 added on Hopper (sm 90+). Set
-  `FLEXTRAIN_SKIP_FLASH_ATTN=1` to skip. Wheel-install failures are
-  non-fatal — the rest of the install proceeds.
-* Fetches a prebuilt `causal-conv1d` wheel from
+  flash-attn 2 always; flash-attn 3 added on Hopper (sm 90+) /
+  Blackwell. If no matching wheel exists for your combo, that
+  package is skipped silently — the install does not fail.
+  `FLEXTRAIN_SKIP_FLASH_ATTN=1` opts out.
+* **causal-conv1d** prebuilt wheel from
   [Dao-AILab/causal-conv1d](https://github.com/Dao-AILab/causal-conv1d)
-  GitHub releases (Mamba-style state-space layers; FLA also uses it
-  for some kernels). Set `FLEXTRAIN_SKIP_CAUSAL_CONV1D=1` to skip.
-* Pulls in `flash-linear-attention` so Qwen3-Next / Qwen3.5 hybrid
-  layers (Gated DeltaNet) work out of the box.
+  GitHub releases (Mamba-style state-space layers; FLA also uses
+  it for some kernels). `FLEXTRAIN_SKIP_CAUSAL_CONV1D=1` opts out.
+
+The two-step install (rather than auto-installing during
+`pip install -e .`) is forced by modern pip's default build
+isolation: setup.py cannot reach the user environment from inside
+the isolated build env, so wheel installs have to run as a separate
+user-env step.
 
 Optional extras: `-e ".[hopper]"` (`tilelang` for FLA on Hopper +
 Triton ≥ 3.4 — works around a correctness bug in the default Triton
