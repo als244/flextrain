@@ -360,22 +360,11 @@ adapters). MoE routing decisions vary slightly with chunk packing
 across working-set configs, so engine-determinism on offload is
 within a small bf16 envelope rather than bit-identical.
 
-### Cross-stack residual gap is bf16, not a bug
-
-HF in bf16 vs HF in fp32 on the **same** model defines the bf16
-noise floor:
-
-| Comparison | model | logit max\|Δ\| | logit mean\|Δ\| |
-|---|---|---|---|
-| HF-bf16 vs HF-fp32 (within HF) | Llama-3.2-1B | 0.486 | 0.025 |
-| FT-bf16 vs HF-bf16 (cross-stack) | Llama-3.2-1B | 0.438 | 0.036 |
-| FT-bf16 vs HF-bf16 (cross-stack) | Llama-3.1-8B | 2.08  | 0.031 |
-
-FT-vs-HF max|Δ| on 1B is on the order of HF's own bf16/fp32 noise
-floor; on 8B it grows roughly with depth (LoRA-B per-layer rel
-error: ~4% at L31 → ~12% at L0, smooth in depth). Argmax matches at
-every top-disagreement position — there is no algorithmic
-disagreement.
+The residual cross-stack gap is bf16 noise, not algorithmic
+disagreement. The bf16 noise floor (HF-bf16 vs HF-fp32 on the same
+model), the per-layer LoRA-B rel-error growth with depth, and the
+YARN RoPE bug that drove the parity push are all written up in
+[`docs/internal/lora_findings.md`](internal/lora_findings.md).
 
 ## What's verified
 
