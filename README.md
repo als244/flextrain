@@ -40,10 +40,14 @@ fetches:
 * **flash-attention** prebuilt wheels matching your
   (python, torch, CUDA) tuple from
   [mjun0812/flash-attention-prebuild-wheels](https://github.com/mjun0812/flash-attention-prebuild-wheels).
-  flash-attn 2 always; flash-attn 3 added on Hopper (sm 90+) /
-  Blackwell. If no matching wheel exists for your combo, that
-  package is skipped silently — the install does not fail.
-  `FLEXTRAIN_SKIP_FLASH_ATTN=1` opts out.
+  flash-attn 2 always; flash-attn 3 added only on Hopper (compute
+  capability exactly 9.0) — FA3 prebuilt wheels currently ship only
+  sm_90 kernels, so they're skipped on Ada (sm_89), Blackwell
+  (sm_120), and earlier sm_80 / sm_86 to avoid the "no kernel image
+  is available for execution on the device" runtime error. The
+  in-tree FA2 path covers those GPUs. If no matching wheel exists
+  for your combo, that package is skipped silently — the install
+  does not fail. `FLEXTRAIN_SKIP_FLASH_ATTN=1` opts out.
 * **causal-conv1d** prebuilt wheel from
   [Dao-AILab/causal-conv1d](https://github.com/Dao-AILab/causal-conv1d)
   GitHub releases (Mamba-style state-space layers; FLA also uses
