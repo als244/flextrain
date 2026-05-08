@@ -38,15 +38,19 @@ The install also:
   flash-attn 2 always; flash-attn 3 added on Hopper (sm 90+). Set
   `FLEXTRAIN_SKIP_FLASH_ATTN=1` to skip. Wheel-install failures are
   non-fatal — the rest of the install proceeds.
+* Fetches a prebuilt `causal-conv1d` wheel from
+  [Dao-AILab/causal-conv1d](https://github.com/Dao-AILab/causal-conv1d)
+  GitHub releases (Mamba-style state-space layers; FLA also uses it
+  for some kernels). Set `FLEXTRAIN_SKIP_CAUSAL_CONV1D=1` to skip.
 * Pulls in `flash-linear-attention` so Qwen3-Next / Qwen3.5 hybrid
   layers (Gated DeltaNet) work out of the box.
 
 Optional extras: `-e ".[hopper]"` (`tilelang` for FLA on Hopper +
 Triton ≥ 3.4 — works around a correctness bug in the default Triton
-chunk_bwd kernel), `-e ".[causal-conv1d]"` (Mamba-style state-space
-support — not used by current archs), `-e ".[peft]"` (HF PEFT for
-LoRA parity tests), `-e ".[flash-attn-build]"` (build flash-attn
-from source instead of the prebuilt wheel — slow; minutes-to-hours).
+chunk_bwd kernel), `-e ".[peft]"` (HF PEFT for LoRA parity tests),
+`-e ".[flash-attn-build]"` / `-e ".[causal-conv1d-build]"` (build
+those packages from source instead of fetching a prebuilt wheel —
+slow; minutes-to-hours).
 
 ## Quickstart
 

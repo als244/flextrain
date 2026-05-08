@@ -24,12 +24,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Mamba-style state-space layers (not currently used by any in-tree
-# arch, but kept as an extra for future state-space ports). The
-# Dao-AILab causal-conv1d package ships prebuilt wheels for common
-# (torch, cuda) combinations on PyPI; on misses, source compile takes
-# 5-15 minutes.
-causal-conv1d = ["causal-conv1d"]
 # tilelang is required only on Hopper (sm90+) with Triton >= 3.4.0 to
 # work around FLA issue #640 (default Triton chunk_bwd_dqkwg has a
 # correctness bug under that combination). Harmless on other GPUs;
@@ -42,6 +36,11 @@ peft = ["peft"]
 # extra is only for users who want to build flash-attn from source
 # (slow; can take 30+ minutes on first install).
 flash-attn-build = ["flash_attn_interface"]
+# causal-conv1d is fetched the same way — prebuilt wheels from the
+# Dao-AILab/causal-conv1d GitHub releases via
+# ``helpers/install_causal_conv1d_wheel.py``. The
+# ``causal-conv1d-build`` extra is the source-build escape hatch.
+causal-conv1d-build = ["causal-conv1d"]
 
 [tool.setuptools.packages.find]
 include = ["flextrain*"]

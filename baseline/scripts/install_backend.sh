@@ -348,7 +348,7 @@ if [[ "${LINEAR_ATTENTION_MODE}" != "none" ]]; then
     if [[ "${LINEAR_ATTENTION_MODE}" == "auto" ]]; then
       CAUSAL_ARGS+=(--optional)
     fi
-    python "${BASELINE_DIR}/scripts/install_causal_conv1d_wheel.py" "${CAUSAL_ARGS[@]}"
+    python "${BASELINE_DIR}/../helpers/install_causal_conv1d_wheel.py" "${CAUSAL_ARGS[@]}"
   fi
 fi
 

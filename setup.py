@@ -153,6 +153,63 @@ def _install_flash_attn_wheels() -> None:
             )
 
 
+def _install_causal_conv1d_wheel() -> None:
+    """Best-effort fetch of a prebuilt causal-conv1d wheel.
+
+    causal-conv1d (Dao-AILab/causal-conv1d) ships prebuilt wheels on
+    its GitHub releases keyed by (python, torch, cuda, cxx11-abi).
+    Source builds compile CUDA kernels and take ~5-15 minutes; the
+    wheel skips that. Used by FLA's Mamba-style state-space layers.
+
+    Failures are non-fatal — the install proceeds without
+    causal-conv1d. Set ``FLEXTRAIN_SKIP_CAUSAL_CONV1D=1`` to skip
+    entirely.
+    """
+    if os.environ.get("FLEXTRAIN_SKIP_CAUSAL_CONV1D") == "1":
+        print(
+            "[flextrain setup] FLEXTRAIN_SKIP_CAUSAL_CONV1D=1, "
+            "skipping causal-conv1d wheel install"
+        )
+        return
+
+    try:
+        import torch
+    except ImportError:
+        print(
+            "[flextrain setup] torch not importable; skipping "
+            "causal-conv1d wheel install",
+            flush=True,
+        )
+        return
+
+    if not torch.cuda.is_available():
+        print(
+            "[flextrain setup] no CUDA GPU detected; skipping "
+            "causal-conv1d wheel install",
+            flush=True,
+        )
+        return
+
+    installer = HELPERS_DIR / "install_causal_conv1d_wheel.py"
+    if not installer.exists():
+        print(
+            f"[flextrain setup] {installer} missing; skipping "
+            "causal-conv1d install"
+        )
+        return
+
+    cmd = [sys.executable, str(installer), "--optional"]
+    try:
+        subprocess.check_call(cmd)
+    except subprocess.CalledProcessError as e:
+        print(
+            f"[flextrain setup] causal-conv1d wheel install failed ({e}); "
+            f"proceeding without it. Install manually via "
+            f"`python {installer}`.",
+            flush=True,
+        )
+
+
 class _BuildPyWithHelpers(build_py):
     def run(self) -> None:
         _build_all_helpers()
@@ -163,6 +220,7 @@ class _DevelopWithHelpers(develop):
     def run(self) -> None:
         _build_all_helpers()
         _install_flash_attn_wheels()
+        _install_causal_conv1d_wheel()
         super().run()
 
 
@@ -170,6 +228,7 @@ class _InstallWithHelpers(install):
     def run(self) -> None:
         _build_all_helpers()
         _install_flash_attn_wheels()
+        _install_causal_conv1d_wheel()
         super().run()
 
 
@@ -177,6 +236,7 @@ class _EditableWheelWithHelpers(editable_wheel):
     def run(self) -> None:
         _build_all_helpers()
         _install_flash_attn_wheels()
+        _install_causal_conv1d_wheel()
         super().run()
 
 
