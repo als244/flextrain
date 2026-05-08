@@ -507,10 +507,13 @@ in-tree archs you can read for analog patterns:
   with depth. Almost always a sign the permute didn't run. If
   `post_load_permute` is defined as a top-level function in the arch
   module, `from_pretrained` calls it automatically.
-* **bf16 master + fp32 norm grad** — RMSNorm weights are tiny and
-  benefit from fp32 master + fp32 grad accumulator. `BuildContext.norm_grad_dtype`
-  defaults to fp32 for you; don't override it to bf16 unless you
-  have a strong reason.
+* **bf16 master + fp32 norm grad** — RMSNorm weights are 1-D so
+  the fp32-vs-bf16 byte cost is negligible. The convention in
+  every in-tree arch is fp32 norm master + fp32 norm grad on the
+  intuition that fp32 may help precision on small-LR updates of
+  small tensors; this hasn't been measured rigorously, so treat it
+  as a low-cost convention rather than a correctness requirement.
+  `BuildContext.norm_grad_dtype` defaults to fp32 for you.
 * **Stashing tensors on `self`** — only `self.layer_id`,
   `self.schema`, `self.param_spec`, and config / submodule
   references survive between fwd and bwd. Use `slot.aux` for

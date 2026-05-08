@@ -85,7 +85,7 @@ class MyArchBlockConfig:
     compute_dtype: torch.dtype = torch.bfloat16
     master_dtype: torch.dtype | None = None
     grad_dtype: torch.dtype | None = None
-    norm_grad_dtype: torch.dtype = torch.float32      # convention: fp32 norm grads
+    norm_grad_dtype: torch.dtype = torch.float32      # convention; cheap, possibly precision-helpful
     norm_master_dtype: torch.dtype = torch.float32
 
     def dims(self) -> dict[str, int]:
@@ -144,7 +144,7 @@ split — LoRA's fast path needs it (see
 | `master_dtype` | bf16 (= compute_dtype) | Override to fp32 for higher-precision updates at 2× param memory. |
 | `grad_dtype` | bf16 | Halves grad memory vs fp32, fine on most ops. |
 | `opt_state_dtype` (matmul params) | bf16 | Engine default. fp32 if cold-start training at scale (numerical updates need full precision). |
-| `norm_master_dtype` / `norm_grad_dtype` | **fp32** | RMSNorm weights are 1-D — fp32 cost is negligible and avoids round-to-zero on small-LR updates. |
+| `norm_master_dtype` / `norm_grad_dtype` | fp32 (convention) | RMSNorm weights are 1-D so the fp32 vs bf16 byte cost is negligible. The intuition is that fp32 may help precision on small-LR updates of small tensors, but this hasn't been measured rigorously — it's a low-cost convention, not a correctness requirement. |
 | LoRA adapter dtypes | bf16 across the board (matches `from_pretrained` default) | HF PEFT's documented convention is fp32 for adapter master / grad / opt-state at scale; FT's default is bf16 for memory. Override per training recipe. |
 
 The `BuildContext` defaults that `from_pretrained` uses are bf16 /
@@ -156,6 +156,65 @@ config defaults so the arch builder doesn't need a special case.
 The schema is your block's most consequential public surface: the
 working-set planner reads it to size buffers, and the DP solver
 uses tiers + your `compute_cost` to choose what to save where.
+
+### Where tiers live: blocks declare, layers aggregate
+
+Tiers are a per-FIELD property, set by the BLOCK that owns the field
+in its `fields()` method. Layers do not change tiers — they just
+concatenate their blocks' field tuples:
+
+```python
+# In the layer's __init__:
+x_inp = ActivationField("x_inp", lambda n, d: (n, d["d_model"]),
+                        cfg.compute_dtype, tier=0)
+self.schema = ActivationSchema(
+    fields=concat_fields([
+        (x_inp,),                # layer-owned field (typically tier 0)
+        self.attn_norm.fields(),
+        self.attn.fields(),
+        self.ffn_norm.fields(),
+        self.ffn.fields(),
+    ]),
+    max_tier=3,                  # max across all fields above
+)
+self.param_spec = ParamSpec.merge([
+    blk.param_spec() for blk in (self.attn_norm, self.attn,
+                                 self.ffn_norm, self.ffn)
+])
+```
+
+The layer typically owns one extra field of its own (`x_inp` for
+the residual-stream input) and aggregates everything else from
+blocks. `compute_cost` follows the same pattern at runtime:
+`ComputeCost.sum([blk.compute_cost(chunk, max_tier) for blk in ...],
+max_tier=max_tier)`.
+
+The save level chosen by the DP solver is per-(layer, chunk), not
+per-field. At runtime, every field with `tier <= slot.level` is
+guaranteed valid; every field with `tier > slot.level` is unset and
+your `forward_recompute` must produce it before bwd reads it.
+
+### Save levels and tiers — what the numbers mean
+
+A save level `L` for a (layer, chunk) means: save every field with
+`tier <= L`; recompute the rest. So:
+
+| `slot.level` | Saved at fwd | Recomputed in bwd | Memory | Compute |
+|---|---|---|---|---|
+| 0 | only tier-0 fields | every tier ≥ 1 field | smallest | most recompute |
+| 1 | tier-0 + tier-1 | every tier ≥ 2 field | more | less recompute |
+| 2 | tier 0/1/2 | every tier-3 field | even more | only tier-3 recomputed |
+| `max_tier` | every field | nothing | largest | zero recompute |
+
+So tier number = "how much memory budget is needed to keep this
+saved." Higher tier = needs more budget. The DP solver picks `L`
+per (layer, chunk) to fit the activation budget while minimizing
+compute_time + transfer_time.
+
+When picking the tier for a NEW field, ask: "if memory is the
+tightest, which fields am I willing to drop and recompute?" Those
+are the high-tier ones. Fields you absolutely want pinned in
+memory regardless of pressure go at tier 0.
 
 ### What to declare as a field (vs. scratch / aux / chunk.extra)
 
@@ -185,21 +244,21 @@ Real conventions extracted from in-tree blocks:
 
 | Tier | Use for | In-tree examples |
 |---|---|---|
-| **0** | Always-saved tiny state. Cheap to keep, expensive to recompute relative to size. | RMSNorm `*_rstd`, `xk` / `xv` (KV cache fillers), MoE router state (`x_router`, `router_weights`, `chosen_experts`), `x_inp` (the residual-stream input to a layer) |
-| **1** | Flash-attention-equivalent intermediates. Mid-sized; recomputable at moderate cost. | `attn_result`, `softmax_lse` |
-| **2** | Large pre-projection tensors. Saving avoids a matmul in bwd. | `xq`, `xo` |
-| **3** | Largest "fall-out" fwd intermediates that recompute naturally during fwd-recompute. | `x1`, `x3` (SwiGLU gate/up products), `x_up` (MoE pre-SwiGLU expert inputs) |
+| **0** | Always saved. Tiny, expensive (or impossible) to recompute. The engine NEVER drops these regardless of memory pressure. | RMSNorm `*_rstd`, `xk` / `xv` (KV-cache fillers), MoE router state (`x_router`, `router_weights`, `chosen_experts`), `x_inp` (residual-stream input) |
+| **1** | Saved when budget allows level ≥ 1. Mid-sized state from flash-attention's fwd that's moderately costly to redo. | `attn_result`, `softmax_lse` |
+| **2** | Saved when budget allows level ≥ 2. Large pre-projection tensors; saving them avoids a matmul in bwd. | `xq`, `xo` |
+| **3** | Saved when budget allows level ≥ 3 (= maximum). Largest fwd intermediates; only saved when memory is loose. When dropped, they're recomputed via the layer's `forward_recompute`. | `x1`, `x3` (SwiGLU gate/up outputs), `x_up` (MoE pre-SwiGLU expert inputs) |
 
 Heuristics for a NEW field:
 
-* "Always-recompute-cheap and tiny" → tier 0. Examples: rstds,
-  small int32 routing tables.
-* "Saves a matmul in bwd, too big to keep at every save level" →
-  tier 2 or 3 depending on size relative to the others in the
-  layer.
-* "Falls out of the SwiGLU / FFN forward recompute path naturally"
-  → tier 3 (saving here only matters when memory is loose; the
-  recompute cost is low when it's tight).
+* "Tiny, must always be saved (or recompute is impossible / very
+  costly relative to size)" → tier 0. Examples: rstds, small
+  int32 routing tables.
+* "Saves a matmul in bwd; medium-to-large; we'd drop it first
+  under memory pressure" → tier 2 or 3 depending on size relative
+  to the others in the layer (largest goes to tier 3).
+* "The largest fwd intermediates — only saved when memory is
+  abundant; otherwise recomputed by `forward_recompute`" → tier 3.
 
 ### `token_axis` — easy to get wrong
 

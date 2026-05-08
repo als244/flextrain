@@ -212,13 +212,28 @@ ActivationSchema(
 
 ### Save tier conventions (loose)
 
-* **Tier 0** — always saved. Tiny, recompute-cheap, but recompute
-  is wasteful (RMSNorm rstd, MoE expert counts, router weights).
-* **Tier 1** — flash-attn-equivalent state (`attn_result`,
-  `softmax_lse`). Mid-sized; recomputable at moderate cost.
-* **Tier 2** — large pre-projection tensors (`xq`, `xo`).
-* **Tier 3** — largest intermediates that fall out naturally during
-  fwd recomputation (`x1`, `x3`, `x_up`).
+A field with `tier=N` is saved when the engine picks save level
+`L >= N` for this (layer, chunk), and recomputed when `L < N`. Save
+level 0 means save only tier-0; save level `max_tier` means save
+everything. So tier number = "how much memory budget is needed to
+keep this saved" — higher tier is dropped first under pressure.
+
+* **Tier 0** — always saved (engine never drops these regardless of
+  memory pressure). Tiny; recompute is impossible or wasteful.
+  Examples: RMSNorm rstd, MoE expert counts, router weights, `xk` /
+  `xv`, `x_inp`.
+* **Tier 1** — saved when budget permits level ≥ 1. Mid-sized
+  flash-attention state (`attn_result`, `softmax_lse`).
+* **Tier 2** — saved when budget permits level ≥ 2. Large
+  pre-projection tensors (`xq`, `xo`).
+* **Tier 3** — saved when budget permits level = max. Largest fwd
+  intermediates (`x1`, `x3`, `x_up`); recomputed via
+  `forward_recompute` when memory is tight.
+
+Tiers are declared per-FIELD by the BLOCK that owns the field.
+Layers aggregate via `concat_fields([block.fields() for block in ...])`
+and don't change tiers. See [`best_practices.md`](best_practices.md)
+for the assembly pattern.
 
 The save-level solver picks the lowest tier that fits the working-
 set budget while balancing the recompute FLOPs you reported in
