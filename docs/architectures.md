@@ -31,5 +31,5 @@ For each architecture, the `flextrain/io/arch/<name>.py` file exposes:
   hyperparameters (`rms_norm_eps`, `rope_theta`, `window_size_left`,
   `load_balance_coef`, `routing_mode`, ...).
 
-To add a new architecture, see [implementing.md](implementing.md) and
+To add a new architecture, see [extending/](extending/README.md) and
 [weights.md](weights.md).

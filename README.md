@@ -186,7 +186,7 @@ download.py  pre-stage models/datasets for air-gapped nodes
 | [dataset.md](docs/dataset.md) | data format + built-in JSON SFT source |
 | [weights.md](docs/weights.md) | HF safetensors I/O, custom archs |
 | [lora.md](docs/lora.md) | LoRA, MoE per-expert LoRA, HF PEFT parity |
-| [implementing.md](docs/implementing.md) | adding a new block / layer / model |
+| [extending/](docs/extending/README.md) | adding a new model: tutorial + flow + per-level contracts (block / layer / chunk / model) |
 | [dtypes.md](docs/dtypes.md) | compute / master / grad / opt-state dtypes |
 | [optimizers.md](docs/optimizers.md) | AdamW / Muon / HybridMuonAdamW |
 | [export.md](docs/export.md) | export to vLLM / sGLang / HF (full, LoRA adapter, merged) |
