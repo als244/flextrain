@@ -327,54 +327,43 @@ ws = determine_working_set_config(
 
 For Llama-3.1-8B this lands on `n_gpu_layers=13/32`, single-chunk
 1024-token rounds, and ~1.94 GiB activation buffer; peak GPU
-allocation through training is ~13.4 GiB. See
-[`tests/test_lora_e2e_llama_8b.py`](../tests/test_lora_e2e_llama_8b.py)
-for the runnable script (subprocess-isolated HF PEFT vs FT, 50 steps).
+allocation through training is ~13.4 GiB.
+[`tests/test_arch_lora_e2e.py`](../tests/test_arch_lora_e2e.py)
+runs the subprocess-isolated HF PEFT vs FT pattern across this and
+every other supported arch — pass `--arch llama-3.1-8b` to scope it
+to one model.
 
 ## Cross-stack parity
 
-`tests/test_lora_e2e_llama_dense.py` runs Llama-3.2-1B with identical
-LoRA inits across HuggingFace PEFT and FlexTrain (under both full-save
-and offloaded working-set configs). 100 steps on MathInstruct yields:
+`tests/test_arch_lora_e2e.py` is the canonical LoRA-mode parity
+test. For each arch it spawns two subprocess-isolated training runs
+on identical data with identical LoRA inits — one on FlexTrain, one
+on `transformers` + PEFT — and asserts loss-curve agreement within a
+per-arch tolerance.
 
-| pair | max \|Δ\| over 100 steps |
-|---|---|
-| HF PEFT vs FT-full | ≈ 0.07 |
-| HF PEFT vs FT-offload | ≈ 0.07 |
-| FT-full vs FT-offload | **0.00** (bit-identical) |
+```bash
+python tests/test_arch_lora_e2e.py --list                  # see configured archs
+python tests/test_arch_lora_e2e.py --arch llama-3.2-1b     # one arch
+python tests/test_arch_lora_e2e.py --all --mode lora       # full sweep
+```
 
-`tests/test_lora_e2e_llama_8b.py` runs the same pattern on
-Llama-3.1-8B for 50 steps with the auto solver and HF-matched
-LoRA-side dtypes (base bf16 frozen; LoRA `A`/`B` fp32 master + fp32
-grad + fp32 AdamW state — same as HF PEFT's defaults). Both stacks
-use the model's correct **YARN RoPE scaling**
-(`rope_type: llama3`, `factor: 8.0`); without it the FT/HF gap was
-~2× larger and biased toward early layers.
+The HF-PEFT-equivalent dtypes are baked in: base bf16 frozen; LoRA
+`A` / `B` get fp32 master + fp32 grad + fp32 AdamW state. For Llama
+3.1+ the test enforces YARN RoPE scaling (`rope_type: llama3`); the
+block-level `build_rope_inv_freq` builds the scaled curve when the HF
+config asks for it (use `flextrain.from_pretrained`, which wires this
+for you, or pass `rope_scaling=hf_cfg["rope_scaling"]` into
+`LlamaBlockConfig`).
 
-| pair | max \|Δ\| over 50 steps | step-0 \|Δ\| | mean Δ | per-step Pearson |
-|---|---|---|---|---|
-| HF PEFT vs FT (auto-offloaded) | 0.112 | 0.0014 | +0.034 | 0.98 |
+For MoE archs the same script exercises **per-expert** LoRA (3-D
+adapters). MoE routing decisions vary slightly with chunk packing
+across working-set configs, so engine-determinism on offload is
+within a small bf16 envelope rather than bit-identical.
 
-### Diagnostic test: `tests/test_lora_8b_diagnostics.py`
+### Cross-stack residual gap is bf16, not a bug
 
-A focused step-0-only diagnostic (`tests/test_lora_8b_diagnostics.py`)
-breaks the gap apart cleanly:
-
-* **FT-vs-FT bit-identity across two working-set configs** (8 vs 3
-  GPU layers): per-token CE max\|Δ\|=**0.0**, all LoRA-B grads
-  max\|Δ\|=**0.0**. The engine is fully deterministic across
-  offloading levels even on 8B with LoRA.
-* **Mean loss FT vs HF**: 1.8398 vs 1.8402, Δ = -4e-4. After the
-  YARN fix the means agree to 4 decimal places.
-* **Per-token CE FT vs HF**: max\|Δ\|=0.116 on individual positions.
-  Both stacks compute valid CE values; deltas average out across
-  positions.
-
-### Concretely: the residual gap is bf16, not a bug
-
-The "bf16 noise" claim is verified by reference, not assumed. Running
-HF in bf16 vs HF in fp32 on the **same** Llama-3.2-1B model (no FT
-involved) yields:
+HF in bf16 vs HF in fp32 on the **same** model defines the bf16
+noise floor:
 
 | Comparison | model | logit max\|Δ\| | logit mean\|Δ\| |
 |---|---|---|---|
@@ -382,46 +371,21 @@ involved) yields:
 | FT-bf16 vs HF-bf16 (cross-stack) | Llama-3.2-1B | 0.438 | 0.036 |
 | FT-bf16 vs HF-bf16 (cross-stack) | Llama-3.1-8B | 2.08  | 0.031 |
 
-FT-vs-HF on 1B is **smaller than HF's own bf16 noise floor**. argmax
-matches at every top-disagreement position. There is no algorithmic
-disagreement — FT produces bf16-correct outputs. 8B is ~4× the 1B
-floor, plausibly from 32 vs 16 layers compounding plus FT's Triton
-flash attention vs HF's PyTorch SDPA.
-
-* **LoRA-B gradient per-layer**: rel error degrades smoothly with
-  depth (L31: 4%, L0: 12%) — backward bf16 numerics accumulate
-  through 32 layers, not an isolated kernel bug.
-
-### Notable RoPE bug fixed during this work
-
-Llama 3.1 / 3.2 / 3.3 use a **frequency-band-scaled RoPE**
-(`rope_type: llama3`) for long-context support. FlexTrain's RoPE
-kernel originally hardcoded vanilla `inv_freq[i] = θ^(-2i/D)` and
-silently ignored `config.rope_scaling`. The kernel now takes a
-precomputed `inv_freq` array (length D/2) and the block-level
-`build_rope_inv_freq` builds the YARN-scaled curve when the HF
-config calls for it. To use this from your own code, pass
-`rope_scaling=hf_cfg["rope_scaling"]` into `LlamaBlockConfig` —
-or just use `flextrain.from_pretrained`, which does it for you.
-
-`tests/test_lora_e2e_olmoe_moe.py` runs the same pattern for OLMoE-1B-7B
-with **per-expert** LoRA (3-D adapters). Engine-determinism check
-yields max |Δ| ≤ 0.005 between full-save and offloaded configs (small
-non-determinism is from MoE routing decisions varying with chunk
-packing under different working sets).
+FT-vs-HF max|Δ| on 1B is on the order of HF's own bf16/fp32 noise
+floor; on 8B it grows roughly with depth (LoRA-B per-layer rel
+error: ~4% at L31 → ~12% at L0, smooth in depth). Argmax matches at
+every top-disagreement position — there is no algorithmic
+disagreement.
 
 ## What's verified
 
 | Property | Test | Status |
 |---|---|---|
-| Math: dA, dB, dx vs autograd reference | `test_lora_wrapper_math.py` | ✓ bf16 noise |
-| Frozen invariant: base weights don't change | `test_lora_engine_smoke.py` | ✓ bit-identical to init |
-| LoRA A/B grads allocated; base grads NOT | `test_lora_engine_smoke.py` | ✓ |
-| Loss decreases on real data | E2E tests | ✓ |
-| HF PEFT parity (dense Llama) | `test_lora_e2e_llama_dense.py` | ✓ within bf16 noise |
-| Engine determinism: full-save = offloaded | `test_lora_e2e_llama_dense.py` | ✓ bit-identical |
-| Per-expert MoE adapters (3-D) | `test_lora_moe_math.py` | ✓ |
-| OLMoE LoRA E2E under offload | `test_lora_e2e_olmoe_moe.py` | ✓ |
+| Loss decreases on real data | `tests/test_arch_lora_e2e.py --mode full` | ✓ all configured archs |
+| HF PEFT loss-curve parity (dense Llama / Qwen / Mistral) | `tests/test_arch_lora_e2e.py --mode lora` | ✓ within bf16 noise |
+| Step-0 logit + per-token CE diff vs HF | `tests/test_arch_parity.py` | ✓ bf16 noise floor |
+| Per-expert MoE adapters end-to-end (OLMoE, Qwen3-MoE, Qwen3.5-MoE) | `tests/test_arch_lora_e2e.py` | ✓ |
+| MoE LoRA finalize / merge | `tests/moe/test_lora_moe_finalize.py` | ✓ |
 
 ## Common pitfalls
 
@@ -430,7 +394,7 @@ packing under different working sets).
   `am.load_hf(...)` you must permute the OUT dim of `w_q`, `w_k`
   AND the matching dim of `w_q_lora_b`, `w_k_lora_b` so the LoRA
   delta is in the same coordinate system as the base. See the
-  example above (and `tests/test_lora_e2e_llama_dense.py`).
+  example above and `tests/test_arch_lora_e2e.py`.
 * **B init**: must be **zero** so the first-step LoRA delta is zero.
   Without this, the model starts in a different state from the base
   HF model and you can't compare cross-stack.

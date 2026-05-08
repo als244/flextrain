@@ -11,11 +11,12 @@ working-set solver is the value proposition, not data or tensor
 parallelism. The CUDA path is the only supported execution backend.
 Tests are standalone scripts (no `pytest` runner yet).
 
-Supported architectures: Llama-3, Qwen2/3, Qwen3-MoE, Qwen3.5,
-Qwen3.5-MoE / Qwen3.6-MoE, OLMoE, Qwen3-Next, Gemma 2/3.
-See [`docs/architectures.md`](docs/architectures.md). End-to-end smoke
-runs across these archs on a 24 GiB GPU + 117 GiB host workstation
-are recorded in [`docs/verified_runs.md`](docs/verified_runs.md).
+**Supported architectures.** Llama 2 / 3 / 3.1+, Mistral, Qwen2,
+Qwen3 (dense + MoE), Qwen3.5 (dense + MoE) / Qwen3.6, Qwen3-Next,
+OLMoE — see [`docs/architectures.md`](docs/architectures.md). Each
+arch has forward + backward + HF safetensors load. End-to-end smoke
+runs on a 24 GiB GPU + 117 GiB host workstation are recorded in
+[`docs/verified_runs.md`](docs/verified_runs.md).
 
 ## Install
 

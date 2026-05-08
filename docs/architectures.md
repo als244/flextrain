@@ -12,12 +12,15 @@ architectures, the wrapper creates **per-expert adapters** by default.
 | Qwen2 (with biases) | `Qwen2Block` | `Qwen2ForCausalLM` | ✓ | small parity PASSED | QKV biases supported |
 | Qwen3 dense | `Qwen3DenseBlock` / `Qwen3DenseSWABlock` | `Qwen3ForCausalLM` | ✓ | 1.7B parity PASSED, 1.7B `from_pretrained` LoRA smoke PASSED | per-head QK-norm, optional alternating SWA |
 | Qwen3-MoE | `Qwen3MoEBlock` | `Qwen3MoeForCausalLM` | ✓ | small-init parity PASSED | per-head QK-norm + MoE FFN |
+| Qwen3.5 dense | `Qwen3_5FullLayer` + `Qwen3_5LinearLayer` | `Qwen3_5ForCausalLM` / `Qwen3_5ForConditionalGeneration` | ✓ | 9B end-to-end smoke PASSED (LoRA + full) | hybrid linear+full attention, dense MLP |
+| Qwen3.5-MoE | `Qwen3_5FullLayer` + `Qwen3_5LinearLayer` (MoE FFN variant) | `Qwen3_5MoeForCausalLM` / `Qwen3_5MoeForConditionalGeneration` | ✓ | 35B-A3B end-to-end smoke PASSED (LoRA) | hybrid linear+full attention + MoE FFN (256+1 experts) |
 | OLMoE | `OLMoEBlock` | `OlmoeForCausalLM` | ✓ | 1B-7B end-to-end PASSED, 1B-7B `from_pretrained` LoRA smoke PASSED | full-row QK-norm, softmax-then-topk routing |
 | Qwen3-Next | `Qwen3NextLinearLayer` + `Qwen3NextFullLayer` | `Qwen3NextForCausalLM` | — (manual builder) | block-level fwd+bwd parity PASSED | alternating linear (Gated DeltaNet via FLA) and full attention |
 | Mistral | `MistralBlock` | `MistralForCausalLM` | ✓ | small parity PASSED | sliding-window attention |
-| Gemma 2 | `Gemma2Block` | `Gemma2ForCausalLM` | ✓ | builder registered (no E2E weights tested) | pre+post norms each side, attn logit softcap, alternating SWA, scoped autograd bwd for post-norms |
-| Gemma 3 | pending | `Gemma3ForCausalLM` | — | — | Gemma 2 + per-head QK-norm |
-| GPT-OSS | deferred | `GPTOSSForCausalLM` (?) | — | — | needs attention-sink kernel |
+
+In-progress (not yet end-to-end): Gemma 2 / Gemma 3 (forward parity passes;
+backward is stubbed — tracked in `docs/internal/`). GPT-OSS is deferred —
+needs the attention-sink kernel.
 
 For each architecture, the `flextrain/io/arch/<name>.py` file exposes:
 

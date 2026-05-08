@@ -116,20 +116,19 @@ LoRA wrapping; `save_hf_merged` is safe regardless.
 
 ## Correctness validation
 
-`tests/test_export_correctness.py` is the end-to-end check: it loads
-a model, runs a few LoRA steps, exports all three ways, then reloads
-each via subprocess (clean CUDA context) using HF transformers (and
-PEFT for the adapter case) and verifies the top-1 next-token id
-matches FlexTrain in-memory. Currently passing for:
-
-* Llama-3.2-1B (dense, halved→pair RoPE permutation)
-* Qwen3-1.7B (dense, q_norm/k_norm permutation on top of RoPE)
-
-Run it for your own model:
+`tests/io/test_export_roundtrip_loss.py` is the end-to-end check. For
+each (model, mode) it runs two subprocesses sequentially (clean CUDA
+context per phase): an `orig` phase trains N steps from the source HF
+dir and exports via `save_hf_full` / `save_hf_merged`; a `resumed`
+phase loads the exported dir via `from_pretrained` and trains N more
+steps on the **same data prefix**. Pass criterion: every
+`resumed[i] < orig[i]` — the model has already seen those tokens once,
+so further-training loss must be strictly lower. Any silently-dropped
+or-corrupted tensor in the export shows up as a non-decreasing loss.
 
 ```bash
-python tests/test_export_correctness.py --model models/Llama-3.1-8B \
-    --n-steps 50 --rank 16
+PYTHONPATH=. python tests/io/test_export_roundtrip_loss.py \
+    --output-root tests/io/export_roundtrip_logs
 ```
 
 ## Implementation notes

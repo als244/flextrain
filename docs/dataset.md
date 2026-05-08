@@ -191,8 +191,8 @@ For reproducibility:
   iterating data.
 * The engine itself is deterministic for a fixed working-set config.
   Save-level changes (e.g. forcing more activation recompute) are
-  bit-identical at the loss level
-  (see `tests/test_save_level_parity.py`).
-* Naive vs offloaded with the same optimizer is also bit-identical
-  (see `tests/test_muon_offloading_pretraining.py` — max |Δ| = 0.0
-  across 15 steps on a 165M-param model).
+  bit-identical at the loss level — the working-set planner only
+  changes WHERE intermediates live, not what's computed.
+* Naive vs offloaded with the same optimizer is also bit-identical:
+  parameter / gradient / optimizer-state offload only changes the
+  storage location, not the math.

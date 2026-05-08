@@ -91,8 +91,8 @@ ws = WorkingSetConfig(
   tensors.
 
 The engine guarantees that **loss curves are bit-identical across save
-levels** for the same optimizer + initialization (see
-`tests/test_save_level_parity.py`).
+levels** for the same optimizer + initialization — the planner only
+chooses where intermediates live, never what's computed.
 
 ## Common diagnostic outputs
 
