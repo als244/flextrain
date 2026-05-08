@@ -6,40 +6,16 @@ activations between GPU and host RAM via a working-set planner + DP
 solver, so an 8B model trains end-to-end on a 24 GiB GPU without
 DeepSpeed or FSDP.
 
+**Scope.** Single-GPU only. No distributed / multi-GPU support — the
+working-set solver is the value proposition, not data or tensor
+parallelism. The CUDA path is the only supported execution backend.
+Tests are standalone scripts (no `pytest` runner yet).
+
 Supported architectures: Llama-3, Qwen2/3, Qwen3-MoE, Qwen3.5,
-Qwen3.5-MoE / Qwen3.6-MoE, OLMoE, Qwen3-Next, Gemma 2/3. See
-[`docs/architectures.md`](docs/architectures.md).
-
-### Verified end-to-end (RTX 3090 24 GiB GPU + 117 GiB host)
-
-5-step training smoke on `datasets/mathinstruct.jsonl` with the
-default `Instruction:/Response:` prompt template, `--max-seq-len 2048`,
-mean-over-active-tokens loss (PyTorch `CrossEntropyLoss(ignore_index=-100)`
-convention; matches HF / PEFT). LoRA-all at rank=16 unless noted.
-Greedy generation also verified (coherent output, hits EOS naturally).
-
-| Model | Params | Arch | Mode | Batch tokens | Loss curve (5 steps) |
-|---|---|---|---|---|---|
-| Llama-3.2-1B | 1B | dense | LoRA | — | _not re-verified_ |
-| OLMoE-1B-7B | 7B / 1B-active | MoE (64 experts) | LoRA | — | _not re-verified_ |
-| OLMoE-1B-7B | 7B / 1B-active | MoE (64 experts) | full | — | _not re-verified_ |
-| Qwen3-8B | 8B | dense, QK-norm | LoRA | — | _not re-verified_ |
-| Qwen3.5-9B | 9B | hybrid linear+full attn, dense MLP | LoRA | 65k | 0.797 → 0.620 |
-| Qwen3.5-9B | 9B | hybrid linear+full attn, dense MLP | full | 65k | 0.744 → 0.455 |
-| Qwen3.5-27B | 27B | hybrid linear+full attn, dense MLP | LoRA | — | _not re-verified_ |
-| Qwen3.6-27B | 27B | hybrid linear+full attn, dense MLP | LoRA | — | _not re-verified_ |
-| Qwen3-30B-A3B | 30B / 3B-active | MoE (128 experts) | LoRA | — | _not re-verified_ |
-| Qwen3.5-MoE-35B-A3B | 35B / 3B-active | hybrid + MoE (256+1 experts) | LoRA | 65k | 0.743 → 0.541 |
-
-Loss values reflect mean cross-entropy over response tokens
-(positions where `targets != -100`); prior versions of this table
-reported a different convention (mean over all tokens, including
-prompt-position zeros) so older numbers are not directly comparable.
-
-Additional models supported by the existing arch loaders (require a
-larger machine to actually train): Qwen3.6-35B-A3B,
-Qwen3.5-122B-A10B, Qwen3.5-397B-A17B, Qwen3-Coder-30B-A3B-Instruct
-(no new wiring needed; they reuse `Qwen3_5*` / `Qwen3Moe*` arch ids).
+Qwen3.5-MoE / Qwen3.6-MoE, OLMoE, Qwen3-Next, Gemma 2/3.
+See [`docs/architectures.md`](docs/architectures.md). End-to-end smoke
+runs across these archs on a 24 GiB GPU + 117 GiB host workstation
+are recorded in [`docs/verified_runs.md`](docs/verified_runs.md).
 
 ## Install
 
@@ -150,19 +126,15 @@ skips redundant `pytorch_model.bin` shards.
 
 ```python
 from flextrain import from_pretrained
-from flextrain.core.hw_probe import probe_hardware
 from flextrain.optim.adamw import AdamW, AdamWHyperparams
 
-probe = probe_hardware()  # ~14s; sustained TFLOPS / PCIe / mem-bw
 am = from_pretrained(
     "models/Llama-3.1-8B",
     optimizer=AdamW(AdamWHyperparams(lr=3e-5)),
     max_seq_len=1024,
     max_global_batch_tokens=1024,
-    max_gpu_mem_bytes=int(24 * (1 << 30)),
-    max_host_mem_bytes=int(110 * (1 << 30)),
-    hw_cost=probe.hw_cost,
-    mem_bw_gbps=probe.mem_bw_gbps,
+    max_gpu_mem_bytes=24 << 30,
+    max_host_mem_bytes=110 << 30,
 )
 
 for batch in your_dataloader:
@@ -171,7 +143,21 @@ for batch in your_dataloader:
 ```
 
 For LoRA, pass `lora_targets="all"` (and optionally `lora_rank`,
-`lora_alpha`).
+`lora_alpha`). For full fine-tuning with Muon on dense projections,
+swap the optimizer for `flextrain.optim.HybridMuonAdamW`.
+
+**Better save-tier plans.** The default `hw_cost` is a conservative
+60 TFLOPS / 20 GB/s placeholder; on a real GPU this inflates compute
+times and the planner ends up skipping recompute. For accurate plans,
+probe once and pass the result:
+
+```python
+from flextrain.core.hw_probe import probe_hardware
+probe = probe_hardware()  # ~14s; sustained TFLOPS / PCIe / mem-bw
+am = from_pretrained(..., hw_cost=probe.hw_cost, mem_bw_gbps=probe.mem_bw_gbps)
+```
+
+`train.py` does this for you automatically.
 
 ## Layout
 
@@ -203,14 +189,20 @@ download.py  pre-stage models/datasets for air-gapped nodes
 | [dtypes.md](docs/dtypes.md) | compute / master / grad / opt-state dtypes |
 | [optimizers.md](docs/optimizers.md) | AdamW / Muon / HybridMuonAdamW |
 | [export.md](docs/export.md) | export to vLLM / sGLang / HF (full, LoRA adapter, merged) |
+| [verified_runs.md](docs/verified_runs.md) | end-to-end smoke runs on the reference workstation |
 
 ## Tests
 
 Each test is a standalone script (no test runner yet):
 
 ```bash
-python tests/test_save_level_parity.py        # bit-identical loss across save tiers
-python tests/test_olmoe_1b7b_training.py      # OLMoE 1B-7B end-to-end on HF weights
-python tests/test_random_init_pretraining.py  # cold-start on real Llama-3 tokens
-python tests/test_muon_offloading_pretraining_moe.py  # Muon + offload parity
+python tests/test_arch_parity.py              # FT-vs-HF loss + logit parity across archs
+python tests/test_arch_lora_e2e.py --all      # LoRA-mode parity vs HF PEFT (all archs)
+python tests/test_llama32_1b_parity.py        # Llama-3.2-1B end-to-end vs HF transformers
+python tests/parity_qwen3_5_9b_35b_5step.py   # Qwen3.5-9B + 35B-A3B 5-step replay
 ```
+
+Per-area suites live in subdirs: `tests/moe/` (MoE block / backend parity),
+`tests/multi_chunk_dense_parity/` (chunked linear-attn correctness),
+`tests/io/` (HF safetensors round-trip), `tests/cross_machine_parity/`
+(replay across machines).
