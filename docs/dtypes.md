@@ -13,7 +13,7 @@ matters.
 | `compute_dtype` | GPU compute slot | bf16 | What the matmul / kernel sees |
 | `master_dtype` | Host-side authoritative copy | = `compute_dtype` | Read at optimizer step time |
 | `grad_dtype` | GPU grad slot + host grad accumulator | = `compute_dtype` | What the bwd kernel writes |
-| `opt_state_dtype` | Optimizer state buffers | fp32 | AdamW m/v, Muon momentum |
+| `opt_state_dtype` | Optimizer state buffers | bf16 | AdamW m/v, Muon momentum |
 
 The engine casts between roles at the buffer boundaries:
 * On parameter prefetch (host → device): `master_dtype` → `compute_dtype`

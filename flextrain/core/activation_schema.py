@@ -334,7 +334,7 @@ class ActivationSlot:
         incorrectly returned True for higher-tier fields on prefetched
         slots, causing LlamaBlock/Qwen3Block forward_recompute to
         silently skip the xq/xo/x1/x3 recompute — see [FINDING 17]
-        in ``docs/NOTES.md``. Symptom: bwd at an offloaded layer
+        in ``docs/internal/NOTES.md``. Symptom: bwd at an offloaded layer
         would read a previous layer's xq from the ring slot,
         producing gradients that explode through the residual chain.
         """

@@ -40,7 +40,7 @@ optionally ``lora_rank``, ``lora_alpha``, plus dtype overrides).
 
 To extend FlexTrain to a new architecture
 -----------------------------------------
-See :doc:`docs/implementing.md`. The short version:
+See :doc:`docs/extending/README.md`. The short version:
 
 1. Build a layer/block class under ``flextrain/nn/layers/``.
 2. Register an :class:`ArchSpec` (HF tensor-name map) under

@@ -694,13 +694,13 @@ class Layer(Protocol):
         benches, tests) while enabling the LoRA fast-path consumer in
         :mod:`flextrain.engine.active_model` to call dgrad alone and
         skip the per-projection Wgrad matmuls for frozen base weights.
-        See ``docs/lora_fast_backward.md`` for the contract.
+        See ``docs/internal/lora_fast_backward.md`` for the contract.
         """
         ...
 
     # ------------------------------------------------------------------
     # Optional: split backward into dgrad / wgrad. Phase 1 of the LoRA
-    # fast-backward refactor (docs/lora_fast_backward.md). Layers that
+    # fast-backward refactor (docs/internal/lora_fast_backward.md). Layers that
     # implement these two methods AND have ``backward()`` delegate to
     # them gain the ability to skip Wgrad on a per-projection basis
     # (LoRA does this for every wrapped projection). Layers that don't

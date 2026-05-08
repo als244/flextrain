@@ -33,9 +33,9 @@ against those two functions is a bug unless explicitly called out below.
 ## Files created so far
 
 ### Plan + orientation
-- [docs/START_HERE.md](START_HERE.md) — named phases in order, review gate
+- [docs/internal/START_HERE.md](START_HERE.md) — named phases in order, review gate
   after Phase 1.
-- [docs/PLAN.md](PLAN.md) — the approved full plan (copied from
+- [docs/internal/PLAN.md](PLAN.md) — the approved full plan (copied from
   `~/.claude/plans/`).
 
 ### Package skeleton

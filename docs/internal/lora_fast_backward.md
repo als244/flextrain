@@ -463,8 +463,9 @@ The intent is that each phase is independently mergeable and testable.
       then wgrad.
 - [x] Update `flextrain/core/__init__.py` to export
       `BackwardIntermediates`.
-- [x] Update `docs/implementing.md` with a new "Optional: split
-      backward into `backward_dgrad` / `backward_wgrad`" subsection.
+- [x] Update layer-contract docs with a new "Optional: split
+      backward into `backward_dgrad` / `backward_wgrad`" subsection
+      (now in `docs/extending/layer_contract.md`).
 - [x] **Gate: existing parity tests pass unchanged.**
       - `tests/test_llama_parity.py` — orig vs ft: dx 0.0, all
         matmul grads 0.0, g_q 4e-6, norm grads 1.3e-3 (identical to

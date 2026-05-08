@@ -153,7 +153,9 @@ for i in range(n_layers):
 you must also permute the **1-D** `w_q_norm` / `w_k_norm` weights —
 they multiply post-projection Q/K per-dim, and changing the dim
 ordering of Q/K must be reflected in the norm weight ordering.
-See `tests/test_olmoe_1b7b_training.py` for the canonical example.
+The OLMoE arch's `post_load_permute` in `flextrain/io/arch/olmoe.py`
+shows this end-to-end (Q/K halved-pair plus the matching norm
+permutation).
 
 ## Skipping weights at load time
 

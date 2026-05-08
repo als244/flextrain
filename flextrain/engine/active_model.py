@@ -1672,7 +1672,7 @@ class ActiveModel:
         they're sequential per-layer (a layer is one type or the
         other, never both currently).
 
-        See ``docs/multi_chunk_seq_handling.md`` for the per-type
+        See ``docs/internal/multi_chunk_seq_handling.md`` for the per-type
         source-slot rules and event-ordering analysis.
         """
         if layer_ind == 0 and seq_group_ind == 0:
@@ -1768,7 +1768,7 @@ class ActiveModel:
         The off-by-one vs dense KV (which uses target chunk K's own
         slot) reflects that ``lin_final_state`` is a boundary value
         (state AFTER the chunk's tokens) rather than per-token data.
-        See ``docs/multi_chunk_seq_handling.md`` for the full analysis.
+        See ``docs/internal/multi_chunk_seq_handling.md`` for the full analysis.
         """
         target = self._next_reverse_iteration_target(
             seq_group_ind=seq_group_ind,
@@ -2044,7 +2044,7 @@ class ActiveModel:
         # MUST overwrite them. If we returned a max-tier slot here,
         # slot.has("xq") would be True for prefetched offloaded layers
         # and recompute would silently skip — producing stale-xq bwd
-        # (see [FINDING 17] in docs/NOTES.md).
+        # (see [FINDING 17] in docs/internal/NOTES.md).
         home_slot = self._host_act_slots[(lid, chunk_id)]
         assert home_slot is not None
         level = home_slot.level

@@ -91,8 +91,84 @@ ws = WorkingSetConfig(
   tensors.
 
 The engine guarantees that **loss curves are bit-identical across save
-levels** for the same optimizer + initialization (see
-`tests/test_save_level_parity.py`).
+levels** for the same optimizer + initialization — the planner only
+chooses where intermediates live, never what's computed.
+
+## How the DP solver picks save levels
+
+Save level is chosen **per (layer, chunk) pair**, not globally. The
+working-set planner runs a small dynamic-programming optimization
+(implementation in `flextrain/core/save_level.py`, building on the
+paper §3.4 formulation) over all `(layer, chunk)` pairs to pick a
+`SaveLevelPlan` — a mapping from `(layer_id, chunk_id)` to a
+`SaveLevel` (tier in `[0, max_tier]`, with `-1` reserved for the
+GPU-resident-no-home-slot fast path).
+
+The DP minimizes total step time, balancing three numbers per
+`(layer, chunk, level)`:
+
+| Quantity | What it is | Where it comes from |
+|---|---|---|
+| `ci` | forward compute time for this chunk on this layer (ms) | `layer.compute_cost(chunk).total_fwd_flops` ÷ measured TFLOPs (`hw_cost.peak_tflops × practical_efficiency_factor`) |
+| `vi,o` | recompute time AVOIDED in bwd if this chunk was saved at level `o` (ms) | `layer.compute_cost(chunk).avoided_recompute_flops[o]` ÷ measured TFLOPs |
+| `δi,o` | transfer time to ship this chunk's tier-≤`o` activations to host and back (ms) | `sum(field.byte_size for field in schema.fields if field.tier <= o)` ÷ PCIe bandwidth (`hw_cost.pcie_bw_gbps`) |
+
+For each `(layer, chunk)` it picks the level `o` that minimizes
+`compute_time(o) + transfer_time(o)` where:
+
+* `compute_time(o) = ci + (sum of fwd FLOPs at every tier > o) ÷ TFLOPs`
+  — i.e., the original fwd plus whatever fwd we have to redo in bwd
+  for fields not saved at this level.
+* `transfer_time(o) = δi,o` — what we pay to ship the saved
+  activations to host (and fetch them back at bwd).
+
+The budget constraint: total saved bytes across all `(layer, chunk)`
+in the plan can't exceed `host_act_buffer_size`. If saving at level
+`o` for some `(layer, chunk)` would blow the budget, the DP forces
+that pair to a lower level — the `compute_time`-vs-`transfer_time`
+tradeoff for the OTHER pairs gets re-optimized around it.
+
+So a "tighter" host-activation budget pushes the plan toward lower
+save levels (more recompute in bwd); a looser budget pushes it
+toward higher save levels (less recompute, more bytes transferred).
+
+### What this means for a layer author
+
+The DP's decisions are entirely driven by the numbers your blocks
+return from `compute_cost(chunk, max_tier)` (FLOPs) and the byte
+sizes derived from your `ActivationField.shape_fn × dtype`. If
+either is wrong, the solver picks the wrong level — you might OOM,
+or you might leave compute on the table.
+
+* **Under-report `total_fwd_flops` or `avoided_recompute_flops`** →
+  solver thinks recompute is cheap → picks lower level → bwd does
+  more work than expected → step time inflated.
+* **Over-report** → solver thinks recompute is costly → picks
+  higher level → activation memory inflated → OOM, or chunk size
+  shrinks to fit.
+* **Wrong `shape_fn` / `dtype`** → solver thinks saving is cheaper
+  (or more expensive) than it is → wrong tradeoff, same failure
+  modes.
+* **Non-monotone `avoided_recompute_flops`** → `__post_init__`
+  raises at block construction (the solver requires
+  monotone-non-decreasing).
+
+For the FLOP-counting playbook (matmuls = `2*M*N*K`, ignore
+norms/elementwise, attribute each matmul to the highest tier that
+gates its recompute), see
+[`extending/best_practices.md`](extending/best_practices.md#compute-contract-dp-solver).
+
+### Inspecting what the solver picked
+
+* `verbose=True` on `from_pretrained` / `determine_working_set_config`
+  prints `Selected Best Option: {...}` with the chosen save level,
+  chunk size, and `n_gpu_layers`.
+* `force_saved_act_level=L` on `from_pretrained` overrides the DP's
+  per-`(layer, chunk)` choice with a single fixed level (clamped per
+  layer to `schema.max_tier`). Useful for parity tests where you
+  want to verify save-level invariance.
+* `--force-save-level {0,1,2,3}` from the `train.py` CLI is the
+  same knob.
 
 ## Common diagnostic outputs
 

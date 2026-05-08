@@ -266,7 +266,7 @@ class OLMoEBlock:
         """Delegate to ``backward_dgrad`` + ``backward_wgrad`` -- same
         FLOPs, same kernels, same order. The split lets LoRA's fast
         path (rank-r dA/dB on attention deferred Wgrads) skip the
-        per-projection Wgrad addmm. See ``docs/lora_fast_backward.md``.
+        per-projection Wgrad addmm. See ``docs/internal/lora_fast_backward.md``.
         """
         upstream_dx, intermediates = self.backward_dgrad(
             dx, chunk, weights, grads, slot, ctx,

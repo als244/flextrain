@@ -27,7 +27,7 @@ And at top level:
     model.norm.weight            <-> head.w_final_norm
     lm_head.weight               <-> head.w_head_proj (transpose)
 
-See docs/PLAN.md "HF integration: config + weights, not compute" for the
+See docs/internal/PLAN.md "HF integration: config + weights, not compute" for the
 rationale (we own the compute path; HF owns config + weights + tokenizer).
 """
 

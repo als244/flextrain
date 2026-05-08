@@ -9,7 +9,7 @@ composes a specific combination of algorithmic blocks from
    safetensors load / export.
 3. A matching ``hf_config_to_flextrain`` adapter in the same arch module.
 
-See docs/PLAN.md "Multi-architecture strategy" for the full coverage list.
+See docs/internal/PLAN.md "Multi-architecture strategy" for the full coverage list.
 """
 
 from .llama import LlamaBlock, LlamaBlockConfig

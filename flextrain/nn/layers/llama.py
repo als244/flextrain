@@ -286,7 +286,7 @@ class LlamaBlock:
         :meth:`backward_wgrad` -- same FLOPs, same kernels, same order.
         The split is what enables LoRA's fast-path (skip the per-
         projection Wgrad matmul on frozen base weights). See
-        ``docs/lora_fast_backward.md``.
+        ``docs/internal/lora_fast_backward.md``.
         """
         upstream_dx, intermediates = self.backward_dgrad(
             dx, chunk, weights, grads, slot, ctx,

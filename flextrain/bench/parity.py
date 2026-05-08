@@ -119,7 +119,7 @@ def _rope_pair_interleave(
     x: torch.Tensor, seq_positions: torch.Tensor, theta: float
 ) -> torch.Tensor:
     """Pair-interleave RoPE (matches the Triton kernel; NOT the HF
-    halved-split convention — see NOTES.md [FINDING 6])."""
+    halved-split convention — see docs/internal/NOTES.md [FINDING 6])."""
     T, H, D = x.shape
     half = D // 2
     pos = seq_positions.view(-1, 1, 1).float()
