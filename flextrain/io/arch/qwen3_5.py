@@ -500,6 +500,139 @@ def _text_cfg(hf_config):
     return getattr(hf_config, "text_config", hf_config)
 
 
+ARCH_NAME = "qwen3_5"
+
+
+_REQUIRED_DIMS = (
+    "vocab_size", "n_layers", "d_model", "n_heads", "head_dim", "expert_dim",
+)
+_DEFAULT_DATATYPES = {
+    "embed": "bfloat16", "head_proj": "bfloat16", "attn_proj": "bfloat16",
+    "expert_proj": "bfloat16", "router": "bfloat16", "norm": "bfloat16",
+    "residual": "bfloat16",
+}
+
+
+def expand_dims(dims) -> dict:
+    """Qwen3.5 dense dims schema = Llama + linear-attn primaries +
+    optional ``layer_pattern`` shorthand.
+
+    Required: ``vocab_size, n_layers, d_model, n_heads, head_dim,
+    expert_dim``.
+
+    Linear-attn primaries (default match the Qwen3.5 dense reference):
+    ``linear_num_v_heads=16``, ``linear_num_k_heads=16``,
+    ``linear_head_k_dim=128``, ``linear_head_v_dim=128``,
+    ``linear_conv_kernel=4``.
+
+    ``layer_pattern`` (optional): a shorthand string like ``"3L1F"``
+    that ``flextrain.from_dims`` expands into ``hyperparams["layer_types"]``
+    of length ``n_layers``. Without it the user must supply
+    ``hyperparams["layer_types"]`` directly.
+    """
+    out = dict(dims)
+    missing = [k for k in _REQUIRED_DIMS if k not in out]
+    if missing:
+        raise KeyError(
+            f"qwen3_5 dims missing required keys: {missing}. "
+            f"Got keys: {sorted(out)}"
+        )
+    out.setdefault("n_kv_heads", out["n_heads"])
+    out.setdefault("num_shared_experts", 1)
+    out.setdefault("num_routed_experts", 0)
+    out.setdefault("top_k", 0)
+    out.setdefault("is_causal", True)
+    out.setdefault("datatypes", dict(_DEFAULT_DATATYPES))
+    # Linear-attn primaries.
+    out.setdefault("linear_num_v_heads", 16)
+    out.setdefault("linear_num_k_heads", 16)
+    out.setdefault("linear_head_k_dim", 128)
+    out.setdefault("linear_head_v_dim", 128)
+    out.setdefault("linear_conv_kernel", 4)
+    # Standard derived attn dims.
+    out["attn_dim"] = int(out["n_heads"]) * int(out["head_dim"])
+    out["kv_dim"] = int(out["n_kv_heads"]) * int(out["head_dim"])
+    # Linear-attn aliases + derived dims (the GatedDeltaNet param spec
+    # reads several of these — match what hf_config_to_flextrain emits).
+    nv = int(out["linear_num_v_heads"])
+    nk = int(out["linear_num_k_heads"])
+    hk = int(out["linear_head_k_dim"])
+    hv = int(out["linear_head_v_dim"])
+    ck = int(out["linear_conv_kernel"])
+    key_dim = nk * hk
+    value_dim = nv * hv
+    out.setdefault("num_v_heads", nv)
+    out.setdefault("num_k_heads", nk)
+    out.setdefault("head_k_dim", hk)
+    out.setdefault("head_v_dim", hv)
+    out.setdefault("key_dim", key_dim)
+    out.setdefault("value_dim", value_dim)
+    out.setdefault("conv_dim", 2 * key_dim + value_dim)
+    out.setdefault("proj_qkvz_dim", 2 * key_dim + 2 * value_dim)
+    out.setdefault("proj_ba_dim", 2 * nv)
+    out.setdefault("conv_kernel_size", ck)
+    return out
+
+
+def default_hyperparams() -> dict:
+    """Qwen3.5 dense defaults: eps=1e-6, rope=1e7, partial_rotary=0.25.
+    ``layer_types=None`` means the caller must either set it explicitly
+    via ``hyperparams`` or pass ``dims["layer_pattern"]`` for shorthand
+    expansion."""
+    return {
+        "rms_norm_eps": 1e-6,
+        "rope_theta": 10_000_000.0,
+        "rope_scaling": None,
+        "partial_rotary_factor": 0.25,
+        "layer_types": None,
+        "full_attention_interval": None,
+        "attn_output_gate": True,
+    }
+
+
+def flextrain_to_hf_config(dims, hyperparams=None) -> dict:
+    """Inverse mapping for Qwen3.5 dense. Emits ``layer_types`` (if set)
+    and the linear-attn primaries (under HF's
+    ``linear_num_value_heads`` / ``linear_num_key_heads`` / etc names)."""
+    hp = dict(default_hyperparams())
+    if hyperparams:
+        hp.update(hyperparams)
+    d = expand_dims(dims)
+    cfg = {
+        "architectures": ["Qwen3_5ForCausalLM"],
+        "model_type": "qwen3_5",
+        "vocab_size": int(d["vocab_size"]),
+        "num_hidden_layers": int(d["n_layers"]),
+        "hidden_size": int(d["d_model"]),
+        "num_attention_heads": int(d["n_heads"]),
+        "num_key_value_heads": int(d["n_kv_heads"]),
+        "head_dim": int(d["head_dim"]),
+        "intermediate_size": int(d["expert_dim"]),
+        "linear_num_value_heads": int(d["linear_num_v_heads"]),
+        "linear_num_key_heads": int(d["linear_num_k_heads"]),
+        "linear_key_head_dim": int(d["linear_head_k_dim"]),
+        "linear_value_head_dim": int(d["linear_head_v_dim"]),
+        "linear_conv_kernel_dim": int(d["linear_conv_kernel"]),
+        "rms_norm_eps": float(hp["rms_norm_eps"]),
+        "rope_theta": float(hp["rope_theta"]),
+        "rope_scaling": hp.get("rope_scaling"),
+        "partial_rotary_factor": float(hp["partial_rotary_factor"]),
+        "max_position_embeddings": 32768,
+        "hidden_act": "silu",
+        "tie_word_embeddings": False,
+        "attention_bias": False,
+        "attn_output_gate": bool(hp.get("attn_output_gate", True)),
+        "initializer_range": 0.02,
+        "torch_dtype": "bfloat16",
+        "use_cache": True,
+    }
+    if hp.get("layer_types"):
+        cfg["layer_types"] = list(hp["layer_types"])
+    if hp.get("full_attention_interval") is not None:
+        cfg["full_attention_interval"] = int(hp["full_attention_interval"])
+    return cfg
+
+
 def hf_config_to_flextrain(hf_config: Any) -> dict:
     tc = _text_cfg(hf_config)
     g = (tc.get if isinstance(tc, dict) else lambda k, default=None: getattr(tc, k, default))
@@ -810,3 +943,10 @@ def _register_builder() -> None:
 
 
 _register_builder()
+
+
+# Public block-builder symbol used by ``flextrain.from_dims`` via
+# ``flextrain.io.arch.ARCH_MODULES``. Same function the registry above
+# hands to from_pretrained, exposed at module level so the dims path
+# can look it up by short name.
+BLOCK_BUILDER = _qwen3_5_block_builder

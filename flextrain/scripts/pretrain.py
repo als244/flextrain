@@ -129,6 +129,8 @@ def _parse_dims_flags(args: argparse.Namespace) -> dict:
         ("expert_dim", "expert_dim"),
         ("num_routed_experts", "num_routed_experts"),
         ("top_k", "top_k"),
+        ("shared_expert_dim", "shared_expert_dim"),
+        ("layer_pattern", "layer_pattern"),
     ]:
         v = getattr(args, src, None)
         if v is not None:
@@ -529,6 +531,12 @@ def add_argparse_subparser(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--expert-dim", type=int)
     p.add_argument("--num-routed-experts", type=int)
     p.add_argument("--top-k", type=int)
+    p.add_argument("--shared-expert-dim", type=int,
+                   help="Per-shared-expert FFN dim (Qwen3-Next, Qwen3.5-MoE)")
+    p.add_argument("--layer-pattern",
+                   help="Hybrid-attn schedule shorthand (e.g. '1F1L', "
+                        "'1F47L'). Codes: F=full, L=linear, S=sliding. "
+                        "Pattern repeats to fill n_layers.")
     # --- compute budget (one of) ---
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--total-tokens",

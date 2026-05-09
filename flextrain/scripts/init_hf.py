@@ -100,7 +100,17 @@ def _cmd_init(args: argparse.Namespace) -> int:
     # 2. Compose the HF-side config dict, then look up the matching
     # ArchSpec via ``select_arch`` — that's the same dispatch
     # ``from_pretrained`` uses to find a weight map.
-    hyperparams = arch_mod.default_hyperparams()
+    hyperparams = dict(arch_mod.default_hyperparams())
+    # Mirror the from_dims expansion of dims["layer_pattern"] →
+    # hyperparams["layer_types"], so config.json carries the schedule.
+    if (
+        not hyperparams.get("layer_types")
+        and dims.get("layer_pattern")
+    ):
+        from flextrain.io.arch import expand_layer_pattern
+        hyperparams["layer_types"] = expand_layer_pattern(
+            dims["layer_pattern"], int(dims["n_layers"]),
+        )
     hf_config = arch_mod.flextrain_to_hf_config(dims, hyperparams)
     arch_spec = select_arch(hf_config)
 
@@ -113,6 +123,26 @@ def _cmd_init(args: argparse.Namespace) -> int:
     # symmetric on save (handled inside export_hf_safetensors); FP
     # transforms in the ArchSpec emit each tensor in its HF-native
     # layout / dtype.
+    #
+    # Hybrid-attn arches (qwen3_5, qwen3_5_moe, qwen3_next) currently
+    # emit ALL ArchSpec layer entries per layer, ignoring whether the
+    # layer is linear-attn or full-attn — the export raises
+    # KeyError on the missing layer-type-specific tensors. That's a
+    # pre-existing flextrain export limitation; until it's fixed, the
+    # init CLI writes config.json but skips safetensors for hybrid
+    # arches.
+    hybrid = any(arch_id in arch_spec.hf_arch_ids for arch_id in (
+        "Qwen3_5ForCausalLM", "Qwen3_5MoeForCausalLM", "Qwen3NextForCausalLM",
+        "Qwen3_5MoeForConditionalGeneration", "Qwen3_5ForConditionalGeneration",
+    ))
+    if hybrid:
+        print(
+            "[init] hybrid-attn arch detected — skipping safetensors export "
+            "(pre-existing limitation in flextrain.export_hf_safetensors). "
+            "config.json was written.",
+            flush=True,
+        )
+        return 0
     out_path = am.save_hf(str(out_dir), arch=arch_spec)
     print(f"[init] wrote {out_path}", flush=True)
     return 0
@@ -143,6 +173,12 @@ def add_argparse_subparser(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--expert-dim", type=int)
     p.add_argument("--num-routed-experts", type=int)
     p.add_argument("--top-k", type=int)
+    p.add_argument("--shared-expert-dim", type=int,
+                   help="Per-shared-expert FFN dim (Qwen3-Next, Qwen3.5-MoE)")
+    p.add_argument("--layer-pattern",
+                   help="Hybrid-attn schedule shorthand (e.g. '1F1L', "
+                        "'1F47L'). Codes: F=full, L=linear, S=sliding. "
+                        "Pattern repeats to fill n_layers.")
 
     p.add_argument("--out", required=True,
                    help="output directory (config.json + model.safetensors)")

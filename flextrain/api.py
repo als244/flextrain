@@ -703,13 +703,24 @@ def from_dims(
             max_host_mem_bytes=int(110 * (1 << 30)),
         )
     """
-    from flextrain.io.arch import get_arch_module
+    from flextrain.io.arch import get_arch_module, expand_layer_pattern
 
     arch_module = get_arch_module(arch)
     expanded_dims = arch_module.expand_dims(dims)
     hp = dict(arch_module.default_hyperparams())
     if hyperparams is not None:
         hp.update(hyperparams)
+    # Hybrid-attn shorthand: ``dims["layer_pattern"]`` → ``hp["layer_types"]``.
+    # Explicit ``hyperparams["layer_types"]`` always wins (so callers can
+    # override the shorthand for one-off ablations).
+    if (
+        not hp.get("layer_types")
+        and "layer_pattern" in expanded_dims
+        and expanded_dims["layer_pattern"]
+    ):
+        hp["layer_types"] = expand_layer_pattern(
+            expanded_dims["layer_pattern"], int(expanded_dims["n_layers"]),
+        )
     build_block = arch_module.BLOCK_BUILDER
 
     am, _ = _build_active_model(
