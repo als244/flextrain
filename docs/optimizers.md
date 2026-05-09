@@ -11,7 +11,7 @@ from flextrain.optim.adamw import AdamW, AdamWHyperparams
 opt = AdamW(
     AdamWHyperparams(lr=3e-4, beta1=0.9, beta2=0.95, eps=1e-8,
                      weight_decay=0.0),
-    state_dtype=torch.float32,   # default; override to torch.bfloat16 for ~50% memory
+    state_dtype=torch.bfloat16,   # default; override to torch.float32 for cold-start pretraining at scale
 )
 ```
 

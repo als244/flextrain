@@ -77,12 +77,12 @@ class TensorSpec:
                                forward / backward pass; typically bf16.
     * ``grad_dtype``        -- accumulated gradient dtype; bf16 or fp32.
     * ``opt_state_dtype``   -- moments / Muon orthogonalization workspace
-                               dtype; fp32 by default.
+                               dtype; bf16 by default.
 
-    These default to ``torch.bfloat16`` / ``torch.float32`` so most layers can
-    pass a single ``dtype=`` for compatibility with ``orig``. Individual
-    architectures override per-tensor (e.g. embedding master in bf16 but
-    optimizer state in fp32).
+    These default to ``torch.bfloat16`` so most layers can pass a single
+    ``dtype=`` for compatibility with ``orig``. Individual architectures
+    override per-tensor (e.g. RMSNorm γ master/grad in fp32 because the
+    weights are 1-D and the byte cost is negligible).
 
     The engine decides when to cast between master and compute: on parameter
     prefetch (host->device) it casts master_dtype -> compute_dtype if they
@@ -176,7 +176,7 @@ class ParamSpec:
 
     * host + device parameter buffers (bf16, see ``tensor.dtype``)
     * gradient buffers (same shapes, grad-dtype per :meth:`grad_dtype_of`)
-    * AdamW optimizer state (two tensors per param, fp32 by default)
+    * AdamW optimizer state (two tensors per param, bf16 by default)
     * Muon optimizer state (one tensor per param + transient ortho workspace)
     * HF-safetensors load/export via a per-architecture name map (see
       ``io/arch/<family>.py``).

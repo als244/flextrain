@@ -61,7 +61,7 @@ Running the dense E2E engine immediately followed by a MoE engine in the same Py
 Currently `HybridMuonAdamWHyperparams` has separate `adamw` and `muon` sub-hyperparam objects with independent LR. Default LR comes from each sub-object. Should the top-level `lr` field override both, or stay as a label only? Right now top-level `lr` is unused.
 
 ### Q-2. Muon state dtype for MoE experts
-For MoE expert stacks routed to Muon, state is allocated using `TensorSpec.opt_state_dtype` (default fp32). Muon's momentum is traditionally bf16. Should we default expert Muon momentum to bf16, or leave it fp32 unless user overrides? Impact: ~50% opt state memory on MoE models.
+For MoE expert stacks routed to Muon, state is allocated using `TensorSpec.opt_state_dtype` (default bf16). Resolved: bf16 default matches Muon's traditional momentum precision and saves ~50% opt state memory on MoE models. Pass `state_dtype=torch.float32` for higher-precision moment tracking when needed.
 
 ### Q-3. Qwen3-MoE 30B-A3B HF weights test
 Architecture works (small-init parity passes). Need a `test_qwen3_moe_30b_training.py` following the OLMoE template but I can't run it here (disk/GPU). Want me to write the script anyway? You can run on a bigger box.

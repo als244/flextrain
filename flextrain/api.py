@@ -245,8 +245,10 @@ def from_pretrained(
     lora_targets
         ``None`` for full fine-tuning. ``"all"`` or a list of param
         names (e.g. ``("w_q","w_v")``) for LoRA. The default LoRA
-        adapter dtype is fp32 for master/grad/opt-state (matches HF
-        PEFT).
+        adapter dtype is bf16 for compute/master/grad/opt-state
+        (memory-conservative; HF PEFT's convention at scale is fp32
+        master/grad/opt-state -- override the
+        ``lora_adapter_*_dtype`` kwargs to switch).
     hw_cost
         :class:`HardwareCost` for the DP-solver. Pass the result of
         :func:`flextrain.core.hw_probe.probe_hardware` for measured

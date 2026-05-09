@@ -207,16 +207,20 @@ Two common cases:
 
 ## Memory budget heuristics
 
-For an `N`-param model (excluding embed+head) with bf16 master, fp32
-opt state:
+For an `N`-param model (excluding embed+head) with the default bf16
+stack (bf16 master, bf16 grad, bf16 opt state):
 
 | Component | Bytes |
 |-----------|-------|
 | Master weights (host) | `2 N` |
 | Grads (host + GPU resident) | `2 N + 2 N * (n_gpu_grads / n_layers)` |
-| Opt state (host) | `8 N` (AdamW fp32) or `2 N` (Muon bf16) |
+| Opt state (host) | `4 N` (AdamW bf16) or `2 N` (Muon bf16) |
 | GPU compute slots | `2 N * (n_gpu_layers / n_layers)` |
 | Activation ring | depends on save level & chunk size |
+
+Override the bf16 opt state default with `state_dtype=torch.float32`
+in the optimizer constructor for cold-start pretraining at scale; that
+doubles the opt-state row to `8 N` (AdamW) or `4 N` (Muon).
 
 Hybrid Muon + AdamW saves ~40% on opt state vs pure AdamW for
 transformer-shaped param distributions.

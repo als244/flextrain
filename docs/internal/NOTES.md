@@ -311,7 +311,7 @@ slips through a conditional), so layer bugs like forgetting to check
 - **New design:** `TensorSpec` has four optional dtype fields:
   `compute_dtype` (required), `master_dtype`, `grad_dtype`,
   `opt_state_dtype`. Missing roles default to `compute_dtype` except
-  `opt_state_dtype` which defaults to `float32`. `TensorSpec.simple(name,
+  `opt_state_dtype` which defaults to `bfloat16`. `TensorSpec.simple(name,
   shape_fn, dtype)` preserves the old single-dtype call site for block
   code that doesn't care.
 - **Queries:** `TensorSpec.{compute,master,grad,opt_state}_byte_size(dims)`,

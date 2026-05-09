@@ -46,11 +46,10 @@ def _make_adamw_state_spec(dtype: torch.dtype) -> OptimizerStateSpec:
     )
 
 
-# Default: fp32 moments. This is the safer choice for numerical
-# stability in long runs. bf16 opt state is an available memory trade
-# (half the opt ring size) for large models where you'd otherwise need
-# host offload. User-selectable via the ``state_dtype`` constructor
-# arg.
+# bf16 moments are the default (cheap; halves opt-state memory). Pass
+# ``state_dtype=torch.float32`` for higher-precision moment updates --
+# recommended for cold-start pretraining at scale where the m / v
+# values can lose precision. Pre-built fp32 spec for that path.
 _ADAMW_STATE_SPEC_FP32 = _make_adamw_state_spec(torch.float32)
 
 
@@ -60,8 +59,8 @@ class AdamW(Optimizer):
     Usage
     -----
         opt = AdamW(hp=AdamWHyperparams(lr=3e-4))
-        # or bf16 opt state to halve memory:
-        opt = AdamW(hp=..., state_dtype=torch.bfloat16)
+        # or fp32 opt state for cold-start pretraining at scale:
+        opt = AdamW(hp=..., state_dtype=torch.float32)
         state = {}  # engine-allocated per (param, state_tensor) pair
         opt.step(param_spec, master, grads, state, step_num=step)
     """
