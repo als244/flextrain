@@ -1,0 +1,13 @@
+# Hardware-probe cache — machine-specific (peak TFLOPS, PCIe BW,
+# memory BW). Re-probed on first run via flextrain.core.hw_probe;
+# committing it would yield wrong working-set plans on a different GPU.
+_hw_cost_cache.json
+
+# Orchestrator session marker — only used to tell my interactive shell
+# which timestamped grid is the latest. Not a real artifact.
+_latest_grid_ts.txt
+
+# Stdout tee from the grid orchestrator. Redundant with the structured
+# train.jsonl / eval.jsonl logs that each per-run subdir already holds,
+# and bulky (50K+ lines per grid). Skip from version control.
+**/grid.log

@@ -1,0 +1,11 @@
+{
+  "params": 28970240,
+  "total_flops": 1e+17,
+  "actual_steps": 35113,
+  "actual_tokens": 575291392,
+  "final_train_loss": 4.845405574158201,
+  "final_val_loss": 4.9071857284938885,
+  "total_time_s": 1184.159249305725,
+  "d_model": 256,
+  "n_layers": 4
+}

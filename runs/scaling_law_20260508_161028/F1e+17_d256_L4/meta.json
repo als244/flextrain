@@ -1,0 +1,33 @@
+{
+  "dims": {
+    "vocab_size": 50304,
+    "n_layers": 4,
+    "d_model": 256,
+    "n_heads": 4,
+    "n_kv_heads": 4,
+    "head_dim": 64,
+    "expert_dim": 704
+  },
+  "params": 28970240,
+  "config": {
+    "d_model": 256,
+    "n_layers": 4,
+    "total_flops": 1e+17,
+    "out_dir": "runs/scaling_law_20260508_161028/F1e+17_d256_L4",
+    "batch_tokens": 16384,
+    "max_seq_len": 1024,
+    "peak_lr": 0.0003,
+    "warmup_frac": 0.02,
+    "grad_clip": 1.0,
+    "weight_decay": 0.1,
+    "init_seed": 42,
+    "eval_every": 200,
+    "eval_tokens": 200000,
+    "log_every": 20,
+    "max_gpu_mem_gib": 22,
+    "max_host_mem_gib": 80
+  },
+  "total_steps": 35113,
+  "warmup_steps": 702,
+  "flops_per_step": 2847890472960.0
+}

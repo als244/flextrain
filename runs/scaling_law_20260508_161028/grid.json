@@ -1,0 +1,178 @@
+[
+  {
+    "params": 20645760,
+    "total_flops": 3e+16,
+    "actual_steps": 14781,
+    "actual_tokens": 242171904,
+    "final_train_loss": 5.4321149218448,
+    "final_val_loss": 5.422489686361717,
+    "total_time_s": 411.10980916023254,
+    "d_model": 192,
+    "n_layers": 3
+  },
+  {
+    "params": 28970240,
+    "total_flops": 3e+16,
+    "actual_steps": 10534,
+    "actual_tokens": 172589056,
+    "final_train_loss": 5.218432146829948,
+    "final_val_loss": 5.2107087602932864,
+    "total_time_s": 354.8879282474518,
+    "d_model": 256,
+    "n_layers": 4
+  },
+  {
+    "params": 37277760,
+    "total_flops": 3e+16,
+    "actual_steps": 8186,
+    "actual_tokens": 134119424,
+    "final_train_loss": 5.149257367701704,
+    "final_val_loss": 5.137370548125592,
+    "total_time_s": 301.96282052993774,
+    "d_model": 320,
+    "n_layers": 4
+  },
+  {
+    "params": 47486976,
+    "total_flops": 3e+16,
+    "actual_steps": 6426,
+    "actual_tokens": 105283584,
+    "final_train_loss": 5.102264264567096,
+    "final_val_loss": 5.103217929194963,
+    "total_time_s": 283.91618299484253,
+    "d_model": 384,
+    "n_layers": 5
+  },
+  {
+    "params": 28970240,
+    "total_flops": 1e+17,
+    "actual_steps": 35113,
+    "actual_tokens": 575291392,
+    "final_train_loss": 4.845405574158201,
+    "final_val_loss": 4.9071857284938885,
+    "total_time_s": 1184.159249305725,
+    "d_model": 256,
+    "n_layers": 4
+  },
+  {
+    "params": 37277760,
+    "total_flops": 1e+17,
+    "actual_steps": 27288,
+    "actual_tokens": 447086592,
+    "final_train_loss": 4.718456115571719,
+    "final_val_loss": 4.744038849497856,
+    "total_time_s": 1008.5943760871887,
+    "d_model": 320,
+    "n_layers": 4
+  },
+  {
+    "params": 47486976,
+    "total_flops": 1e+17,
+    "actual_steps": 21421,
+    "actual_tokens": 350961664,
+    "final_train_loss": 4.613003108798777,
+    "final_val_loss": 4.629356528999722,
+    "total_time_s": 944.6415348052979,
+    "d_model": 384,
+    "n_layers": 5
+  },
+  {
+    "params": 59703616,
+    "total_flops": 1e+17,
+    "actual_steps": 17038,
+    "actual_tokens": 279150592,
+    "final_train_loss": 4.542704064953702,
+    "final_val_loss": 4.583513067724528,
+    "total_time_s": 931.7485556602478,
+    "d_model": 448,
+    "n_layers": 6
+  },
+  {
+    "params": 37277760,
+    "total_flops": 3e+17,
+    "actual_steps": 81865,
+    "actual_tokens": 1341276160,
+    "final_train_loss": 4.524735882987414,
+    "final_val_loss": 4.519589920178959,
+    "total_time_s": 2999.471911907196,
+    "d_model": 320,
+    "n_layers": 4
+  },
+  {
+    "params": 47486976,
+    "total_flops": 3e+17,
+    "actual_steps": 64265,
+    "actual_tokens": 1052917760,
+    "final_train_loss": 4.381558048063183,
+    "final_val_loss": 4.407619496183703,
+    "total_time_s": 2830.709949731827,
+    "d_model": 384,
+    "n_layers": 5
+  },
+  {
+    "params": 59703616,
+    "total_flops": 3e+17,
+    "actual_steps": 51115,
+    "actual_tokens": 837468160,
+    "final_train_loss": 4.260549937032577,
+    "final_val_loss": 4.203903382432594,
+    "total_time_s": 2792.827002286911,
+    "d_model": 448,
+    "n_layers": 6
+  },
+  {
+    "params": 89815104,
+    "total_flops": 3e+17,
+    "actual_steps": 33978,
+    "actual_tokens": 556695552,
+    "final_train_loss": 4.155948957782408,
+    "final_val_loss": 4.0487741018954,
+    "total_time_s": 2747.5240466594696,
+    "d_model": 576,
+    "n_layers": 8
+  },
+  {
+    "params": 47486976,
+    "total_flops": 1e+18,
+    "actual_steps": 214217,
+    "actual_tokens": 3509731328,
+    "final_train_loss": 4.191546078826785,
+    "final_val_loss": 4.207742274361411,
+    "total_time_s": 9504.24055981636,
+    "d_model": 384,
+    "n_layers": 5
+  },
+  {
+    "params": 59703616,
+    "total_flops": 1e+18,
+    "actual_steps": 170383,
+    "actual_tokens": 2791555072,
+    "final_train_loss": 4.076910017064301,
+    "final_val_loss": 4.057743397710184,
+    "total_time_s": 9293.927462100983,
+    "d_model": 448,
+    "n_layers": 6
+  },
+  {
+    "params": 89815104,
+    "total_flops": 1e+18,
+    "actual_steps": 113260,
+    "actual_tokens": 1855651840,
+    "final_train_loss": 3.925541292728951,
+    "final_val_loss": 3.895901170037688,
+    "total_time_s": 9118.19479727745,
+    "d_model": 576,
+    "n_layers": 8
+  },
+  {
+    "params": 148069632,
+    "total_flops": 1e+18,
+    "actual_steps": 68700,
+    "actual_tokens": 1125580800,
+    "final_train_loss": 3.777989365241069,
+    "final_val_loss": 3.7622632374622054,
+    "total_time_s": 8859.217563867569,
+    "d_model": 768,
+    "n_layers": 10
+  }
+]
