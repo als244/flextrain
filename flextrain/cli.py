@@ -678,6 +678,12 @@ def main(argv: list[str] | None = None) -> int:
     train.add_argument("config", help="path to RunConfig YAML")
     train.set_defaults(func=_cmd_train)
 
+    # `pretrain` is a sibling, not a replacement: the YAML `train` path
+    # above is the SFT / from-pretrained workflow; `pretrain` is the
+    # random-init-from-dims workflow that goes through ``from_dims``.
+    from flextrain.scripts.pretrain import add_argparse_subparser as _add_pretrain
+    _add_pretrain(sub)
+
     args = p.parse_args(argv)
     return args.func(args)
 
