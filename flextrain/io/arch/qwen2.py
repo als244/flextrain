@@ -111,6 +111,52 @@ QWEN2_ARCH = ArchSpec(
 register_arch(QWEN2_ARCH)
 
 
+ARCH_NAME = "qwen2"
+
+
+_REQUIRED_DIMS = (
+    "vocab_size", "n_layers", "d_model", "n_heads", "head_dim", "expert_dim",
+)
+_DEFAULT_DATATYPES = {
+    "embed": "bfloat16", "head_proj": "bfloat16", "attn_proj": "bfloat16",
+    "expert_proj": "bfloat16", "router": "bfloat16", "norm": "bfloat16",
+    "residual": "bfloat16",
+}
+
+
+def expand_dims(dims) -> dict:
+    """Qwen2 dims schema = Llama + ``qkv_bias`` (defaults to True —
+    Qwen2 uses biased Q/K/V projections)."""
+    out = dict(dims)
+    missing = [k for k in _REQUIRED_DIMS if k not in out]
+    if missing:
+        raise KeyError(
+            f"qwen2 dims missing required keys: {missing}. "
+            f"Got keys: {sorted(out)}"
+        )
+    out.setdefault("n_kv_heads", out["n_heads"])
+    out.setdefault("num_shared_experts", 1)
+    out.setdefault("num_routed_experts", 0)
+    out.setdefault("top_k", 0)
+    out.setdefault("is_causal", True)
+    out.setdefault("qkv_bias", True)
+    out.setdefault("datatypes", dict(_DEFAULT_DATATYPES))
+    out["attn_dim"] = int(out["n_heads"]) * int(out["head_dim"])
+    out["kv_dim"] = int(out["n_kv_heads"]) * int(out["head_dim"])
+    return out
+
+
+def default_hyperparams() -> dict:
+    """Qwen2 defaults: eps=1e-6, rope=1e6, full attention."""
+    return {
+        "rms_norm_eps": 1e-6,
+        "rope_theta": 1_000_000.0,
+        "rope_scaling": None,
+        "window_size_left": -1,
+        "window_size_right": 0,
+    }
+
+
 def hf_config_to_flextrain(hf_config: Any) -> dict:
     """Qwen2 ``config.json`` → FlexTrain dims dict."""
     get = (
@@ -249,6 +295,9 @@ def post_load_permute(am, hf_config, dims, hyperparams):
 def _register_builder() -> None:
     from flextrain.api import register_block_builder
     register_block_builder(("Qwen2ForCausalLM",), _qwen2_block_builder)
+
+
+BLOCK_BUILDER = _qwen2_block_builder
 
 
 _register_builder()

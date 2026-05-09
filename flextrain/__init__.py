@@ -7,6 +7,7 @@ See ``README.md`` and ``docs/`` for the high-level overview, and
 from .api import (  # noqa: F401  -- re-exports
     BuildContext,
     BlockBuilder,
+    from_dims,
     from_pretrained,
     register_block_builder,
 )
@@ -25,6 +26,7 @@ from .io.arch import qwen3_moe as _qwen3_moe  # noqa: F401
 __all__ = [
     "BuildContext",
     "BlockBuilder",
+    "from_dims",
     "from_pretrained",
     "register_block_builder",
 ]

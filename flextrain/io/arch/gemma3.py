@@ -118,6 +118,56 @@ GEMMA3_ARCH = ArchSpec(
 register_arch(GEMMA3_ARCH)
 
 
+ARCH_NAME = "gemma3"
+
+
+_REQUIRED_DIMS = (
+    "vocab_size", "n_layers", "d_model", "n_heads", "head_dim", "expert_dim",
+)
+_DEFAULT_DATATYPES = {
+    "embed": "bfloat16", "head_proj": "bfloat16", "attn_proj": "bfloat16",
+    "expert_proj": "bfloat16", "router": "bfloat16", "norm": "bfloat16",
+    "residual": "bfloat16",
+}
+
+
+def expand_dims(dims) -> dict:
+    """Gemma3 dims schema = Llama. Local/global pattern lives in
+    hyperparams."""
+    out = dict(dims)
+    missing = [k for k in _REQUIRED_DIMS if k not in out]
+    if missing:
+        raise KeyError(
+            f"gemma3 dims missing required keys: {missing}. "
+            f"Got keys: {sorted(out)}"
+        )
+    out.setdefault("n_kv_heads", out["n_heads"])
+    out.setdefault("num_shared_experts", 1)
+    out.setdefault("num_routed_experts", 0)
+    out.setdefault("top_k", 0)
+    out.setdefault("is_causal", True)
+    out.setdefault("datatypes", dict(_DEFAULT_DATATYPES))
+    out["attn_dim"] = int(out["n_heads"]) * int(out["head_dim"])
+    out["kv_dim"] = int(out["n_kv_heads"]) * int(out["head_dim"])
+    return out
+
+
+def default_hyperparams() -> dict:
+    """Gemma3 defaults: eps=1e-6, rope=1e6 (full) / 10k (local).
+    ``sliding_window`` and ``layer_types`` left as ``None`` so the
+    block builder falls back to its own alternation default."""
+    return {
+        "rms_norm_eps": 1e-6,
+        "rope_theta": 1_000_000.0,
+        "rope_local_base": 10_000.0,
+        "attn_logit_softcap": None,
+        "final_logit_softcap": None,
+        "query_pre_attn_scalar": None,
+        "sliding_window": None,
+        "layer_types": None,
+    }
+
+
 def hf_config_to_flextrain(hf_config: Any) -> dict:
     get = (
         (lambda k, default=None: getattr(hf_config, k, default))

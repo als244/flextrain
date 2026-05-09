@@ -295,13 +295,152 @@ def from_pretrained(
         dims["kv_dim"] = int(dims["n_kv_heads"]) * int(dims["head_dim"])
     hyperparams = arch_module.hf_config_to_hyperparams(hf_config)
 
-    # Sane dtype defaults.
+    am, hw_cost = _build_active_model(
+        dims=dims,
+        hyperparams=hyperparams,
+        build_block=build_block,
+        hf_config=hf_config,
+        optimizer=optimizer,
+        max_seq_len=max_seq_len,
+        max_global_batch_tokens=max_global_batch_tokens,
+        max_gpu_mem_bytes=max_gpu_mem_bytes,
+        max_host_mem_bytes=max_host_mem_bytes,
+        leeway_gpu_mem_bytes=leeway_gpu_mem_bytes,
+        leeway_host_mem_bytes=leeway_host_mem_bytes,
+        compute_dtype=compute_dtype,
+        master_dtype=master_dtype,
+        grad_dtype=grad_dtype,
+        norm_grad_dtype=norm_grad_dtype,
+        lora_targets=lora_targets,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
+        lora_adapter_compute_dtype=lora_adapter_compute_dtype,
+        lora_adapter_master_dtype=lora_adapter_master_dtype,
+        lora_adapter_grad_dtype=lora_adapter_grad_dtype,
+        lora_adapter_opt_state_dtype=lora_adapter_opt_state_dtype,
+        hw_cost=hw_cost,
+        mem_bw_gbps=mem_bw_gbps,
+        fixed_seq_len=fixed_seq_len,
+        force_saved_act_level=force_saved_act_level,
+        head_chunk_size=head_chunk_size,
+        min_chunk_size=min_chunk_size,
+        max_chunk_size=max_chunk_size,
+        moe_backend=moe_backend,
+        device=device,
+        verbose=verbose,
+        verbose_label="from_pretrained",
+    )
+
+    # 6. Load + permute weights.
+    if load_weights:
+        if verbose:
+            import sys
+            print(
+                f"[from_pretrained] Loading HF safetensors from {model_path}...",
+                flush=True, file=sys.stderr,
+            )
+        am.load_hf(model_path, strict=strict)
+        # Arch-specific post-load fixups (Q/K halved→pair, tied head, ...).
+        post_load = getattr(arch_module, "post_load_permute", None)
+        if post_load is not None:
+            post_load(am, hf_config, dims, hyperparams)
+        # Stash hyperparams so the export side can recover e.g.
+        # partial_rotary_factor for the inverse permutation.
+        am._hf_hyperparams = dict(hyperparams)
+        if verbose:
+            import sys
+            print("[from_pretrained] Weights loaded.", flush=True, file=sys.stderr)
+
+    # 7. LoRA auto-init: ``A ~ N(0, lora_a_std)``, ``B = 0`` so the LoRA
+    # delta starts at zero (model behaves identically to the base at
+    # step 0 — required for clean transfer learning). Run regardless
+    # of ``load_weights``; the buffer manager already allocated the
+    # adapter tensors and they'd otherwise hold undefined values.
+    if lora_targets:
+        _init_lora_params(am, seed=lora_init_seed, a_std=lora_a_std)
+
+    return am
+
+
+def _init_lora_params(am: ActiveModel, *, seed: int, a_std: float) -> None:
+    """Initialize all ``*_lora_a`` and ``*_lora_b`` host-resident
+    parameters across the backbone, then refresh GPU residents so the
+    next ``fwd_bwd`` sees the new values.
+
+    Convention: ``A ~ N(0, a_std)``, ``B = 0``. Yields
+    ``W_eff = W + (A @ B) * scale = W`` at step 0 (LoRA delta is zero
+    until B picks up gradient). This matches HF PEFT's
+    ``init_lora_weights="default"`` behavior."""
+    import torch as _t
+    g = _t.Generator(device="cpu").manual_seed(int(seed))
+    n_layers = len(am.backbone)
+    touched = 0
+    for L in range(n_layers):
+        host = am.buffers.host_params[L]
+        for nm, t in host.items():
+            if nm.endswith("_lora_a"):
+                # Generate in fp32, cast to t.dtype to match adapter dtype.
+                rand = _t.empty(t.shape, dtype=_t.float32).normal_(
+                    mean=0.0, std=a_std, generator=g,
+                )
+                t.copy_(rand.to(t.dtype))
+                touched += 1
+            elif nm.endswith("_lora_b"):
+                t.zero_()
+                touched += 1
+    am._refresh_gpu_residents()
+    _t.cuda.synchronize()
+
+
+def _build_active_model(
+    *,
+    dims: Mapping,
+    hyperparams: Mapping,
+    build_block: BlockBuilder,
+    hf_config: Mapping[str, Any],
+    optimizer: Optimizer,
+    max_seq_len: int,
+    max_global_batch_tokens: int,
+    max_gpu_mem_bytes: int,
+    max_host_mem_bytes: int,
+    leeway_gpu_mem_bytes: int,
+    leeway_host_mem_bytes: int,
+    compute_dtype: torch.dtype,
+    master_dtype: torch.dtype | None,
+    grad_dtype: torch.dtype | None,
+    norm_grad_dtype: torch.dtype,
+    lora_targets: object | None,
+    lora_rank: int,
+    lora_alpha: float,
+    lora_adapter_compute_dtype: torch.dtype | None,
+    lora_adapter_master_dtype: torch.dtype | None,
+    lora_adapter_grad_dtype: torch.dtype | None,
+    lora_adapter_opt_state_dtype: torch.dtype | None,
+    hw_cost: HardwareCost | None,
+    mem_bw_gbps: float | None,
+    fixed_seq_len: bool,
+    force_saved_act_level: int | None,
+    head_chunk_size: int,
+    min_chunk_size: int | None,
+    max_chunk_size: int | None,
+    moe_backend: object | None,
+    device: str,
+    verbose: bool,
+    verbose_label: str,
+) -> tuple[ActiveModel, HardwareCost]:
+    """Shared build path for ``from_pretrained`` and ``from_dims``.
+
+    Takes resolved ``dims`` + ``hyperparams`` (the only things that
+    differ between the two entry points) and produces a fully-built
+    ``ActiveModel`` plus the resolved ``hw_cost`` (so the caller can
+    cache it). Does NOT load or randomly initialize weights — that's
+    the caller's responsibility.
+    """
     master_dtype = master_dtype or compute_dtype
     grad_dtype = grad_dtype or compute_dtype
-
     n_layers = int(dims["n_layers"])
 
-    # 3. Build embed + head + backbone.
+    # Build embed + head + backbone.
     embed = _build_embed(
         dims, compute=compute_dtype, master=master_dtype, grad=grad_dtype,
     )
@@ -340,7 +479,7 @@ def from_pretrained(
     )
     backbone = [build_block(i, ctx) for i in range(n_layers)]
 
-    # 4. Solve working set.
+    # Solve working set.
     opt_dtype_name = _dtype_name(getattr(optimizer, "state_spec", None))
     training_config = {
         "master_weight_dtype": _dtype_name_from_torch(master_dtype),
@@ -359,7 +498,7 @@ def from_pretrained(
         if verbose:
             import sys
             print(
-                "[from_pretrained] hw_cost not provided; running "
+                f"[{verbose_label}] hw_cost not provided; running "
                 "probe_hardware() (~10s). Pass hw_cost=probe_hardware().hw_cost "
                 "to skip on subsequent calls.",
                 flush=True, file=sys.stderr,
@@ -369,8 +508,6 @@ def from_pretrained(
         hw_cost = _probe_result.hw_cost
         if mem_bw_gbps is None:
             mem_bw_gbps = _probe_result.mem_bw_gbps
-    ws_peak_tflops = hw_cost.peak_tflops
-    ws_pcie_bw_gbps = hw_cost.pcie_bw_gbps
     working_set = determine_working_set_config(
         model_dims=dims,
         max_seq_len=max_seq_len,
@@ -381,40 +518,28 @@ def from_pretrained(
         max_host_mem_bytes=max_host_mem_bytes,
         leeway_gpu_mem_bytes=leeway_gpu_mem_bytes,
         leeway_host_mem_bytes=leeway_host_mem_bytes,
-        peak_tflops=ws_peak_tflops,
-        pcie_bw_gbps=ws_pcie_bw_gbps,
+        peak_tflops=hw_cost.peak_tflops,
+        pcie_bw_gbps=hw_cost.pcie_bw_gbps,
         mem_bw_gbps=mem_bw_gbps,
         fixed_seq_len=fixed_seq_len,
         verbose=verbose,
         min_chunk_size=min_chunk_size,
         max_chunk_size=max_chunk_size,
         lora_active=lora_targets is not None,
-        # Hand the actual specs to the solver so it sizes from real
-        # frozen-aware byte counts (LoRA wraps backbone tensors with
-        # ``frozen=True``; embed/head get marked frozen above when
-        # ``lora_targets`` is set).
         layer_param_specs=[layer.param_spec for layer in backbone],
         embed_param_spec=embed.param_spec,
         head_param_spec=head.param_spec,
-        # Hand actual schemas so the host-buffer sizing uses real
-        # arch-specific tier-0 byte counts (linear-attn ``lin_z`` /
-        # ``lin_*_rstd`` etc.) rather than the dense-transformer
-        # heuristic in ``transformer_saved_act_sizes``. Critical for
-        # hybrid backbones (Qwen3-Next / Qwen3.5 / Qwen3.5-MoE /
-        # Qwen3.6 / Qwen3.6-MoE) where the heuristic undersizes by
-        # 1.5-2x and ``plan_from_solution`` raises mid-step.
         layer_schemas=[layer.schema for layer in backbone],
     )
 
-    # 5. Build engine.
+    # Build engine.
     if verbose:
-        # cudaHostRegister of large host buffers (host_act_buffer +
-        # host params/grads/opt-state) is silent and can take 10-60s.
-        # Print a heartbeat so users running under nsys / nvprof don't
-        # mistake the silent window for a hang.
+        # cudaHostRegister of large host buffers is silent and can take
+        # 10-60s; print a heartbeat so users running under nsys / nvprof
+        # don't mistake the silent window for a hang.
         import sys
         print(
-            "[from_pretrained] Building engine + pinning host buffers "
+            f"[{verbose_label}] Building engine + pinning host buffers "
             "(this can take 10-60s for large models)...",
             flush=True, file=sys.stderr,
         )
@@ -437,68 +562,201 @@ def from_pretrained(
         except Exception:
             mem_msg = ""
         print(
-            f"[from_pretrained] Engine ready. {mem_msg}".rstrip(),
+            f"[{verbose_label}] Engine ready. {mem_msg}".rstrip(),
             flush=True, file=sys.stderr,
         )
-
-    # 6. Load + permute weights.
-    if load_weights:
-        if verbose:
-            import sys
-            print(
-                f"[from_pretrained] Loading HF safetensors from {model_path}...",
-                flush=True, file=sys.stderr,
-            )
-        am.load_hf(model_path, strict=strict)
-        # Arch-specific post-load fixups (Q/K halved→pair, tied head, ...).
-        post_load = getattr(arch_module, "post_load_permute", None)
-        if post_load is not None:
-            post_load(am, hf_config, dims, hyperparams)
-        # Stash hyperparams so the export side can recover e.g.
-        # partial_rotary_factor for the inverse permutation.
-        am._hf_hyperparams = dict(hyperparams)
-        if verbose:
-            import sys
-            print("[from_pretrained] Weights loaded.", flush=True, file=sys.stderr)
-
-    # 7. LoRA auto-init: ``A ~ N(0, lora_a_std)``, ``B = 0`` so the LoRA
-    # delta starts at zero (model behaves identically to the base at
-    # step 0 — required for clean transfer learning). Skip when we
-    # didn't load weights (cold start) or LoRA isn't enabled.
-    if lora_targets and load_weights:
-        _init_lora_params(am, seed=lora_init_seed, a_std=lora_a_std)
-
-    return am
+    return am, hw_cost
 
 
-def _init_lora_params(am: ActiveModel, *, seed: int, a_std: float) -> None:
-    """Initialize all ``*_lora_a`` and ``*_lora_b`` host-resident
-    parameters across the backbone, then refresh GPU residents so the
-    next ``fwd_bwd`` sees the new values.
+def _init_random_weights(am: ActiveModel, *, seed: int, std: float) -> None:
+    """Deterministically initialize every host-resident parameter that
+    isn't a LoRA adapter slot.
 
-    Convention: ``A ~ N(0, a_std)``, ``B = 0``. Yields
-    ``W_eff = W + (A @ B) * scale = W`` at step 0 (LoRA delta is zero
-    until B picks up gradient). This matches HF PEFT's
-    ``init_lora_weights="default"`` behavior."""
-    import torch as _t
-    g = _t.Generator(device="cpu").manual_seed(int(seed))
-    n_layers = len(am.backbone)
-    touched = 0
-    for L in range(n_layers):
-        host = am.buffers.host_params[L]
-        for nm, t in host.items():
-            if nm.endswith("_lora_a"):
-                # Generate in fp32, cast to t.dtype to match adapter dtype.
-                rand = _t.empty(t.shape, dtype=_t.float32).normal_(
-                    mean=0.0, std=a_std, generator=g,
-                )
-                t.copy_(rand.to(t.dtype))
-                touched += 1
-            elif nm.endswith("_lora_b"):
-                t.zero_()
-                touched += 1
+    Naming convention (set by the block / embed / head TensorSpecs in
+    ``flextrain/nn/blocks/`` and ``flextrain/nn/{embed,head}.py``):
+
+    * Any name containing ``"norm"`` is an RMSNorm γ → init to 1.0.
+    * Any name starting with ``"b_"`` is a bias vector → init to 0.0.
+    * Names ending in ``"_lora_a"`` / ``"_lora_b"`` are skipped (handled
+      by ``_init_lora_params``).
+    * Everything else (``w_q``, ``w_k``, ``w_v``, ``w_o``, ``w_1``,
+      ``w_2``, ``w_3``, ``w_up``, ``w_down``, ``w_router``,
+      ``w_tok_embeddings``, ``w_head_proj``, etc.) is treated as a
+      linear projection / embedding and drawn from ``N(0, std)``.
+
+    Generation is in fp32 for cross-dtype determinism, then cast to the
+    target tensor's dtype. After populating host buffers,
+    ``am._refresh_gpu_residents()`` syncs the GPU-resident slots."""
+    g = torch.Generator(device="cpu").manual_seed(int(seed))
+
+    def _fill(name: str, t: torch.Tensor) -> None:
+        if name.endswith("_lora_a") or name.endswith("_lora_b"):
+            return
+        if "norm" in name:
+            t.fill_(1.0)
+            return
+        if name.startswith("b_"):
+            t.zero_()
+            return
+        rand = torch.empty(t.shape, dtype=torch.float32).normal_(
+            mean=0.0, std=std, generator=g,
+        )
+        t.copy_(rand.to(t.dtype))
+
+    for name, t in am.buffers.host_embed_params.items():
+        _fill(name, t)
+    for name, t in am.buffers.host_head_params.items():
+        _fill(name, t)
+    for layer_host in am.buffers.host_params:
+        for name, t in layer_host.items():
+            _fill(name, t)
     am._refresh_gpu_residents()
-    _t.cuda.synchronize()
+    torch.cuda.synchronize()
+
+
+def from_dims(
+    dims: Mapping,
+    *,
+    arch: str,
+    optimizer: Optimizer,
+    max_seq_len: int,
+    max_global_batch_tokens: int,
+    max_gpu_mem_bytes: int,
+    max_host_mem_bytes: int,
+    hyperparams: Mapping | None = None,
+    init_seed: int = 0xF1EC7,
+    init_std: float = 0.02,
+    device: str = "cuda:0",
+    leeway_gpu_mem_bytes: int = 2 * (1 << 30),
+    leeway_host_mem_bytes: int = 4 * (1 << 30),
+    compute_dtype: torch.dtype = torch.bfloat16,
+    master_dtype: torch.dtype | None = torch.bfloat16,
+    grad_dtype: torch.dtype | None = torch.bfloat16,
+    norm_grad_dtype: torch.dtype = torch.float32,
+    lora_targets: object | None = None,
+    lora_rank: int = 16,
+    lora_alpha: float = 16.0,
+    lora_adapter_compute_dtype: torch.dtype | None = torch.bfloat16,
+    lora_adapter_master_dtype: torch.dtype | None = torch.bfloat16,
+    lora_adapter_grad_dtype: torch.dtype | None = torch.bfloat16,
+    lora_adapter_opt_state_dtype: torch.dtype | None = torch.bfloat16,
+    lora_init_seed: int = 20260424,
+    lora_a_std: float = 0.02,
+    hw_cost: HardwareCost | None = None,
+    mem_bw_gbps: float | None = None,
+    fixed_seq_len: bool = False,
+    force_saved_act_level: int | None = None,
+    head_chunk_size: int = 1024,
+    verbose: bool = False,
+    min_chunk_size: int | None = None,
+    max_chunk_size: int | None = None,
+    moe_backend: object | None = None,
+) -> ActiveModel:
+    """Build an :class:`ActiveModel` from a FlexTrain dims dict —
+    bypasses HF entirely.
+
+    Useful for benchmarking, pretraining, or training models with
+    custom shapes that don't have a real HF checkpoint. Mirror of
+    :func:`from_pretrained` minus the ``model_path`` / safetensors
+    load. Random init is sized by ``init_std`` (default ``0.02`` —
+    standard transformer init).
+
+    Parameters
+    ----------
+    dims
+        FlexTrain dims dict — required keys depend on the arch (see
+        each arch module's ``expand_dims``). Accepts the same shape as
+        ``orig/model_dims.json`` entries: ``vocab_size, n_layers,
+        d_model, n_heads, head_dim, expert_dim`` and (for MoE)
+        ``num_routed_experts, top_k``. ``n_kv_heads`` defaults to
+        ``n_heads``; ``attn_dim`` / ``kv_dim`` are derived.
+    arch
+        Short architecture name. One of:
+        ``llama, mistral, gemma2, qwen2, qwen3, olmoe, qwen3_moe``.
+        See :data:`flextrain.io.arch.ARCH_MODULES`.
+    hyperparams
+        Optional overrides for per-arch defaults from
+        ``arch_module.default_hyperparams()``. Useful for setting
+        ``rms_norm_eps``, ``rope_theta``, ``window_size_left``,
+        ``load_balance_coef``, etc.
+    init_seed, init_std
+        Random-init reproducibility seed + standard deviation. The
+        same seed produces bitwise-identical weights across calls.
+    Other parameters
+        See :func:`from_pretrained`. ``load_weights`` and ``strict``
+        are inapplicable here (there are no weights to load).
+
+    Example
+    -------
+    ::
+
+        am = flextrain.from_dims(
+            dims={"vocab_size": 50304, "n_layers": 12,
+                  "d_model": 768, "n_heads": 12, "head_dim": 64,
+                  "expert_dim": 3072},
+            arch="llama",
+            optimizer=AdamW(AdamWHyperparams(lr=3e-4)),
+            max_seq_len=2048, max_global_batch_tokens=2048,
+            max_gpu_mem_bytes=int(24 * (1 << 30)),
+            max_host_mem_bytes=int(110 * (1 << 30)),
+        )
+    """
+    from flextrain.io.arch import get_arch_module
+
+    arch_module = get_arch_module(arch)
+    expanded_dims = arch_module.expand_dims(dims)
+    hp = dict(arch_module.default_hyperparams())
+    if hyperparams is not None:
+        hp.update(hyperparams)
+    build_block = arch_module.BLOCK_BUILDER
+
+    am, _ = _build_active_model(
+        dims=expanded_dims,
+        hyperparams=hp,
+        build_block=build_block,
+        hf_config={},
+        optimizer=optimizer,
+        max_seq_len=max_seq_len,
+        max_global_batch_tokens=max_global_batch_tokens,
+        max_gpu_mem_bytes=max_gpu_mem_bytes,
+        max_host_mem_bytes=max_host_mem_bytes,
+        leeway_gpu_mem_bytes=leeway_gpu_mem_bytes,
+        leeway_host_mem_bytes=leeway_host_mem_bytes,
+        compute_dtype=compute_dtype,
+        master_dtype=master_dtype,
+        grad_dtype=grad_dtype,
+        norm_grad_dtype=norm_grad_dtype,
+        lora_targets=lora_targets,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
+        lora_adapter_compute_dtype=lora_adapter_compute_dtype,
+        lora_adapter_master_dtype=lora_adapter_master_dtype,
+        lora_adapter_grad_dtype=lora_adapter_grad_dtype,
+        lora_adapter_opt_state_dtype=lora_adapter_opt_state_dtype,
+        hw_cost=hw_cost,
+        mem_bw_gbps=mem_bw_gbps,
+        fixed_seq_len=fixed_seq_len,
+        force_saved_act_level=force_saved_act_level,
+        head_chunk_size=head_chunk_size,
+        min_chunk_size=min_chunk_size,
+        max_chunk_size=max_chunk_size,
+        moe_backend=moe_backend,
+        device=device,
+        verbose=verbose,
+        verbose_label="from_dims",
+    )
+
+    if verbose:
+        import sys
+        print(
+            f"[from_dims] Random-initializing weights "
+            f"(seed={init_seed}, std={init_std})...",
+            flush=True, file=sys.stderr,
+        )
+    _init_random_weights(am, seed=init_seed, std=init_std)
+    if lora_targets is not None:
+        _init_lora_params(am, seed=lora_init_seed, a_std=lora_a_std)
+    return am
 
 
 def _arch_module_for(hf_config: Mapping):
@@ -571,6 +829,7 @@ def _dtype_name_from_torch(dt: torch.dtype) -> str:
 __all__ = [
     "BuildContext",
     "BlockBuilder",
+    "from_dims",
     "from_pretrained",
     "register_block_builder",
 ]

@@ -218,6 +218,55 @@ QWEN3_MOE_ARCH = ArchSpec(
 register_arch(QWEN3_MOE_ARCH)
 
 
+ARCH_NAME = "qwen3_moe"
+
+
+_REQUIRED_DIMS = (
+    "vocab_size", "n_layers", "d_model", "n_heads", "head_dim", "expert_dim",
+    "num_routed_experts", "top_k",
+)
+_DEFAULT_DATATYPES = {
+    "embed": "bfloat16", "head_proj": "bfloat16", "attn_proj": "bfloat16",
+    "expert_proj": "bfloat16", "router": "bfloat16", "norm": "bfloat16",
+    "residual": "bfloat16",
+}
+
+
+def expand_dims(dims) -> dict:
+    """Qwen3-MoE dims schema = Llama + ``num_routed_experts`` +
+    ``top_k``, no shared expert. ``expert_dim`` is the per-expert FFN
+    intermediate size (HF ``moe_intermediate_size``)."""
+    out = dict(dims)
+    missing = [k for k in _REQUIRED_DIMS if k not in out]
+    if missing:
+        raise KeyError(
+            f"qwen3_moe dims missing required keys: {missing}. "
+            f"Got keys: {sorted(out)}"
+        )
+    out.setdefault("n_kv_heads", out["n_heads"])
+    out.setdefault("num_shared_experts", 0)
+    out.setdefault("is_causal", True)
+    out.setdefault("datatypes", dict(_DEFAULT_DATATYPES))
+    out["attn_dim"] = int(out["n_heads"]) * int(out["head_dim"])
+    out["kv_dim"] = int(out["n_kv_heads"]) * int(out["head_dim"])
+    return out
+
+
+def default_hyperparams() -> dict:
+    """Qwen3-MoE defaults: eps=1e-6, rope=1e6, aux-loss 0.001,
+    ``topk_then_softmax`` routing (``norm_topk_prob=True`` matches the
+    Qwen3-MoE checkpoints)."""
+    return {
+        "rms_norm_eps": 1e-6,
+        "rope_theta": 1_000_000.0,
+        "rope_scaling": None,
+        "window_size_left": -1,
+        "window_size_right": 0,
+        "load_balance_coef": 0.001,
+        "routing_mode": "topk_then_softmax",
+    }
+
+
 def hf_config_to_flextrain(hf_config: Any) -> dict:
     get = (
         (lambda k, default=None: getattr(hf_config, k, default))
@@ -324,6 +373,9 @@ def post_load_permute(am, hf_config, dims, hyperparams):
 def _register_builder() -> None:
     from flextrain.api import register_block_builder
     register_block_builder(("Qwen3MoeForCausalLM",), _qwen3_moe_block_builder)
+
+
+BLOCK_BUILDER = _qwen3_moe_block_builder
 
 
 _register_builder()

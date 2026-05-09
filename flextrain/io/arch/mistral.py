@@ -84,6 +84,54 @@ MISTRAL_ARCH = ArchSpec(
 register_arch(MISTRAL_ARCH)
 
 
+ARCH_NAME = "mistral"
+
+
+_REQUIRED_DIMS = (
+    "vocab_size", "n_layers", "d_model", "n_heads", "head_dim", "expert_dim",
+)
+_DEFAULT_DATATYPES = {
+    "embed": "bfloat16", "head_proj": "bfloat16", "attn_proj": "bfloat16",
+    "expert_proj": "bfloat16", "router": "bfloat16", "norm": "bfloat16",
+    "residual": "bfloat16",
+}
+
+
+def expand_dims(dims) -> dict:
+    """Mistral dims schema = Llama dims schema. Tensor layout is
+    identical; only sliding-window attention differs (lives in
+    hyperparams)."""
+    out = dict(dims)
+    missing = [k for k in _REQUIRED_DIMS if k not in out]
+    if missing:
+        raise KeyError(
+            f"mistral dims missing required keys: {missing}. "
+            f"Got keys: {sorted(out)}"
+        )
+    out.setdefault("n_kv_heads", out["n_heads"])
+    out.setdefault("num_shared_experts", 1)
+    out.setdefault("num_routed_experts", 0)
+    out.setdefault("top_k", 0)
+    out.setdefault("is_causal", True)
+    out.setdefault("datatypes", dict(_DEFAULT_DATATYPES))
+    out["attn_dim"] = int(out["n_heads"]) * int(out["head_dim"])
+    out["kv_dim"] = int(out["n_kv_heads"]) * int(out["head_dim"])
+    return out
+
+
+def default_hyperparams() -> dict:
+    """Mistral defaults: eps=1e-5, rope=10k. ``window_size_left=None``
+    means full-context attention (Mistral-7B-v0.3 and later); pass an
+    integer to opt into sliding-window."""
+    return {
+        "rms_norm_eps": 1e-5,
+        "rope_theta": 10000.0,
+        "rope_scaling": None,
+        "window_size_left": None,
+        "window_size_right": 0,
+    }
+
+
 def hf_config_to_flextrain(hf_config: Any) -> dict:
     get = (
         (lambda k, default=None: getattr(hf_config, k, default))
@@ -206,6 +254,9 @@ def post_load_permute(am, hf_config, dims, hyperparams):
 def _register_builder() -> None:
     from flextrain.api import register_block_builder
     register_block_builder(("MistralForCausalLM",), _mistral_block_builder)
+
+
+BLOCK_BUILDER = _mistral_block_builder
 
 
 _register_builder()
