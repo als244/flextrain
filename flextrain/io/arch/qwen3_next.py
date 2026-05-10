@@ -428,6 +428,129 @@ QWEN3_NEXT_ARCH = ArchSpec(
 register_arch(QWEN3_NEXT_ARCH)
 
 
+ARCH_NAME = "qwen3_next"
+
+
+_REQUIRED_DIMS = (
+    "vocab_size", "n_layers", "d_model", "n_heads", "head_dim", "expert_dim",
+    "num_routed_experts", "top_k",
+)
+_DEFAULT_DATATYPES = {
+    "embed": "bfloat16", "head_proj": "bfloat16", "attn_proj": "bfloat16",
+    "expert_proj": "bfloat16", "router": "bfloat16", "norm": "bfloat16",
+    "residual": "bfloat16",
+}
+
+
+def expand_dims(dims) -> dict:
+    """Qwen3-Next dims schema: like Qwen3.5-MoE but with the
+    Qwen3-Next-specific 47-1 hybrid pattern by convention. Defaults
+    target the published Qwen3-Next-A30B reference shape.
+    """
+    out = dict(dims)
+    missing = [k for k in _REQUIRED_DIMS if k not in out]
+    if missing:
+        raise KeyError(
+            f"qwen3_next dims missing required keys: {missing}. "
+            f"Got keys: {sorted(out)}"
+        )
+    out.setdefault("n_kv_heads", out["n_heads"])
+    out.setdefault("is_causal", True)
+    out.setdefault("datatypes", dict(_DEFAULT_DATATYPES))
+    sed = int(out.get("shared_expert_dim", 512))
+    out.setdefault("shared_expert_dim", sed)
+    out.setdefault("num_shared_experts", 1 if sed > 0 else 0)
+    out.setdefault("partial_rotary_factor", 0.25)
+    out.setdefault("linear_num_v_heads", 32)
+    out.setdefault("linear_num_k_heads", 16)
+    out.setdefault("linear_head_k_dim", 128)
+    out.setdefault("linear_head_v_dim", 128)
+    out.setdefault("linear_conv_kernel", 4)
+    out["attn_dim"] = int(out["n_heads"]) * int(out["head_dim"])
+    out["kv_dim"] = int(out["n_kv_heads"]) * int(out["head_dim"])
+    nv = int(out["linear_num_v_heads"])
+    nk = int(out["linear_num_k_heads"])
+    hk = int(out["linear_head_k_dim"])
+    hv = int(out["linear_head_v_dim"])
+    ck = int(out["linear_conv_kernel"])
+    key_dim = nk * hk
+    value_dim = nv * hv
+    out.setdefault("num_v_heads", nv)
+    out.setdefault("num_k_heads", nk)
+    out.setdefault("head_k_dim", hk)
+    out.setdefault("head_v_dim", hv)
+    out.setdefault("key_dim", key_dim)
+    out.setdefault("value_dim", value_dim)
+    out.setdefault("conv_dim", 2 * key_dim + value_dim)
+    out.setdefault("proj_qkvz_dim", 2 * key_dim + 2 * value_dim)
+    out.setdefault("proj_ba_dim", 2 * nv)
+    out.setdefault("conv_kernel_size", ck)
+    return out
+
+
+def default_hyperparams() -> dict:
+    """Qwen3-Next defaults: eps=1e-6, rope=1e7, aux-loss 0.001,
+    ``topk_then_softmax``. ``layer_types=None`` ⇒ caller supplies via
+    ``hyperparams`` or shorthand ``dims["layer_pattern"]``."""
+    return {
+        "rms_norm_eps": 1e-6,
+        "rope_theta": 10_000_000.0,
+        "rope_scaling": None,
+        "partial_rotary_factor": 0.25,
+        "load_balance_coef": 0.001,
+        "routing_mode": "topk_then_softmax",
+        "layer_types": None,
+        "decoder_sparse_step": 1,
+    }
+
+
+def flextrain_to_hf_config(dims, hyperparams=None) -> dict:
+    """Inverse mapping for Qwen3-Next."""
+    hp = dict(default_hyperparams())
+    if hyperparams:
+        hp.update(hyperparams)
+    d = expand_dims(dims)
+    norm_topk = (hp.get("routing_mode") == "topk_then_softmax")
+    cfg = {
+        "architectures": ["Qwen3NextForCausalLM"],
+        "model_type": "qwen3_next",
+        "vocab_size": int(d["vocab_size"]),
+        "num_hidden_layers": int(d["n_layers"]),
+        "hidden_size": int(d["d_model"]),
+        "num_attention_heads": int(d["n_heads"]),
+        "num_key_value_heads": int(d["n_kv_heads"]),
+        "head_dim": int(d["head_dim"]),
+        "moe_intermediate_size": int(d["expert_dim"]),
+        "num_experts": int(d["num_routed_experts"]),
+        "num_experts_per_tok": int(d["top_k"]),
+        "norm_topk_prob": norm_topk,
+        "router_aux_loss_coef": float(hp.get("load_balance_coef", 0.001)),
+        "linear_num_value_heads": int(d["linear_num_v_heads"]),
+        "linear_num_key_heads": int(d["linear_num_k_heads"]),
+        "linear_key_head_dim": int(d["linear_head_k_dim"]),
+        "linear_value_head_dim": int(d["linear_head_v_dim"]),
+        "linear_conv_kernel_dim": int(d["linear_conv_kernel"]),
+        "rms_norm_eps": float(hp["rms_norm_eps"]),
+        "rope_theta": float(hp["rope_theta"]),
+        "rope_scaling": hp.get("rope_scaling"),
+        "partial_rotary_factor": float(hp["partial_rotary_factor"]),
+        "max_position_embeddings": 32768,
+        "hidden_act": "silu",
+        "tie_word_embeddings": False,
+        "attention_bias": False,
+        "initializer_range": 0.02,
+        "torch_dtype": "bfloat16",
+        "use_cache": True,
+        "decoder_sparse_step": int(hp.get("decoder_sparse_step", 1)),
+    }
+    sed = int(d.get("shared_expert_dim", 0))
+    if sed > 0:
+        cfg["shared_expert_intermediate_size"] = sed
+    if hp.get("layer_types"):
+        cfg["layer_types"] = list(hp["layer_types"])
+    return cfg
+
+
 def hf_config_to_flextrain(hf_config: Any) -> dict:
     get = (
         (lambda k, default=None: getattr(hf_config, k, default))
@@ -489,3 +612,110 @@ def hf_config_to_hyperparams(hf_config: Any) -> dict:
         "layer_types": get("layer_types"),
         "decoder_sparse_step": get("decoder_sparse_step", 1),
     }
+
+
+# ---------------------------------------------------------------------------
+# Block builder. Reuses Qwen3NextLinearLayer / Qwen3NextFullLayer
+# (the same classes Qwen3.5-MoE uses — math is identical across both
+# arches per the existing comment in qwen3_5_moe.py:689-691).
+# ---------------------------------------------------------------------------
+
+
+def _qwen3_next_block_builder(layer_idx: int, ctx) -> object:
+    from flextrain.nn.layers.qwen3_next import (
+        Qwen3NextLayerConfig, Qwen3NextLinearLayer, Qwen3NextFullLayer,
+    )
+
+    dims = ctx.dims
+    hp = ctx.hyperparams
+    layer_types = hp.get("layer_types") or []
+    if layer_idx >= len(layer_types):
+        raise ValueError(
+            f"qwen3_next layer {layer_idx}: layer_types list has only "
+            f"{len(layer_types)} entries"
+        )
+    is_full = (layer_types[layer_idx] == "full_attention")
+
+    block_cfg = Qwen3NextLayerConfig(
+        d_model=int(dims["d_model"]),
+        n_heads=int(dims["n_heads"]),
+        n_kv_heads=int(dims["n_kv_heads"]),
+        head_dim=int(dims["head_dim"]),
+        expert_dim=int(dims["expert_dim"]),
+        num_experts=int(dims.get("num_routed_experts", 256)),
+        top_k=int(dims.get("top_k", 8)),
+        linear_num_v_heads=int(dims.get("linear_num_v_heads", 32)),
+        linear_num_k_heads=int(dims.get("linear_num_k_heads", 16)),
+        linear_head_k_dim=int(dims.get("linear_head_k_dim", 128)),
+        linear_head_v_dim=int(dims.get("linear_head_v_dim", 128)),
+        linear_conv_kernel=int(dims.get("linear_conv_kernel", 4)),
+        partial_rotary_factor=float(hp.get("partial_rotary_factor", 0.25)),
+        num_shared_experts=int(dims.get("num_shared_experts", 1)),
+        shared_expert_dim=int(dims.get("shared_expert_dim", 512)),
+        rms_norm_eps=float(hp.get("rms_norm_eps", 1e-6)),
+        rope_base=float(hp.get("rope_theta", 10_000_000.0)),
+        is_causal=True,
+        load_balance_coef=float(hp.get("load_balance_coef", 0.001)),
+        routing_mode=hp.get("routing_mode", "topk_then_softmax"),
+        compute_dtype=ctx.compute_dtype,
+        master_dtype=ctx.master_dtype,
+        grad_dtype=ctx.grad_dtype,
+        norm_grad_dtype=ctx.norm_grad_dtype,
+    )
+
+    moe_backend = getattr(ctx, "moe_backend", None)
+    if is_full:
+        base = Qwen3NextFullLayer(
+            layer_id=layer_idx, cfg=block_cfg, expert_compute=moe_backend,
+        )
+    else:
+        base = Qwen3NextLinearLayer(
+            layer_id=layer_idx, cfg=block_cfg, expert_compute=moe_backend,
+        )
+
+    if not ctx.lora_targets:
+        return base
+    # Same per-layer LoRA-target filtering as Qwen3.5-MoE (linear layers
+    # have no w_q/w_k/w_v/w_o, so an attn-only target list would error
+    # there). Mirror HF PEFT's per-layer auto-skip semantics.
+    from flextrain.nn.layers.lora_wrapper import (
+        LoRAWrapperLayer, _discover_lora_eligible_names,
+    )
+    layer_dims = dict(
+        dims,
+        attn_dim=int(dims["n_heads"]) * int(dims["head_dim"]),
+        kv_dim=int(dims["n_kv_heads"]) * int(dims["head_dim"]),
+    )
+    if ctx.lora_targets != "all" and ctx.lora_targets is not None:
+        eligible = set(_discover_lora_eligible_names(base.param_spec, layer_dims))
+        kept = tuple(t for t in ctx.lora_targets if t in eligible)
+        if not kept:
+            from dataclasses import replace as _replace
+            from flextrain.core.layer import ParamSpec
+            base.param_spec = ParamSpec(tensors=tuple(
+                _replace(t, frozen=True) for t in base.param_spec.tensors
+            ))
+            return base
+        targets_for_layer: object = kept
+    else:
+        targets_for_layer = ctx.lora_targets
+    return LoRAWrapperLayer(
+        base, lora_targets=targets_for_layer,
+        rank=ctx.lora_rank, alpha=ctx.lora_alpha,
+        adapter_compute_dtype=ctx.lora_adapter_compute_dtype,
+        adapter_master_dtype=ctx.lora_adapter_master_dtype,
+        adapter_grad_dtype=ctx.lora_adapter_grad_dtype,
+        adapter_opt_state_dtype=ctx.lora_adapter_opt_state_dtype,
+        layer_dims=layer_dims,
+    )
+
+
+def _register_builder() -> None:
+    from flextrain.api import register_block_builder
+    register_block_builder(("Qwen3NextForCausalLM",), _qwen3_next_block_builder)
+
+
+_register_builder()
+
+
+BLOCK_BUILDER = _qwen3_next_block_builder

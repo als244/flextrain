@@ -39,7 +39,7 @@ Semantics preserved from orig
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Mapping, MutableMapping as MutableMappingT, Sequence as _Seq
+from typing import Any, Mapping, Sequence as _Seq
 
 import numpy as np
 import torch
@@ -464,7 +464,7 @@ class ActiveModel:
                 self.buffers.gpu_embed_params,
                 self.buffers.gpu_embed_grads,
                 host_master=self.buffers.host_embed_params,
-                host_opt=self.buffers.host_embed_opt.host,
+                gpu_opt=self.buffers.gpu_embed_opt,
                 step_num=step_num,
                 mirror_host=True,
             )
@@ -476,7 +476,7 @@ class ActiveModel:
                 self.buffers.gpu_head_params,
                 self.buffers.gpu_head_grads,
                 host_master=self.buffers.host_head_params,
-                host_opt=self.buffers.host_head_opt.host,
+                gpu_opt=self.buffers.gpu_head_opt,
                 step_num=step_num,
                 mirror_host=True,
             )
@@ -664,48 +664,32 @@ class ActiveModel:
         grads: Mapping[str, torch.Tensor],
         *,
         host_master: Mapping[str, torch.Tensor],
-        host_opt: MutableMappingT,
+        gpu_opt: Mapping[str, torch.Tensor],
         step_num: int,
         mirror_host: bool,
     ) -> int:
-        """Step an embed / head layer whose weights are always resident.
-        Their opt-state lives host-side; we stage it to GPU temporarily.
+        """Step an embed / head layer whose weights AND opt-state are
+        GPU-resident. Master mirror to host happens post-step so
+        ``host_*_params`` stays in sync for save / parity paths.
 
         The activation ring is NOT touched here (embed/head step runs
         BEFORE we swap the ring to opt-state mode).
         """
-        # Allocate a transient GPU opt-state dict matching the shape /
-        # dtype of the host opt-state. This is tiny (embed + head
-        # are small) so we just torch.empty_like on the device side
-        # and copy from host. Uses default stream (simplest) and we
-        # just sync at the end to be safe.
-        dev_opt: dict[str, torch.Tensor] = {}
-        for name, host_t in host_opt.items():
-            d = torch.empty(
-                host_t.shape, dtype=host_t.dtype, device=self.device
-            )
-            d.copy_(host_t)  # blocking on default stream — tiny tensors
-            dev_opt[name] = d
-
         ret = self.optimizer.step(
-            param_spec, weights, grads, dev_opt, step_num=step_num
+            param_spec, weights, grads, gpu_opt, step_num=step_num
         )
         if ret:
             return ret
 
-        # Mirror updated state back to host (blocking — these are tiny).
-        # Skip frozen tensors (their master / opt-state never changed,
-        # the copy would be a no-op transfer).
+        # Mirror updated master back to host (blocking — these are tiny).
+        # Skip frozen tensors (their master never changed). Opt-state is
+        # GPU-canonical so no opt mirror needed.
         if mirror_host:
             frozen_names = {t.name for t in param_spec.tensors if t.frozen}
             for name, t in weights.items():
                 if name in frozen_names:
                     continue
                 host_master[name].copy_(t)
-            for name, t in dev_opt.items():
-                # Opt-state names are e.g. "o_m_q" — strip the trailing
-                # weight name to test against frozen_names.
-                host_opt[name].copy_(t)
         torch.cuda.synchronize()
         return 0
 

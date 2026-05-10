@@ -605,6 +605,142 @@ def _text_cfg(hf_config):
     return getattr(hf_config, "text_config", hf_config)
 
 
+ARCH_NAME = "qwen3_5_moe"
+
+
+_REQUIRED_DIMS = (
+    "vocab_size", "n_layers", "d_model", "n_heads", "head_dim", "expert_dim",
+    "num_routed_experts", "top_k",
+)
+_DEFAULT_DATATYPES = {
+    "embed": "bfloat16", "head_proj": "bfloat16", "attn_proj": "bfloat16",
+    "expert_proj": "bfloat16", "router": "bfloat16", "norm": "bfloat16",
+    "residual": "bfloat16",
+}
+
+
+def expand_dims(dims) -> dict:
+    """Qwen3.5-MoE dims schema = Qwen3-MoE + linear-attn primaries +
+    optional shared expert + optional ``layer_pattern`` shorthand.
+
+    Required: ``vocab_size, n_layers, d_model, n_heads, head_dim,
+    expert_dim, num_routed_experts, top_k``.
+
+    Linear-attn primary defaults match the Qwen3.5-MoE reference:
+    ``linear_num_v_heads=32``, ``linear_num_k_heads=16``,
+    ``linear_head_k_dim=128``, ``linear_head_v_dim=128``,
+    ``linear_conv_kernel=4``.
+
+    Shared expert: pass ``shared_expert_dim=<int>``; ``num_shared_experts``
+    is auto-set from ``shared_expert_dim > 0``.
+    """
+    out = dict(dims)
+    missing = [k for k in _REQUIRED_DIMS if k not in out]
+    if missing:
+        raise KeyError(
+            f"qwen3_5_moe dims missing required keys: {missing}. "
+            f"Got keys: {sorted(out)}"
+        )
+    out.setdefault("n_kv_heads", out["n_heads"])
+    out.setdefault("is_causal", True)
+    out.setdefault("datatypes", dict(_DEFAULT_DATATYPES))
+    sed = int(out.get("shared_expert_dim", 0))
+    out.setdefault("num_shared_experts", 1 if sed > 0 else 0)
+    out.setdefault("partial_rotary_factor", 0.25)
+    out.setdefault("linear_num_v_heads", 32)
+    out.setdefault("linear_num_k_heads", 16)
+    out.setdefault("linear_head_k_dim", 128)
+    out.setdefault("linear_head_v_dim", 128)
+    out.setdefault("linear_conv_kernel", 4)
+    out["attn_dim"] = int(out["n_heads"]) * int(out["head_dim"])
+    out["kv_dim"] = int(out["n_kv_heads"]) * int(out["head_dim"])
+    nv = int(out["linear_num_v_heads"])
+    nk = int(out["linear_num_k_heads"])
+    hk = int(out["linear_head_k_dim"])
+    hv = int(out["linear_head_v_dim"])
+    ck = int(out["linear_conv_kernel"])
+    key_dim = nk * hk
+    value_dim = nv * hv
+    out.setdefault("num_v_heads", nv)
+    out.setdefault("num_k_heads", nk)
+    out.setdefault("head_k_dim", hk)
+    out.setdefault("head_v_dim", hv)
+    out.setdefault("key_dim", key_dim)
+    out.setdefault("value_dim", value_dim)
+    out.setdefault("conv_dim", 2 * key_dim + value_dim)
+    out.setdefault("proj_qkvz_dim", 2 * key_dim + 2 * value_dim)
+    out.setdefault("proj_ba_dim", 2 * nv)
+    out.setdefault("conv_kernel_size", ck)
+    return out
+
+
+def default_hyperparams() -> dict:
+    """Qwen3.5-MoE defaults: eps=1e-6, rope=1e7, aux-loss 0.001, routing
+    ``topk_then_softmax`` (matches ``norm_topk_prob=True`` on the
+    reference checkpoint). ``layer_types=None`` → caller supplies it
+    via ``hyperparams`` or ``dims["layer_pattern"]``."""
+    return {
+        "rms_norm_eps": 1e-6,
+        "rope_theta": 10_000_000.0,
+        "rope_scaling": None,
+        "partial_rotary_factor": 0.25,
+        "load_balance_coef": 0.001,
+        "routing_mode": "topk_then_softmax",
+        "layer_types": None,
+        "full_attention_interval": None,
+        "attn_output_gate": True,
+    }
+
+
+def flextrain_to_hf_config(dims, hyperparams=None) -> dict:
+    """Inverse mapping for Qwen3.5-MoE."""
+    hp = dict(default_hyperparams())
+    if hyperparams:
+        hp.update(hyperparams)
+    d = expand_dims(dims)
+    norm_topk = (hp.get("routing_mode") == "topk_then_softmax")
+    cfg = {
+        "architectures": ["Qwen3_5MoeForCausalLM"],
+        "model_type": "qwen3_5_moe",
+        "vocab_size": int(d["vocab_size"]),
+        "num_hidden_layers": int(d["n_layers"]),
+        "hidden_size": int(d["d_model"]),
+        "num_attention_heads": int(d["n_heads"]),
+        "num_key_value_heads": int(d["n_kv_heads"]),
+        "head_dim": int(d["head_dim"]),
+        "moe_intermediate_size": int(d["expert_dim"]),
+        "num_experts": int(d["num_routed_experts"]),
+        "num_experts_per_tok": int(d["top_k"]),
+        "norm_topk_prob": norm_topk,
+        "router_aux_loss_coef": float(hp.get("load_balance_coef", 0.001)),
+        "linear_num_value_heads": int(d["linear_num_v_heads"]),
+        "linear_num_key_heads": int(d["linear_num_k_heads"]),
+        "linear_key_head_dim": int(d["linear_head_k_dim"]),
+        "linear_value_head_dim": int(d["linear_head_v_dim"]),
+        "linear_conv_kernel_dim": int(d["linear_conv_kernel"]),
+        "rms_norm_eps": float(hp["rms_norm_eps"]),
+        "rope_theta": float(hp["rope_theta"]),
+        "rope_scaling": hp.get("rope_scaling"),
+        "partial_rotary_factor": float(hp["partial_rotary_factor"]),
+        "max_position_embeddings": 32768,
+        "hidden_act": "silu",
+        "tie_word_embeddings": False,
+        "attention_bias": False,
+        "attn_output_gate": bool(hp.get("attn_output_gate", True)),
+        "initializer_range": 0.02,
+        "torch_dtype": "bfloat16",
+        "use_cache": True,
+    }
+    sed = int(d.get("shared_expert_dim", 0))
+    if sed > 0:
+        cfg["shared_expert_intermediate_size"] = sed
+    if hp.get("layer_types"):
+        cfg["layer_types"] = list(hp["layer_types"])
+    if hp.get("full_attention_interval") is not None:
+        cfg["full_attention_interval"] = int(hp["full_attention_interval"])
+    return cfg
+
+
 def hf_config_to_flextrain(hf_config: Any) -> dict:
     tc = _text_cfg(hf_config)
     g = (tc.get if isinstance(tc, dict) else lambda k, default=None: getattr(tc, k, default))
@@ -887,3 +1023,8 @@ def _register_builder() -> None:
 
 
 _register_builder()
+
+
+# Public block-builder symbol exposed for ``flextrain.from_dims`` via
+# ``flextrain.io.arch.ARCH_MODULES`` short-name lookup.
+BLOCK_BUILDER = _qwen3_5_moe_block_builder

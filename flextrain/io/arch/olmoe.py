@@ -278,6 +278,41 @@ def default_hyperparams() -> dict:
     }
 
 
+def flextrain_to_hf_config(dims, hyperparams=None) -> dict:
+    """Inverse mapping for OLMoE. ``intermediate_size`` is the per-expert
+    FFN dim (HF stores it under ``intermediate_size`` for OLMoE — same
+    field name as dense models, no separate ``moe_intermediate_size``)."""
+    hp = dict(default_hyperparams())
+    if hyperparams:
+        hp.update(hyperparams)
+    d = expand_dims(dims)
+    norm_topk = (hp.get("routing_mode") == "topk_then_softmax")
+    return {
+        "architectures": ["OlmoeForCausalLM"],
+        "model_type": "olmoe",
+        "vocab_size": int(d["vocab_size"]),
+        "num_hidden_layers": int(d["n_layers"]),
+        "hidden_size": int(d["d_model"]),
+        "num_attention_heads": int(d["n_heads"]),
+        "num_key_value_heads": int(d["n_kv_heads"]),
+        "head_dim": int(d["head_dim"]),
+        "intermediate_size": int(d["expert_dim"]),
+        "num_experts": int(d["num_routed_experts"]),
+        "num_experts_per_tok": int(d["top_k"]),
+        "norm_topk_prob": norm_topk,
+        "router_aux_loss_coef": float(hp.get("load_balance_coef", 0.01)),
+        "rms_norm_eps": float(hp["rms_norm_eps"]),
+        "rope_theta": float(hp["rope_theta"]),
+        "rope_scaling": hp.get("rope_scaling"),
+        "max_position_embeddings": 4096,
+        "hidden_act": "silu",
+        "tie_word_embeddings": False,
+        "initializer_range": 0.02,
+        "torch_dtype": "bfloat16",
+        "use_cache": True,
+    }
+
+
 def hf_config_to_flextrain(hf_config: Any) -> dict:
     """OLMoE ``config.json`` → FlexTrain dims dict."""
     get = (

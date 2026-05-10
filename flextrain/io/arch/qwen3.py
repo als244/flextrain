@@ -171,6 +171,41 @@ def default_hyperparams() -> dict:
     }
 
 
+def flextrain_to_hf_config(dims, hyperparams=None) -> dict:
+    """Inverse mapping for Qwen3 dense. Emits ``sliding_window`` only
+    when the user enabled it (``window_size_left > 0``)."""
+    hp = dict(default_hyperparams())
+    if hyperparams:
+        hp.update(hyperparams)
+    d = expand_dims(dims)
+    cfg = {
+        "architectures": ["Qwen3ForCausalLM"],
+        "model_type": "qwen3",
+        "vocab_size": int(d["vocab_size"]),
+        "num_hidden_layers": int(d["n_layers"]),
+        "hidden_size": int(d["d_model"]),
+        "num_attention_heads": int(d["n_heads"]),
+        "num_key_value_heads": int(d["n_kv_heads"]),
+        "head_dim": int(d["head_dim"]),
+        "intermediate_size": int(d["expert_dim"]),
+        "rms_norm_eps": float(hp["rms_norm_eps"]),
+        "rope_theta": float(hp["rope_theta"]),
+        "rope_scaling": hp.get("rope_scaling"),
+        "max_position_embeddings": 32768,
+        "hidden_act": "silu",
+        "tie_word_embeddings": False,
+        "attention_bias": False,
+        "initializer_range": 0.02,
+        "torch_dtype": "bfloat16",
+        "use_cache": True,
+    }
+    sw = int(hp.get("window_size_left", -1) or -1)
+    if sw > 0:
+        cfg["sliding_window"] = sw
+        cfg["max_window_layers"] = int(hp.get("max_window_layers", 0))
+    return cfg
+
+
 def hf_config_to_flextrain(hf_config: Any) -> dict:
     """Qwen3 dense ``config.json`` → FlexTrain dims dict."""
     get = (

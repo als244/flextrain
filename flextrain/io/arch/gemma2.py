@@ -171,6 +171,48 @@ def default_hyperparams() -> dict:
     }
 
 
+def flextrain_to_hf_config(dims, hyperparams=None) -> dict:
+    """Inverse mapping for Gemma2. Emits ``layer_types`` when set, soft-cap
+    fields, and ``query_pre_attn_scalar``."""
+    hp = dict(default_hyperparams())
+    if hyperparams:
+        hp.update(hyperparams)
+    d = expand_dims(dims)
+    cfg = {
+        "architectures": ["Gemma2ForCausalLM"],
+        "model_type": "gemma2",
+        "vocab_size": int(d["vocab_size"]),
+        "num_hidden_layers": int(d["n_layers"]),
+        "hidden_size": int(d["d_model"]),
+        "num_attention_heads": int(d["n_heads"]),
+        "num_key_value_heads": int(d["n_kv_heads"]),
+        "head_dim": int(d["head_dim"]),
+        "intermediate_size": int(d["expert_dim"]),
+        "rms_norm_eps": float(hp["rms_norm_eps"]),
+        "rope_theta": float(hp["rope_theta"]),
+        "rope_scaling": hp.get("rope_scaling"),
+        "max_position_embeddings": 8192,
+        "hidden_act": "gelu_pytorch_tanh",
+        "tie_word_embeddings": True,
+        "initializer_range": 0.02,
+        "torch_dtype": "bfloat16",
+        "use_cache": True,
+        "sliding_window": int(hp.get("sliding_window", 4096)),
+        "attn_logit_softcapping": (
+            float(hp["attn_logit_softcap"])
+            if hp.get("attn_logit_softcap") is not None else None
+        ),
+        "final_logit_softcapping": (
+            float(hp["final_logit_softcap"])
+            if hp.get("final_logit_softcap") is not None else None
+        ),
+        "query_pre_attn_scalar": hp.get("query_pre_attn_scalar"),
+    }
+    if hp.get("layer_types"):
+        cfg["layer_types"] = list(hp["layer_types"])
+    return cfg
+
+
 def hf_config_to_flextrain(hf_config: Any) -> dict:
     get = (
         (lambda k, default=None: getattr(hf_config, k, default))

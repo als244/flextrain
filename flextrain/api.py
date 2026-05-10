@@ -192,7 +192,7 @@ def from_pretrained(
     max_gpu_mem_bytes: int,
     max_host_mem_bytes: int,
     device: str = "cuda:0",
-    leeway_gpu_mem_bytes: int = 2 * (1 << 30),
+    leeway_gpu_mem_bytes: int = 3 * (1 << 30),
     leeway_host_mem_bytes: int = 4 * (1 << 30),
     compute_dtype: torch.dtype = torch.bfloat16,
     # Master defaults to compute_dtype (bf16). Override to torch.float32
@@ -629,7 +629,7 @@ def from_dims(
     init_seed: int = 0xF1EC7,
     init_std: float = 0.02,
     device: str = "cuda:0",
-    leeway_gpu_mem_bytes: int = 2 * (1 << 30),
+    leeway_gpu_mem_bytes: int = 3 * (1 << 30),
     leeway_host_mem_bytes: int = 4 * (1 << 30),
     compute_dtype: torch.dtype = torch.bfloat16,
     master_dtype: torch.dtype | None = torch.bfloat16,
@@ -703,13 +703,24 @@ def from_dims(
             max_host_mem_bytes=int(110 * (1 << 30)),
         )
     """
-    from flextrain.io.arch import get_arch_module
+    from flextrain.io.arch import get_arch_module, expand_layer_pattern
 
     arch_module = get_arch_module(arch)
     expanded_dims = arch_module.expand_dims(dims)
     hp = dict(arch_module.default_hyperparams())
     if hyperparams is not None:
         hp.update(hyperparams)
+    # Hybrid-attn shorthand: ``dims["layer_pattern"]`` → ``hp["layer_types"]``.
+    # Explicit ``hyperparams["layer_types"]`` always wins (so callers can
+    # override the shorthand for one-off ablations).
+    if (
+        not hp.get("layer_types")
+        and "layer_pattern" in expanded_dims
+        and expanded_dims["layer_pattern"]
+    ):
+        hp["layer_types"] = expand_layer_pattern(
+            expanded_dims["layer_pattern"], int(expanded_dims["n_layers"]),
+        )
     build_block = arch_module.BLOCK_BUILDER
 
     am, _ = _build_active_model(

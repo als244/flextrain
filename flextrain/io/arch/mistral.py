@@ -132,6 +132,41 @@ def default_hyperparams() -> dict:
     }
 
 
+def flextrain_to_hf_config(dims, hyperparams=None) -> dict:
+    """Inverse of hf_config_to_flextrain / hf_config_to_hyperparams for
+    Mistral. ``window_size_left=None`` ⇒ full-context (sliding_window
+    omitted from the HF config — matches Mistral-7B-v0.3 and later);
+    a positive int sets ``sliding_window``."""
+    hp = dict(default_hyperparams())
+    if hyperparams:
+        hp.update(hyperparams)
+    d = expand_dims(dims)
+    cfg = {
+        "architectures": ["MistralForCausalLM"],
+        "model_type": "mistral",
+        "vocab_size": int(d["vocab_size"]),
+        "num_hidden_layers": int(d["n_layers"]),
+        "hidden_size": int(d["d_model"]),
+        "num_attention_heads": int(d["n_heads"]),
+        "num_key_value_heads": int(d["n_kv_heads"]),
+        "head_dim": int(d["head_dim"]),
+        "intermediate_size": int(d["expert_dim"]),
+        "rms_norm_eps": float(hp["rms_norm_eps"]),
+        "rope_theta": float(hp["rope_theta"]),
+        "rope_scaling": hp.get("rope_scaling"),
+        "max_position_embeddings": 8192,
+        "hidden_act": "silu",
+        "tie_word_embeddings": False,
+        "initializer_range": 0.02,
+        "torch_dtype": "bfloat16",
+        "use_cache": True,
+    }
+    sw = hp.get("window_size_left")
+    if sw is not None and int(sw) > 0:
+        cfg["sliding_window"] = int(sw)
+    return cfg
+
+
 def hf_config_to_flextrain(hf_config: Any) -> dict:
     get = (
         (lambda k, default=None: getattr(hf_config, k, default))

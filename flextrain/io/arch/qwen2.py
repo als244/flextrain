@@ -157,6 +157,36 @@ def default_hyperparams() -> dict:
     }
 
 
+def flextrain_to_hf_config(dims, hyperparams=None) -> dict:
+    """Inverse mapping for Qwen2. ``attention_bias`` mirrors
+    ``dims["qkv_bias"]`` (Qwen2 uses biased Q/K/V projections by default)."""
+    hp = dict(default_hyperparams())
+    if hyperparams:
+        hp.update(hyperparams)
+    d = expand_dims(dims)
+    return {
+        "architectures": ["Qwen2ForCausalLM"],
+        "model_type": "qwen2",
+        "vocab_size": int(d["vocab_size"]),
+        "num_hidden_layers": int(d["n_layers"]),
+        "hidden_size": int(d["d_model"]),
+        "num_attention_heads": int(d["n_heads"]),
+        "num_key_value_heads": int(d["n_kv_heads"]),
+        "head_dim": int(d["head_dim"]),
+        "intermediate_size": int(d["expert_dim"]),
+        "rms_norm_eps": float(hp["rms_norm_eps"]),
+        "rope_theta": float(hp["rope_theta"]),
+        "rope_scaling": hp.get("rope_scaling"),
+        "max_position_embeddings": 32768,
+        "hidden_act": "silu",
+        "tie_word_embeddings": False,
+        "attention_bias": bool(d.get("qkv_bias", True)),
+        "initializer_range": 0.02,
+        "torch_dtype": "bfloat16",
+        "use_cache": True,
+    }
+
+
 def hf_config_to_flextrain(hf_config: Any) -> dict:
     """Qwen2 ``config.json`` → FlexTrain dims dict."""
     get = (

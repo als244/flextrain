@@ -69,7 +69,16 @@ from ._sizing import (
 # transfers can hide behind it. Orig defaulted to 2.
 ARITH_BOUND_FACTOR = 2
 
-DEFAULT_LEEWAY_GPU_BYTES = 2 * (1 << 30)
+# Leeway between the user-supplied ``max_gpu_mem_bytes`` and the budget
+# the solver plans inside. Absorbs three things the est_total formula
+# can't model precisely: (1) PyTorch caching-allocator fragmentation
+# (max_reserved is typically 0.5-2.8 GiB above max_allocated for these
+# workloads, scaling with arch/MoE), (2) CUDA context overhead beyond
+# the constant 1.9 GiB Blackwell baseline, (3) small per-kernel transient
+# allocations the formula misses. Bumped from 2 → 3 GiB on 2026-05 after
+# matrix sweep showed Qwen3-30B-A3B can have caching slop of 2.77 GiB
+# which exceeded the prior 2 GiB leeway.
+DEFAULT_LEEWAY_GPU_BYTES = 3 * (1 << 30)
 DEFAULT_LEEWAY_HOST_BYTES = 10 * (1 << 30)
 
 
@@ -245,8 +254,10 @@ def _baseline_model_memory(
                 emb_grad = embedding_size_bytes(grad_dims)
                 # Endpoints always use AdamW (orig:62)
                 emb_opt = 2 * embedding_size_bytes(opt_dims)
+        # Endpoint opt-state is GPU-resident (gpu_embed_opt); host carries
+        # only master + grad mirrors (host_embed_params / host_embed_grads).
         required_gpu_bytes += emb_master + emb_grad + emb_opt
-        required_host_bytes += emb_master + emb_grad + emb_opt
+        required_host_bytes += emb_master + emb_grad
         embed_bytes = emb_master + emb_grad + emb_opt
 
     if has_head and grad_dims is not None:
@@ -265,7 +276,7 @@ def _baseline_model_memory(
                 head_grad = head_size_bytes(grad_dims)
                 head_opt = 2 * head_size_bytes(opt_dims)
         required_gpu_bytes += head_master + head_grad + head_opt
-        required_host_bytes += head_master + head_grad + head_opt
+        required_host_bytes += head_master + head_grad
         head_bytes = head_master + head_grad + head_opt
 
     # ---- Backbone: training state in host, +1 layer weights+grads on GPU
@@ -378,6 +389,7 @@ def _baseline_gpu_activation_memory(
     num_chunks: int,
     *,
     training_config: Mapping | None,
+    lora_active: bool = False,
 ) -> int:
     """Per-round GPU activation overhead: transition table + (fwd + bwd)
     context windows + per-chunk attn/MLP scratch space. Mirrors orig:168-212.
@@ -408,6 +420,16 @@ def _baseline_gpu_activation_memory(
     attn_workspace = (
         chunk_size * (4 * n_h * hd + 4 * n_kv * hd) * sz_act
     )
+    # FIX (2026-05): flash-attn 2's varlen_bwd allocates an internal
+    # fp32 ``dq_accum`` of shape (total_q + 128*B, n_heads, head_dim)
+    # opaque to flextrain's caller. Memory tracing on Qwen3-30B-A3B at
+    # chunk=65k showed ~1 GiB additional GPU peak attributable to this
+    # buffer — large enough to push aggressive plans (low-tier saves
+    # near the cap) past the hardware budget. Account for it explicitly
+    # so the planner picks plans that fit. fp32 (4 bytes) regardless of
+    # ``sz_act``.
+    if training_config is not None:
+        attn_workspace += chunk_size * n_h * hd * 4
 
     # Per-chunk linear-attention scratch workspace (Qwen3-Next /
     # Qwen3.5* / Qwen3.6* hybrid layers). Not all archs have linear-attn
@@ -532,33 +554,75 @@ def _baseline_gpu_activation_memory(
     expert_dim = model_dims["expert_dim"]
     top_k = model_dims["top_k"]
     num_routed = model_dims["num_routed_experts"]
+
+    # Forward-recompute outputs that persist in ``slot.aux`` throughout
+    # the layer's bwd, regardless of dense / MoE / hybrid:
+    #   * recompute_attn_norm_output (T, d) bf16
+    #   * recompute_ffn_norm_output  (T, d) bf16
+    # Both alive simultaneously during attn.bwd (the second is consumed
+    # mid-bwd but the first stays). Empirically confirmed by per-substep
+    # memory tracing — solver formula previously counted only one
+    # (mislabeled "attn norm output") in the MoE branch and zero in the
+    # dense branch.
+    recompute_persistent_bytes = 2 * chunk_size * d * sz_act
+
     if num_routed > 0:
         # MoE bwd workspace at TK = chunk_size * top_k slots:
-        #   * attn norm output:      (chunk_size, d) — fwd input ref
         #   * scattered_x:           (TK, d) bf16
         #   * scattered_upstream:    (TK, d) bf16 — read-only across loop
         #   * dx_up_up_grouped:      (TK, 2F) bf16 — survives loop so the
         #                            LoRA wgrad finalize can read it.
         #   * dx_pre_grouped:        (TK, d) bf16 — gather sources from
         #                            this; loop writes per-expert.
-        # = chunk_size * d (attn norm) + TK * (d + d + 2F + d)
-        # = chunk_size * d + chunk_size * top_k * (3*d + 2F)
+        # = TK * (d + d + 2F + d) = chunk_size * top_k * (3*d + 2F)
         mlp_workspace = (
-            chunk_size * d * sz_act
+            recompute_persistent_bytes
             + chunk_size * top_k * (3 * d + 2 * expert_dim) * sz_act
         )
         # Intra-expert backprop scratch: per-stream X_temp carries
         # dx_act_up (T_e, F) + fwd_act (T_e, F) = (T_e, 2F) per stream.
         avg_tokens = int(chunk_size * top_k / num_routed)
         mlp_workspace += 2 * avg_tokens * 2 * expert_dim * sz_act
+        # MoE-bwd return values that live until backward_dgrad returns:
+        #   * dx (T, d) bf16: ``moe_backend.py:513`` allocates
+        #     ``dx = torch.empty_like(dy)`` when caller doesn't supply.
+        #   * dlogits (T, num_routed) bf16: ``full_moe.py:308``
+        #     ``zeros((T, num_routed))``.
+        mlp_workspace += chunk_size * d * sz_act              # +dx
+        mlp_workspace += chunk_size * num_routed * sz_act     # +dlogits
     else:
-        # dense bwd: (d_act_upstream, fwd_act, dx1_up, dx3_up)
-        mlp_workspace = chunk_size * 4 * expert_dim * sz_act
+        # Dense bwd:
+        #   * 4 FFN scratch buffers (d_act_upstream, fwd_act, dx1_up, dx3_up)
+        #   * recompute_persistent_bytes (recompute_attn_norm_output +
+        #     recompute_ffn_norm_output) — same as MoE; lives in
+        #     ``slot.aux`` through layer bwd. Empirically: dense was
+        #     under-estimated by ~0.5-1.0 GiB at chunk=65k for d_model
+        #     2k-4k before this term was added.
+        mlp_workspace = (
+            recompute_persistent_bytes
+            + chunk_size * 4 * expert_dim * sz_act
+        )
 
     # Residual scratch (1 chunk at a time on device during bwd).
     resid_workspace = chunk_size * d * sz_act
 
-    bytes_used += resid_workspace + max(attn_workspace, mlp_workspace)
+    # FIX (2026-05): for routed-MoE LoRA-all training, attn.bwd and
+    # mlp.bwd are NOT mutually exclusive in time. The MoE block's
+    # ``ffn.bwd`` populates ``lora_capture`` (``moe_backend.py:504-508``)
+    # with ``scattered_x``, ``scattered_upstream``, ``dx_up_up_grouped``
+    # references that the LoRA wrapper holds across the rest of the
+    # layer's bwd, so those ~5 GiB at chunk=65k are still alive when
+    # ``attn.bwd`` allocates its own scratch (~2.25 GiB) and flash-attn
+    # allocates its internal fp32 dq_accum (~1 GiB). ``max(mlp, attn)``
+    # undershoots by exactly that overlap; sum for MoE+LoRA. For full FT
+    # (no lora_capture) and dense / linear-attn paths, ``max`` is correct.
+    moe_with_lora_capture = (
+        num_routed > 0 and training_config is not None and lora_active
+    )
+    if moe_with_lora_capture:
+        bytes_used += resid_workspace + mlp_workspace + attn_workspace
+    else:
+        bytes_used += resid_workspace + max(attn_workspace, mlp_workspace)
 
     # Linear-attn cross-chunk state windows (Item 3c). One global
     # ``LinAttnStateWindow`` (fwd + bwd) per engine, allocated by
@@ -1138,6 +1202,7 @@ def determine_working_set_config(
         verbose=verbose,
         min_act_slot_fn=_min_act_slot_bytes,
         full_act_slot_fn=_full_act_slot_bytes,
+        lora_active=lora_active,
     )
 
     if best_option is None:
@@ -1181,6 +1246,7 @@ def determine_working_set_config(
     baseline_act_gpu_memory = _baseline_gpu_activation_memory(
         model_dims, max_seq_len, target_chunk_size, target_num_chunks,
         training_config=training_config,
+        lora_active=lora_active,
     )
 
     est_total_gpu_bytes = (
@@ -1308,6 +1374,7 @@ def _pick_chunk_size(
     verbose: bool,
     min_act_slot_fn=None,
     full_act_slot_fn=None,
+    lora_active: bool = False,
 ) -> dict | None:
     """Greedy chunk-size selection. Mirrors orig:476-653.
 
@@ -1441,6 +1508,7 @@ def _pick_chunk_size(
         baseline_act = _baseline_gpu_activation_memory(
             model_dims, max_seq_len, chunk_size, target_num_chunks,
             training_config=training_config,
+            lora_active=lora_active,
         )
         cur_gpu -= baseline_act
 

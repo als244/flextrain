@@ -466,6 +466,34 @@ def _alloc_opt_state_host(
     return out
 
 
+def _alloc_opt_state_device(
+    param_spec: ParamSpec,
+    opt_spec: OptimizerStateSpec,
+    dims: Mapping[str, int],
+    *,
+    device: torch.device | str,
+) -> dict[str, torch.Tensor]:
+    """Device-side analogue of :func:`_alloc_opt_state_host`. Used for
+    embed/head opt-state, which stays GPU-resident. Naming convention
+    matches the host version so the optimizer kernels can be invoked
+    interchangeably."""
+    out: dict[str, torch.Tensor] = {}
+    per_param_fn = getattr(opt_spec, "per_param_state_tensors", None)
+    for p in param_spec.tensors:
+        if p.frozen:
+            continue
+        shape = p.shape(dims)
+        name_suffix = p.name[2:] if p.name.startswith("w_") else p.name
+        tensors = (
+            per_param_fn(p, dims) if per_param_fn is not None
+            else opt_spec.tensors
+        )
+        for st in tensors:
+            key = f"{st.name}_{name_suffix}"
+            out[key] = torch.zeros(shape, dtype=st.dtype, device=device)
+    return out
+
+
 class BufferManager:
     """All host + device buffers the engine needs.
 
@@ -504,10 +532,8 @@ class BufferManager:
     host_opt: list[_OptStateBundle]
     host_embed_params: dict[str, torch.Tensor]
     host_embed_grads: dict[str, torch.Tensor]
-    host_embed_opt: _OptStateBundle
     host_head_params: dict[str, torch.Tensor]
     host_head_grads: dict[str, torch.Tensor]
-    host_head_opt: _OptStateBundle
     host_act_buffer: torch.Tensor | None  # uint8, cudaHostRegistered
 
     # === GPU ring buffers ===
@@ -519,10 +545,15 @@ class BufferManager:
     gpu_act_slot_views: list[tuple[int, int]]
 
     # === embed/head resident GPU buffers (no ring — they stay resident) ===
+    # Includes opt-state. Endpoint opt is GPU-canonical (no host mirror)
+    # because the picker already budgets it on-device, and keeping it
+    # resident eliminates a per-step PCIe round-trip.
     gpu_embed_params: dict[str, torch.Tensor]
     gpu_embed_grads: dict[str, torch.Tensor]
+    gpu_embed_opt: dict[str, torch.Tensor]
     gpu_head_params: dict[str, torch.Tensor]
     gpu_head_grads: dict[str, torch.Tensor]
+    gpu_head_opt: dict[str, torch.Tensor]
 
     # === KV context (shared across all layers, one window) ===
     kv_fwd: KVContextWindow
@@ -626,10 +657,9 @@ class BufferManager:
                     flush=True, file=sys.stderr,
                 )
 
-        # embed
+        # embed (host master+grad mirror; opt-state stays GPU-resident below)
         self.host_embed_params = {}
         self.host_embed_grads = {}
-        self.host_embed_opt = _OptStateBundle()
         if embed_param_spec is not None:
             self.host_embed_params = _alloc_dict_on_host(
                 embed_param_spec, self.dims, role="master",
@@ -639,16 +669,10 @@ class BufferManager:
                 embed_param_spec, self.dims, role="grad",
                 backend=self.host_backend,
             )
-            if opt_spec is not None:
-                self.host_embed_opt.host = _alloc_opt_state_host(
-                    embed_param_spec, opt_spec, self.dims,
-                    backend=self.host_backend,
-                )
 
-        # head
+        # head (same pattern as embed)
         self.host_head_params = {}
         self.host_head_grads = {}
-        self.host_head_opt = _OptStateBundle()
         if head_param_spec is not None:
             self.host_head_params = _alloc_dict_on_host(
                 head_param_spec, self.dims, role="master",
@@ -658,11 +682,6 @@ class BufferManager:
                 head_param_spec, self.dims, role="grad",
                 backend=self.host_backend,
             )
-            if opt_spec is not None:
-                self.host_head_opt.host = _alloc_opt_state_host(
-                    head_param_spec, opt_spec, self.dims,
-                    backend=self.host_backend,
-                )
 
         # ---- Size the GPU param / grad rings (max across layer types) ----
         # Param ring uses a TWO-REGION layout: non-frozen tensors at
@@ -811,6 +830,7 @@ class BufferManager:
             )
         self.gpu_embed_params = {}
         self.gpu_embed_grads = {}
+        self.gpu_embed_opt = {}
         if embed_param_spec is not None:
             self.gpu_embed_params = _alloc_dict_on_device(
                 embed_param_spec, self.dims, device=self.device, role="compute",
@@ -818,8 +838,14 @@ class BufferManager:
             self.gpu_embed_grads = _alloc_dict_on_device(
                 embed_param_spec, self.dims, device=self.device, role="grad",
             )
+            if opt_spec is not None:
+                self.gpu_embed_opt = _alloc_opt_state_device(
+                    embed_param_spec, opt_spec, self.dims,
+                    device=self.device,
+                )
         self.gpu_head_params = {}
         self.gpu_head_grads = {}
+        self.gpu_head_opt = {}
         if head_param_spec is not None:
             self.gpu_head_params = _alloc_dict_on_device(
                 head_param_spec, self.dims, device=self.device, role="compute",
@@ -827,6 +853,11 @@ class BufferManager:
             self.gpu_head_grads = _alloc_dict_on_device(
                 head_param_spec, self.dims, device=self.device, role="grad",
             )
+            if opt_spec is not None:
+                self.gpu_head_opt = _alloc_opt_state_device(
+                    head_param_spec, opt_spec, self.dims,
+                    device=self.device,
+                )
 
         # ---- KV context ----
         if verbose:
@@ -1283,10 +1314,8 @@ class BufferManager:
                   self.host_head_params, self.host_head_grads):
             for t in d.values():
                 self.host_backend.release(t)
-        for t in self.host_embed_opt.host.values():
-            self.host_backend.release(t)
-        for t in self.host_head_opt.host.values():
-            self.host_backend.release(t)
+        # Endpoint opt-state lives on GPU now (gpu_embed_opt / gpu_head_opt);
+        # its lifetime is tied to the BufferManager via normal CUDA refcount.
         if self.host_act_buffer is not None:
             self.host_backend.release(self.host_act_buffer)
             self.host_act_buffer = None
