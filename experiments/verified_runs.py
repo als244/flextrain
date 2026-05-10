@@ -20,6 +20,13 @@ Usage::
     # rebuild the markdown table from saved logs (no GPU)
     python experiments/verified_runs.py report \\
         --runs-dir runs/verified_runs
+
+Paths assumed (override with env vars when not at the standard layout):
+
+    FLEXTRAIN_MODELS_DIR        default: ``<repo>/models``
+                                each row's HF snapshot lives at
+                                ``$FLEXTRAIN_MODELS_DIR/<model_name>``
+    FLEXTRAIN_VERIFIED_DATASET  default: ``<repo>/datasets/mathinstruct.jsonl``
 """
 from __future__ import annotations
 
@@ -53,10 +60,16 @@ class Row:
     expected_curve: str = ""   # original table value, for side-by-side
 
 
-_MODELS_DIR = "/home/shein/Documents/grad_school/research/flextrain/models"
-_DATASET = "/home/shein/Documents/grad_school/research/flextrain/datasets/mathinstruct.jsonl"
-_TRAIN_PY = str(Path(__file__).resolve().parents[1] / "train.py")
 _REPO_ROOT = str(Path(__file__).resolve().parents[1])
+_TRAIN_PY = f"{_REPO_ROOT}/train.py"
+# Default to repo-relative ``models/`` and ``datasets/`` so a clone with
+# the standard layout reproduces the table out of the box. Override
+# either via env var when the model snapshots / dataset live elsewhere.
+_MODELS_DIR = os.environ.get("FLEXTRAIN_MODELS_DIR", f"{_REPO_ROOT}/models")
+_DATASET = os.environ.get(
+    "FLEXTRAIN_VERIFIED_DATASET",
+    f"{_REPO_ROOT}/datasets/mathinstruct.jsonl",
+)
 
 
 ROWS = {r.key: r for r in [
@@ -64,6 +77,24 @@ ROWS = {r.key: r for r in [
         key="llama_3_2_1b_lora",
         label="Llama-3.2-1B", params="1B", arch="dense",
         model_path=f"{_MODELS_DIR}/Llama-3.2-1B", mode="lora",
+        expected_curve="not re-verified",
+    ),
+    Row(
+        key="llama_3_2_1b_full",
+        label="Llama-3.2-1B", params="1B", arch="dense",
+        model_path=f"{_MODELS_DIR}/Llama-3.2-1B", mode="full",
+        expected_curve="not re-verified",
+    ),
+    Row(
+        key="llama_3_1_8b_lora",
+        label="Llama-3.1-8B-Instruct", params="8B", arch="dense",
+        model_path=f"{_MODELS_DIR}/Llama-3.1-8B-Instruct", mode="lora",
+        expected_curve="not re-verified",
+    ),
+    Row(
+        key="llama_3_1_8b_full",
+        label="Llama-3.1-8B-Instruct", params="8B", arch="dense",
+        model_path=f"{_MODELS_DIR}/Llama-3.1-8B-Instruct", mode="full",
         expected_curve="not re-verified",
     ),
     Row(
@@ -84,6 +115,12 @@ ROWS = {r.key: r for r in [
         key="qwen3_8b_lora",
         label="Qwen3-8B", params="8B", arch="dense, QK-norm",
         model_path=f"{_MODELS_DIR}/Qwen3-8B", mode="lora",
+        expected_curve="not re-verified",
+    ),
+    Row(
+        key="qwen3_8b_full",
+        label="Qwen3-8B", params="8B", arch="dense, QK-norm",
+        model_path=f"{_MODELS_DIR}/Qwen3-8B", mode="full",
         expected_curve="not re-verified",
     ),
     Row(
