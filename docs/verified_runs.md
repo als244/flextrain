@@ -11,7 +11,10 @@ Smoke-test record from training a handful of supported models end-to-end.
   EOS naturally.
 - **Reproduce**: `python experiments/verified_runs.py run-grid --out
   runs/<dir>` shells out to `train.py` per row, captures the per-step
-  log, and emits the table at `<dir>/new_table.md`.
+  log, and emits the table at `<dir>/new_table.md`. Defaults assume
+  HF snapshots at `<repo>/models/<name>` and the SFT dataset at
+  `<repo>/datasets/mathinstruct.jsonl`; override via
+  `FLEXTRAIN_MODELS_DIR` / `FLEXTRAIN_VERIFIED_DATASET` env vars.
 
 Loss values reflect mean cross-entropy over response tokens (positions
 where `targets != -100`); prior versions of this table reported a
