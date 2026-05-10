@@ -254,8 +254,10 @@ def _baseline_model_memory(
                 emb_grad = embedding_size_bytes(grad_dims)
                 # Endpoints always use AdamW (orig:62)
                 emb_opt = 2 * embedding_size_bytes(opt_dims)
+        # Endpoint opt-state is GPU-resident (gpu_embed_opt); host carries
+        # only master + grad mirrors (host_embed_params / host_embed_grads).
         required_gpu_bytes += emb_master + emb_grad + emb_opt
-        required_host_bytes += emb_master + emb_grad + emb_opt
+        required_host_bytes += emb_master + emb_grad
         embed_bytes = emb_master + emb_grad + emb_opt
 
     if has_head and grad_dims is not None:
@@ -274,7 +276,7 @@ def _baseline_model_memory(
                 head_grad = head_size_bytes(grad_dims)
                 head_opt = 2 * head_size_bytes(opt_dims)
         required_gpu_bytes += head_master + head_grad + head_opt
-        required_host_bytes += head_master + head_grad + head_opt
+        required_host_bytes += head_master + head_grad
         head_bytes = head_master + head_grad + head_opt
 
     # ---- Backbone: training state in host, +1 layer weights+grads on GPU
