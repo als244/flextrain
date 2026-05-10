@@ -105,6 +105,12 @@ ROWS = {r.key: r for r in [
         expected_curve="not re-verified",
     ),
     Row(
+        key="qwen3_8b_full",
+        label="Qwen3-8B", params="8B", arch="dense, QK-norm",
+        model_path=f"{_MODELS_DIR}/Qwen3-8B", mode="full",
+        expected_curve="not re-verified",
+    ),
+    Row(
         key="qwen3_5_9b_lora",
         label="Qwen3.5-9B", params="9B",
         arch="hybrid linear+full attn, dense MLP",

@@ -69,7 +69,7 @@ string to the encoder; that's a separate change.
 
 ## RTX 5090 (31.3 GiB, 192 GiB host) — full sweep, 2026-05-10
 
-All 12 rows re-verified at **auto memory budget** (no manual GPU/host
+All 13 rows re-verified at **auto memory budget** (no manual GPU/host
 caps). Per-step metrics (`tok/sec`, `eff TFLOPS`, `hw TFLOPS`,
 `peak alloc`, `peak resv`) read directly from `train.py`'s stdout at
 step 3 — a mid-run logged data point past step-1 warmup. `peak alloc`
@@ -90,6 +90,7 @@ reflects the working-set solver's recompute trade-off.
 | OLMoE-1B-7B | 7B / 1B-active | MoE (64 experts) | LoRA | 0.865 → 0.844 | 22,697 | 108.2 | 125.3 | 25.70 | 28.60 |
 | OLMoE-1B-7B | 7B / 1B-active | MoE (64 experts) | full | 0.865 → 0.673 | 13,305 |  95.1 | 108.1 | 26.40 | 29.00 |
 | Qwen3-8B | 8B | dense, QK-norm | LoRA | 0.933 → 0.873 |  5,026 | 153.2 | 153.5 | 27.10 | 27.40 |
+| Qwen3-8B | 8B | dense, QK-norm | full | 0.928 → 0.478 |  3,533 | 161.6 | 169.2 | 27.60 | 27.80 |
 | Qwen3.5-9B | 9B | hybrid linear+full attn, dense MLP | LoRA | 0.747 → 0.661 |  4,947 | 158.3 | 158.9 | 27.00 | 27.90 |
 | Qwen3.5-9B | 9B | hybrid linear+full attn, dense MLP | full | 0.744 → 0.465 |  3,237 | 155.4 | 165.7 | 26.40 | 26.70 |
 | Qwen3.6-27B | 27B | hybrid linear+full attn, dense MLP | LoRA | 1.013 → 0.815 |  1,284 | 132.6 | 136.6 | 27.30 | 28.70 |
