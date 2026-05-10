@@ -67,6 +67,24 @@ ROWS = {r.key: r for r in [
         expected_curve="not re-verified",
     ),
     Row(
+        key="llama_3_2_1b_full",
+        label="Llama-3.2-1B", params="1B", arch="dense",
+        model_path=f"{_MODELS_DIR}/Llama-3.2-1B", mode="full",
+        expected_curve="not re-verified",
+    ),
+    Row(
+        key="llama_3_1_8b_lora",
+        label="Llama-3.1-8B-Instruct", params="8B", arch="dense",
+        model_path=f"{_MODELS_DIR}/Llama-3.1-8B-Instruct", mode="lora",
+        expected_curve="not re-verified",
+    ),
+    Row(
+        key="llama_3_1_8b_full",
+        label="Llama-3.1-8B-Instruct", params="8B", arch="dense",
+        model_path=f"{_MODELS_DIR}/Llama-3.1-8B-Instruct", mode="full",
+        expected_curve="not re-verified",
+    ),
+    Row(
         key="olmoe_7b_a1b_lora",
         label="OLMoE-1B-7B", params="7B / 1B-active",
         arch="MoE (64 experts)",
