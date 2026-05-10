@@ -192,7 +192,7 @@ def from_pretrained(
     max_gpu_mem_bytes: int,
     max_host_mem_bytes: int,
     device: str = "cuda:0",
-    leeway_gpu_mem_bytes: int = 2 * (1 << 30),
+    leeway_gpu_mem_bytes: int = 3 * (1 << 30),
     leeway_host_mem_bytes: int = 4 * (1 << 30),
     compute_dtype: torch.dtype = torch.bfloat16,
     # Master defaults to compute_dtype (bf16). Override to torch.float32
@@ -629,7 +629,7 @@ def from_dims(
     init_seed: int = 0xF1EC7,
     init_std: float = 0.02,
     device: str = "cuda:0",
-    leeway_gpu_mem_bytes: int = 2 * (1 << 30),
+    leeway_gpu_mem_bytes: int = 3 * (1 << 30),
     leeway_host_mem_bytes: int = 4 * (1 << 30),
     compute_dtype: torch.dtype = torch.bfloat16,
     master_dtype: torch.dtype | None = torch.bfloat16,
