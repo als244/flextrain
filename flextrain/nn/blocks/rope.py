@@ -78,11 +78,14 @@ def build_rope_inv_freq(
         inv = 1.0 / (rope_base ** (torch.arange(0, half, dtype=torch.float32) * 2.0 / head_dim))
         return inv
     rope_type = rope_scaling.get("rope_type") or rope_scaling.get("type") or "default"
-    if rope_type in ("default", "linear"):
-        # ``linear`` scales positions, not freqs — it leaves inv_freq alone
-        # at the kernel level. Engine doesn't currently apply linear pos
-        # scaling; the model only sees the raw positions.
+    if rope_type == "default":
         return build_rope_inv_freq(head_dim, rope_base, None)
+    if rope_type == "linear":
+        # Linear position scaling: effective positions are ``pos / factor``.
+        # Equivalent to ``inv_freq / factor`` since
+        # ``angle = pos * inv_freq``. Gemma-3 4B/12B use this with factor=8.
+        inv = build_rope_inv_freq(head_dim, rope_base, None)
+        return inv / float(rope_scaling.get("factor", 1.0))
     if rope_type == "llama3":
         return _llama3_inv_freq(
             head_dim=head_dim,
@@ -153,9 +156,12 @@ def build_partial_rope_inv_freq(
     the type is one of None/'default'. If a YARN-style partial variant
     appears we'll handle it here.
     """
+    factor = 1.0
     if rope_scaling is not None:
         rope_type = rope_scaling.get("rope_type") or rope_scaling.get("type") or "default"
-        if rope_type not in ("default", "linear", None):
+        if rope_type == "linear":
+            factor = float(rope_scaling.get("factor", 1.0))
+        elif rope_type not in ("default", None):
             import warnings
             warnings.warn(
                 f"build_partial_rope_inv_freq: rope_type={rope_type!r} not "
@@ -164,6 +170,8 @@ def build_partial_rope_inv_freq(
             )
     half = rot_dim // 2
     inv = 1.0 / (rope_base ** (torch.arange(0, half, dtype=torch.float32) * 2.0 / rot_dim))
+    if factor != 1.0:
+        inv = inv / factor
     return inv
 
 

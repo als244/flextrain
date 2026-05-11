@@ -44,7 +44,7 @@ from flextrain.core.activation_schema import (
     ActivationField, ActivationSchema, concat_fields,
 )
 from flextrain.core.layer import (
-    ChunkMeta, ComputeCost, LayerContext, ParamSpec,
+    BackwardIntermediates, ChunkMeta, ComputeCost, LayerContext, ParamSpec,
 )
 from flextrain.nn.blocks import (
     GQAAttentionBlock, GQAAttentionConfig,
@@ -182,6 +182,8 @@ class Gemma2Block:
                 compute_dtype=cfg.compute_dtype,
                 master_dtype=cfg.master_dtype,
                 grad_dtype=cfg.grad_dtype,
+                # Gemma 2 uses gated-GELU (tanh approximation), not SiLU.
+                activation="gelu_tanh",
             )
         )
 
@@ -195,14 +197,31 @@ class Gemma2Block:
             "x_mid", lambda n, d: (n, cfg.d_model),
             cfg.compute_dtype, tier=0,
         )
+        # Dual-residual extras: ``a_only`` and ``ffn_only`` are the
+        # unfused sublayer outputs (attn / ffn called with zero residual),
+        # which feed the post_*_norm.bwd as the pre-norm input. We can't
+        # recompute them without re-running the sublayer, so they ride
+        # at tier 0. See docs/internal/gemma3_status.md §"Design
+        # decision 1" for why these go on the Gemma layer's schema
+        # rather than on the shared attn/ffn schemas.
+        a_only = ActivationField(
+            "a_only", lambda n, d: (n, cfg.d_model),
+            cfg.compute_dtype, tier=0,
+        )
+        ffn_only = ActivationField(
+            "ffn_only", lambda n, d: (n, cfg.d_model),
+            cfg.compute_dtype, tier=0,
+        )
         self.schema = ActivationSchema(
             fields=concat_fields(
                 [
                     self.pre_attn_norm.fields(),
                     (x_inp,),
+                    (a_only,),
                     self.attn.fields(),
                     self.post_attn_norm.fields(),
                     (x_mid,),
+                    (ffn_only,),
                     self.pre_ffn_norm.fields(),
                     self.post_ffn_norm.fields(),
                     self.ffn.fields(),
@@ -234,6 +253,7 @@ class Gemma2Block:
         zero_resid = ctx.scratch(x.shape, x.dtype).zero_()
         h = self.pre_attn_norm.fwd(x, weights, slot.pre_attn_norm_rstd, output=x_temp)
         a_only = self.attn.fwd(zero_resid, h, chunk, weights, slot, ctx)
+        slot.a_only.copy_(a_only.view(-1, cfg.d_model))
         h2 = self.post_attn_norm.fwd(
             a_only.view(-1, cfg.d_model),
             weights, slot.post_attn_norm_rstd, output=x_temp,
@@ -251,6 +271,7 @@ class Gemma2Block:
             h, weights, zero_ffn_resid,
             out_tensor=x, slot=slot, ctx=ctx,
         )
+        slot.ffn_only.copy_(ffn_only.view(-1, cfg.d_model))
         h3 = self.post_ffn_norm.fwd(
             ffn_only.view(-1, cfg.d_model),
             weights, slot.post_ffn_norm_rstd, output=x_temp,
@@ -258,22 +279,229 @@ class Gemma2Block:
         return (x_after_attn.view(-1, cfg.d_model) + h3).view_as(x)
 
     def forward_recompute(self, slot, chunk, weights, ctx) -> None:
-        # Conservative: regenerate everything Llama-style. The dual-norm
-        # bwd needs the input/output of every norm, so partial recompute
-        # is more involved than Llama. First-cut: full recompute on demand.
-        pass
+        """Fill in fields whose ``tier > slot.level``.
 
-    def backward(self, dx, chunk, weights, grads, slot, ctx) -> torch.Tensor:
-        # Gemma 2 bwd is non-trivial because of the dual-residual structure.
-        # First cut: scoped autograd reference path.
-        # TODO: hand-rolled bwd (lands alongside Gemma 3, which builds
-        # on Gemma 2's structure with QK-norm added).
-        raise NotImplementedError(
-            "Gemma2Block.bwd is a stub for this iteration. The dual-residual "
-            "structure (pre+post norm on each sublayer) needs a handwritten "
-            "bwd that's currently being designed. The forward path is "
-            "complete and tested; bwd lands in a follow-up."
+        Tier ladder for Gemma 2:
+          * Tier 0 (always saved): x_inp, x_mid, a_only, ffn_only, xk, xv,
+                                    all four norm rstds.
+          * Tier 1: attn_result, softmax_lse.
+          * Tier 2: xq, xo.
+          * Tier 3: x1, x3.
+
+        ``a_only`` and ``ffn_only`` are tier-0 so they're always present
+        and never recomputed here. The recompute paths for ``xq``,
+        ``xo``, ``x1``, ``x3``, and ``attn_result`` mirror Llama with
+        two adjustments:
+
+        * ``xo`` is reconstructed with ZERO residual (Gemma's attn fwd
+          passes zero into ``attn.fwd``; xo = ``attn_result @ w_o``).
+        * The pre_ffn_norm input is ``slot.x_mid`` (the post-attn
+          residual sum), not ``slot.xo`` as in Llama.
+
+        Stashes the recomputed pre-norm fwd outputs into ``slot.aux``
+        so ``backward_dgrad`` can reuse them without a second recompute.
+        """
+        cfg = self.cfg
+
+        if not slot.has("xq"):
+            pre_attn_norm_fwd_output = self.pre_attn_norm.fwd_from_rstd(
+                slot.x_inp, weights, slot.pre_attn_norm_rstd,
+            )
+            # x_resid=ZERO so the fused addmm in fwd_recompute_o (called
+            # below) reproduces the gemma "no residual" attn output.
+            self.attn.fwd_recompute_qo(
+                pre_attn_norm_fwd_output, chunk, weights, slot,
+                x_resid=ctx.scratch(slot.x_inp.shape, slot.x_inp.dtype).zero_(),
+            )
+            slot.aux["recompute_pre_attn_norm_output"] = pre_attn_norm_fwd_output
+
+        if not slot.has("attn_result"):
+            self.attn.fwd_recompute_attn(chunk, slot, ctx)
+
+        if not slot.has("xo"):
+            zero_resid = ctx.scratch(slot.x_inp.shape, slot.x_inp.dtype).zero_()
+            self.attn.fwd_recompute_o(zero_resid, weights, slot)
+
+        recompute_x1 = not slot.has("x1")
+        recompute_x3 = not slot.has("x3")
+        if recompute_x1 or recompute_x3:
+            pre_ffn_norm_fwd_output = self.pre_ffn_norm.fwd_from_rstd(
+                slot.x_mid, weights, slot.pre_ffn_norm_rstd,
+            )
+            self.ffn.fwd_recompute_x1x3(
+                pre_ffn_norm_fwd_output, weights, slot,
+                recompute_x1=recompute_x1, recompute_x3=recompute_x3,
+            )
+            slot.aux["recompute_pre_ffn_norm_output"] = pre_ffn_norm_fwd_output
+
+    # ------------------------------------------------------------------
+    # Backward — split form (dgrad + wgrad).
+    # ------------------------------------------------------------------
+    #
+    # Dual-residual chain rule (out = x_mid + post_ffn_norm(ffn_only),
+    # x_mid = x_inp + post_attn_norm(a_only)):
+    #
+    #   dffn_only, g_post_ffn_norm += post_ffn_norm.bwd(dout, slot.ffn_only)
+    #   dpre_ffn_norm_h             = ffn.bwd(dffn_only)
+    #                                  inline: g_2
+    #                                  deferred: g_1, g_3
+    #   dx_mid, g_pre_ffn_norm     += pre_ffn_norm.bwd(dpre_ffn_norm_h,
+    #                                                  slot.x_mid,
+    #                                                  dx_accumulator=dout)
+    #
+    #   da_only, g_post_attn_norm  += post_attn_norm.bwd(dx_mid, slot.a_only)
+    #   dpre_attn_h                = attn.bwd(da_only)
+    #                                  inline: g_o
+    #                                  deferred: g_q, g_k, g_v
+    #   dx, g_pre_attn_norm        += pre_attn_norm.bwd(dpre_attn_h,
+    #                                                   slot.x_inp,
+    #                                                   dx_accumulator=dx_mid)
+    #
+    # The four RMSNorm γ grads accumulate inline (1-D, no recompute
+    # needed). g_o / g_2 accumulate inline in attn.bwd / ffn.bwd.
+    # g_q / g_k / g_v / g_1 / g_3 are deferred to wgrad because they
+    # need the recomputed ``pre_{attn,ffn}_norm_fwd_output`` as the
+    # left operand for X^T @ dY. Those outputs ride via
+    # ``intermediates.aux``, same trick as Llama uses.
+    #
+    # Mirrors the split form in ``flextrain/nn/layers/llama.py``.
+
+    def backward(
+        self, dx, chunk, weights, grads, slot, ctx,
+    ) -> torch.Tensor:
+        """Delegating shim. See ``backward_dgrad`` + ``backward_wgrad``."""
+        upstream_dx, intermediates = self.backward_dgrad(
+            dx, chunk, weights, grads, slot, ctx,
         )
+        self.backward_wgrad(intermediates, weights, grads, slot, ctx)
+        return upstream_dx
+
+    def backward_dgrad(
+        self,
+        dx: torch.Tensor,
+        chunk: ChunkMeta,
+        weights,
+        grads,
+        slot,
+        ctx: LayerContext,
+        *,
+        skip_target_names: frozenset[str] = frozenset(),
+    ) -> tuple[torch.Tensor, BackwardIntermediates]:
+        """Returns ``(upstream_dx, intermediates)`` — the gradient w.r.t.
+        the layer input plus a payload of recomputed pre-norm outputs
+        the deferred wgrad pass needs.
+
+        ``skip_target_names`` ⊆ ``{w_q, w_k, w_v, w_o, w_1, w_2, w_3}``
+        skips the corresponding inline Wgrad addmm (LoRA fast path).
+        Inline cases honored here: ``w_o`` and ``w_2``. Deferred cases
+        (``w_q/w_k/w_v/w_1/w_3``) are honored in
+        ``backward_wgrad``.
+        """
+        cfg = self.cfg
+        d_model = cfg.d_model
+
+        # Translate w_* skip targets → g_* skip names for the inline
+        # Wgrads (g_o in attn.bwd, g_2 in ffn.bwd).
+        skip_g_inline: frozenset[str] = frozenset(
+            f"g_{n[2:]}" for n in skip_target_names if n in ("w_o", "w_2")
+        )
+        capture_xy: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = (
+            {} if skip_g_inline else None
+        )
+
+        dy = dx.view(-1, d_model)
+
+        # --- Outer FFN residual ---
+        # post_ffn_norm.bwd reads ``dy`` (the incoming layer-output grad)
+        # but doesn't mutate it; ffn.bwd takes the post-norm dx and
+        # doesn't touch ``dy``. So ``dy`` can serve as the
+        # pre_ffn_norm.bwd accumulator directly — no extra clone needed
+        # (same pattern as LlamaBlock).
+        dffn_only, _ = self.post_ffn_norm.bwd(
+            dy, slot.ffn_only, weights, grads, slot.post_ffn_norm_rstd,
+            dx_accumulator=None, recompute_output=False,
+        )
+        dpre_ffn_norm_h = self.ffn.bwd(
+            dffn_only, weights, grads, slot,
+            skip_grads=skip_g_inline, capture_xy=capture_xy,
+        )
+        dx_mid, pre_ffn_norm_fwd_output = self.pre_ffn_norm.bwd(
+            dpre_ffn_norm_h, slot.x_mid, weights, grads,
+            slot.pre_ffn_norm_rstd,
+            dx_accumulator=dy,  # in-place: dy now holds dx_mid_total
+            recompute_output=True,
+            recomputed_output_tensor=None,
+        )
+
+        # --- Outer attn residual ---
+        da_only, _ = self.post_attn_norm.bwd(
+            dx_mid, slot.a_only, weights, grads, slot.post_attn_norm_rstd,
+            dx_accumulator=None, recompute_output=False,
+        )
+        dpre_attn_h = self.attn.bwd(
+            da_only, chunk, weights, grads, slot, ctx,
+            attn_norm_output=None,  # type: ignore[arg-type]
+            skip_grads=skip_g_inline, capture_xy=capture_xy,
+        )
+        dx_final, pre_attn_norm_fwd_output = self.pre_attn_norm.bwd(
+            dpre_attn_h, slot.x_inp, weights, grads,
+            slot.pre_attn_norm_rstd,
+            dx_accumulator=dx_mid,  # in-place
+            recompute_output=True,
+            recomputed_output_tensor=None,
+        )
+
+        intermediates = BackwardIntermediates(
+            proj_inputs_and_grads={},
+            aux={
+                "pre_ffn_norm_fwd_output": pre_ffn_norm_fwd_output,
+                "pre_attn_norm_fwd_output": pre_attn_norm_fwd_output,
+            },
+        )
+        if capture_xy is not None:
+            for g_name, xy in capture_xy.items():
+                w_name = "w_" + g_name[2:]
+                intermediates.proj_inputs_and_grads[w_name] = xy
+        return dx_final.view_as(dx), intermediates
+
+    def backward_wgrad(
+        self,
+        intermediates: BackwardIntermediates,
+        weights,
+        grads,
+        slot,
+        ctx: LayerContext,
+        *,
+        skip_target_names: frozenset[str] = frozenset(),
+    ) -> None:
+        """Deferred Wgrads (``g_q/g_k/g_v/g_1/g_3``) — each needs the
+        recomputed pre-norm forward output as its left operand. Reads
+        the cached outputs from ``intermediates.aux``."""
+        del ctx, weights
+        pre_ffn_norm_fwd_output = intermediates.aux["pre_ffn_norm_fwd_output"]
+        pre_attn_norm_fwd_output = intermediates.aux["pre_attn_norm_fwd_output"]
+
+        skip_g_names: frozenset[str] = frozenset(
+            f"g_{n[2:]}" for n in skip_target_names
+            if n in ("w_q", "w_k", "w_v", "w_1", "w_3")
+        )
+        capture_xy: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = (
+            {} if skip_g_names else None
+        )
+
+        self.ffn.bwd_accumulate_w1_w3_grads(
+            pre_ffn_norm_fwd_output, grads, slot,
+            skip_grads=skip_g_names, capture_xy=capture_xy,
+        )
+        self.attn.bwd_accumulate_qkv_grads(
+            pre_attn_norm_fwd_output, grads, slot,
+            skip_grads=skip_g_names, capture_xy=capture_xy,
+        )
+
+        if capture_xy is not None:
+            for g_name, xy in capture_xy.items():
+                w_name = "w_" + g_name[2:]
+                intermediates.proj_inputs_and_grads[w_name] = xy
 
     def compute_cost(self, chunk: ChunkMeta) -> ComputeCost:
         max_tier = self.schema.max_tier
