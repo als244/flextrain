@@ -295,6 +295,7 @@ class JsonSFTTokenSource:
         trust_remote_code: bool = False,
         prefetch_max_tokens: int = 1_000_000_000,
         truncate_long: bool = False,
+        apply_chat_template: bool = False,
     ) -> None:
         self.path = path
         self.prompt_field = prompt_field
@@ -305,6 +306,16 @@ class JsonSFTTokenSource:
         self.loop = loop
         self.prefetch_max_tokens = int(prefetch_max_tokens)
         self.truncate_long = bool(truncate_long)
+        # When True, wrap each record's prompt/response through the
+        # tokenizer's ``apply_chat_template`` (the model's NATIVE chat
+        # format — e.g. Gemma 2/3's ``<start_of_turn>user…<end_of_turn>
+        # <start_of_turn>model…<end_of_turn>``, Llama-3's ``<|start_
+        # header_id|>user…<|eot_id|>``, Qwen's ``<|im_start|>``…). The
+        # template's natural turn-terminator is the EOS in this mode;
+        # we do NOT additionally append ``tokenizer.eos_token_id``
+        # (which would be a different token for Gemma — eos_id=1 vs
+        # end_of_turn=106).
+        self.apply_chat_template = bool(apply_chat_template)
 
         if isinstance(tokenizer, str):
             try:
@@ -385,6 +396,40 @@ class JsonSFTTokenSource:
             extra = str(rec.get(self.input_field, "") or "").strip()
         if not prompt or not response:
             return None
+
+        if self.apply_chat_template:
+            # Render via the tokenizer's native chat template. We render
+            # TWICE: once with just the user turn + ``add_generation_
+            # prompt=True`` (so the assistant tag is opened but no
+            # content) — this is the "prompt" half that the loss masks
+            # out; and once with both turns (closed assistant turn) for
+            # the full sequence. The response half is recovered by
+            # string-slicing the full text past the prompt-prefix.
+            user_content = (
+                f"{prompt}\n\n{extra}" if extra else prompt
+            )
+            messages = [
+                {"role": "user", "content": user_content},
+                {"role": "assistant", "content": response},
+            ]
+            full_text = self._tok.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=False,
+            )
+            prompt_text = self._tok.apply_chat_template(
+                messages[:1], tokenize=False, add_generation_prompt=True,
+            )
+            if not full_text.startswith(prompt_text):
+                raise ValueError(
+                    "apply_chat_template: prompt is not a prefix of the "
+                    "full rendered text — the tokenizer's template "
+                    "varies the rendering when ``add_generation_prompt`` "
+                    "is toggled. This SFT path needs the prompt to "
+                    "string-prefix the full text so we can split out "
+                    "the response and mask the prompt positions."
+                )
+            response_text = full_text[len(prompt_text):]
+            return prompt_text, response_text
+
         if extra:
             prompt_text = (
                 f"Instruction:\n{prompt}\n\n"
@@ -422,9 +467,15 @@ class JsonSFTTokenSource:
         prompt_text, response_text = prompt_and_response
         prompt_ids = self._tok.encode(prompt_text, add_special_tokens=False)
         response_ids = self._tok.encode(response_text, add_special_tokens=False)
-        eos_id = getattr(self._tok, "eos_token_id", None)
-        if eos_id is not None:
-            response_ids = response_ids + [int(eos_id)]
+        if not self.apply_chat_template:
+            # Generic Instruction:/Response: format: the wrapper has no
+            # turn-terminator of its own, so append the tokenizer's
+            # eos_id so the model learns to stop. In chat-template mode
+            # the template's natural terminator (e.g. <end_of_turn>) is
+            # already inside ``response_text``.
+            eos_id = getattr(self._tok, "eos_token_id", None)
+            if eos_id is not None:
+                response_ids = response_ids + [int(eos_id)]
         if not response_ids:
             return None
         token_ids = prompt_ids + response_ids

@@ -403,6 +403,19 @@ def _build_arg_parser() -> argparse.ArgumentParser:
              "instead of dropping them. Default: drop. (Truncation can "
              "silently corrupt the loss target at the boundary.)",
     )
+    p.add_argument(
+        "--apply-chat-template",
+        action="store_true",
+        help="Render each record through the model's NATIVE chat template "
+             "(``tokenizer.apply_chat_template``) instead of the generic "
+             "``Instruction:/Response:`` wrapper. The template's natural "
+             "turn-terminator (e.g. Gemma's <end_of_turn>) becomes the "
+             "EOS — no extra tokenizer.eos_token_id is appended. Use this "
+             "to fine-tune instruction-tuned models on their native "
+             "chat format and get representative quality numbers (the "
+             "generic wrapper is OOD to instruct priors; see "
+             "docs/verified_runs.md).",
+    )
     p.add_argument("--steps", type=int, default=20, help="Number of training steps to run. Default: 20.")
     p.add_argument(
         "--data-source",
@@ -863,6 +876,7 @@ def main(argv: list[str] | None = None) -> int:
             max_seq_len=args.max_seq_len,
             loop=True,
             truncate_long=args.truncate_long,
+            apply_chat_template=args.apply_chat_template,
         )
         print(
             f"Dataset ready from {dataset_path}. Output dir: {output_dir}",
