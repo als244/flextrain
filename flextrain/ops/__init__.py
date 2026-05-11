@@ -60,6 +60,10 @@ from ._kernels.sample_top_p import flextrain_sample_top_p
 from ._kernels.silu_bwd import flextrain_silu_bwd
 from ._kernels.softmax import flextrain_softmax
 from ._kernels.swiglu import flextrain_swiglu_bwd, flextrain_swiglu_fwd
+from ._kernels.gelu_tanh_gated import (
+    flextrain_gelu_tanh_gated_bwd,
+    flextrain_gelu_tanh_gated_fwd,
+)
 
 # cuBLASLt matmul dispatchers (external compiled extension).
 from ._kernels._matmul_dispatchers import dispatcher, dispatcher_secondary
@@ -82,6 +86,8 @@ __all__ = [
     "flextrain_cross_entropy_loss",
     "flextrain_embedding_bwd",
     "flextrain_gate_prep_fwd",
+    "flextrain_gelu_tanh_gated_bwd",
+    "flextrain_gelu_tanh_gated_fwd",
     "flextrain_gated_rmsnorm_bwd",
     "flextrain_gated_rmsnorm_fwd",
     "flextrain_l2norm_bwd_into",

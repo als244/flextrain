@@ -31,7 +31,12 @@ from flextrain.core.layer import (
     ParamSpec,
     TensorSpec,
 )
-from flextrain.ops import flextrain_swiglu_bwd, flextrain_swiglu_fwd
+from flextrain.ops import (
+    flextrain_gelu_tanh_gated_bwd,
+    flextrain_gelu_tanh_gated_fwd,
+    flextrain_swiglu_bwd,
+    flextrain_swiglu_fwd,
+)
 
 
 @dataclass(frozen=True)
@@ -41,6 +46,13 @@ class SwiGLUConfig:
     compute_dtype: torch.dtype = torch.bfloat16
     master_dtype: torch.dtype | None = None
     grad_dtype: torch.dtype | None = None
+    # Gating activation. "silu" (default, Llama/Qwen/Mistral) uses the
+    # fast SwiGLU triton kernel; "gelu_tanh" (Gemma 2/3) uses the
+    # ``flextrain_gelu_tanh_gated_{fwd,bwd}`` triton kernels —
+    # equivalent to ``F.gelu(x1, approximate='tanh') * x3`` with a
+    # matching analytic backward (cos > 0.9999 vs torch.autograd on
+    # bf16+fp32 random tensors; see tests/test_gelu_tanh_gated_kernel.py).
+    activation: str = "silu"
 
 
 class SwiGLUFFN:
@@ -119,7 +131,20 @@ class SwiGLUFFN:
         torch.matmul(ffn_norm_output, weights["w_3"], out=slot.x3)
 
         swiglu_scratch = ctx.scratch(slot.x1.shape, slot.x1.dtype)
-        swiglu_result = flextrain_swiglu_fwd(slot.x1, slot.x3, out=swiglu_scratch)
+        if self.cfg.activation == "silu":
+            swiglu_result = flextrain_swiglu_fwd(
+                slot.x1, slot.x3, out=swiglu_scratch,
+            )
+        elif self.cfg.activation == "gelu_tanh":
+            # Gemma 2 / Gemma 3 gated-GELU with tanh approximation,
+            # matching HF's ``hidden_activation="gelu_pytorch_tanh"``.
+            swiglu_result = flextrain_gelu_tanh_gated_fwd(
+                slot.x1, slot.x3, out=swiglu_scratch,
+            )
+        else:
+            raise ValueError(
+                f"SwiGLUFFN: unsupported activation {self.cfg.activation!r}"
+            )
 
         layer_output = torch.addmm(
             attn_output_with_residual,
@@ -167,11 +192,24 @@ class SwiGLUFFN:
         # 1. dx_up_act = dy @ w_2^T
         dx_up_act = torch.matmul(dy_resid, weights["w_2"].T)
 
-        # 2. SwiGLU bwd -- also returns the recomputed SwiGLU forward output
-        #    (the matmul input for w_2's grad).
-        dx1_up, dx3_up, fwd_act_swiglu = flextrain_swiglu_bwd(
-            slot.x1, slot.x3, dx_up_act, store_activations=True
-        )
+        # 2. Gated-activation bwd — also returns the recomputed gated
+        #    activation output (the matmul input for ``w_2``'s grad).
+        #    Dispatch on cfg.activation: silu uses the SwiGLU kernel,
+        #    gelu_tanh uses the Gemma kernel — both have the same call
+        #    signature and return shape.
+        if self.cfg.activation == "silu":
+            dx1_up, dx3_up, fwd_act_swiglu = flextrain_swiglu_bwd(
+                slot.x1, slot.x3, dx_up_act, store_activations=True,
+            )
+        elif self.cfg.activation == "gelu_tanh":
+            dx1_up, dx3_up, fwd_act_swiglu = flextrain_gelu_tanh_gated_bwd(
+                slot.x1, slot.x3, dx_up_act, store_activations=True,
+            )
+        else:
+            raise ValueError(
+                f"SwiGLUFFN.bwd: unsupported activation "
+                f"{self.cfg.activation!r}"
+            )
 
         # 3. g_2 += SwiGLU(x1, x3)^T @ dy
         if "g_2" in skip_grads:
