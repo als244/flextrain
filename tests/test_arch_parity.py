@@ -49,8 +49,11 @@ LORA_R = 16
 LORA_ALPHA = 16.0
 N_STEPS = 5
 TOKENS_PER_STEP = 512   # small per-step token budget so this runs quickly
-LR_LORA = 1e-4
-LR_FULL = 5e-6
+# LR can be overridden via env var for the "lr=0 baseline" diagnostic
+# documented in docs/internal/gemma3_status.md (used to isolate
+# forward-parity drift from optimizer-trajectory drift).
+LR_LORA = float(os.environ.get("PARITY_LR_LORA", "1e-4"))
+LR_FULL = float(os.environ.get("PARITY_LR_FULL", "5e-6"))
 SEED = 0
 
 # HF arch IDs we know how to do PEFT for.
@@ -83,11 +86,12 @@ def _hf_worker(hf_path, mode, init_pkl, batches_pkl, out_pkl):
     """HF training-loop reference. Mode: 'lora' or 'full'."""
     import torch as _t
     import torch.nn.functional as F
-    from transformers import AutoModelForCausalLM
+    from transformers import AutoModelForCausalLM, AutoModelForImageTextToText
 
     with open(os.path.join(hf_path, "config.json")) as f:
         cfg = json.load(f)
-    arch_id = cfg["architectures"][0]
+    raw_arch_id = cfg["architectures"][0]
+    arch_id = raw_arch_id
     if arch_id == "Gemma3ForConditionalGeneration":
         arch_id = "Gemma3ForCausalLM"
     targets_list = list(_HF_TARGETS[arch_id])
@@ -95,10 +99,51 @@ def _hf_worker(hf_path, mode, init_pkl, batches_pkl, out_pkl):
     with open(batches_pkl, "rb") as f:
         batches = pickle.load(f)
 
-    model = AutoModelForCausalLM.from_pretrained(
-        hf_path, torch_dtype=DTYPE, device_map=DEVICE,
-        attn_implementation="sdpa",
-    )
+    # Gemma3ForConditionalGeneration (4B/12B) wraps the text model
+    # under .model.language_model and needs the
+    # ``AutoModelForImageTextToText`` loader; .model.language_model
+    # then exposes the same Gemma3DecoderLayer stack as the 1B
+    # ``Gemma3ForCausalLM`` variant.
+    if raw_arch_id == "Gemma3ForConditionalGeneration":
+        wrapper = AutoModelForImageTextToText.from_pretrained(
+            hf_path, torch_dtype=DTYPE, device_map=DEVICE,
+            attn_implementation="sdpa",
+        )
+        # Use a thin shim so the rest of this worker sees a CausalLM-
+        # shaped object (forward returns ``logits`` / ``loss``).
+        class _Gemma3MMShim(_t.nn.Module):
+            def __init__(self, w):
+                super().__init__()
+                self.wrapper = w
+                self.text_model = w.model.language_model
+                self.lm_head = w.lm_head
+                self.config = w.config.get_text_config()
+            def forward(self, input_ids=None, labels=None, **kw):
+                hidden = self.text_model(
+                    input_ids=input_ids, use_cache=False,
+                ).last_hidden_state
+                logits = self.lm_head(hidden)
+                loss = None
+                if labels is not None:
+                    # Stay in compute dtype (bf16) to keep the (T, V)
+                    # buffer half the size — promoting to fp32 right at
+                    # the CE input doubles the 262K-vocab Gemma logits
+                    # buffer and OOMs on 12B at 32 GiB.
+                    shift_logits = logits[:, :-1, :].contiguous()
+                    shift_labels = labels[:, 1:].contiguous()
+                    loss = F.cross_entropy(
+                        shift_logits.view(-1, shift_logits.size(-1)),
+                        shift_labels.view(-1),
+                        ignore_index=-100,
+                    )
+                from types import SimpleNamespace
+                return SimpleNamespace(logits=logits, loss=loss)
+        model = _Gemma3MMShim(wrapper)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            hf_path, torch_dtype=DTYPE, device_map=DEVICE,
+            attn_implementation="sdpa",
+        )
 
     if mode == "lora":
         from peft import LoraConfig, get_peft_model
@@ -108,16 +153,24 @@ def _hf_worker(hf_path, mode, init_pkl, batches_pkl, out_pkl):
         )
         model = get_peft_model(model, lora_cfg)
 
-        # Replay FT's auto-init A values + zero B.
+        # Replay FT's auto-init A values + zero B. The path to the
+        # underlying decoder layer stack depends on the wrapping:
+        #   * regular HF CausalLM under PEFT: model.model.model.layers
+        #   * our Gemma3ForConditionalGeneration shim under PEFT:
+        #       model.model.text_model.layers
+        if raw_arch_id == "Gemma3ForConditionalGeneration":
+            layers_root = model.model.text_model  # shim's text_model = wrapper.model.language_model
+        else:
+            layers_root = model.model.model
         with open(init_pkl, "rb") as f:
             init = pickle.load(f)
         with _t.no_grad():
             for (L, ft_name), A in init.items():
                 hf_name = _FT2HF[ft_name]
                 if hf_name in ("q_proj", "k_proj", "v_proj", "o_proj"):
-                    parent = model.model.model.layers[L].self_attn
+                    parent = layers_root.layers[L].self_attn
                 else:
-                    parent = model.model.model.layers[L].mlp
+                    parent = layers_root.layers[L].mlp
                 lora = getattr(parent, hf_name, None)
                 if lora is None:
                     continue
@@ -134,6 +187,33 @@ def _hf_worker(hf_path, mode, init_pkl, batches_pkl, out_pkl):
         lr = LR_FULL
 
     model.train()
+    # 12B (and larger) HF LoRA hits OOM at backward on a 32 GiB GPU
+    # without gradient checkpointing — the frozen base's activations
+    # need to live for the LoRA-adapter gradient pass. Enabling
+    # checkpointing trades a ~2× forward recompute for halving the
+    # activation memory. Doesn't affect numerics — bwd grads are the
+    # same; HF replays forward to reconstitute activations.
+    try:
+        # PEFT wraps the underlying model; reach in to enable.
+        target_for_ckpt = (
+            model.get_base_model() if hasattr(model, "get_base_model") else model
+        )
+        if hasattr(target_for_ckpt, "gradient_checkpointing_enable"):
+            target_for_ckpt.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False},
+            )
+        elif hasattr(target_for_ckpt, "text_model") and hasattr(
+            target_for_ckpt.text_model, "gradient_checkpointing_enable",
+        ):
+            target_for_ckpt.text_model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False},
+            )
+        # PEFT also needs ``enable_input_require_grads`` on the base
+        # so the frozen embed's output enters the autograd graph.
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
+    except Exception as e:
+        print(f"  (couldn't enable gradient_checkpointing: {e})", flush=True)
     opt = _t.optim.AdamW(trainable, lr=lr, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.0)
 
     losses = []
@@ -400,12 +480,10 @@ def run_model(model_dir: str, modes=("lora", "full")) -> dict:
         print(f"\n=== SKIP {model_dir}: unknown arch {arch_id} ===")
         return {"status": "skip"}
 
-    # Gemma 2 / Gemma 3 currently have ``forward`` but a stubbed
-    # ``backward`` (the dual-residual-norm bwd is in flight). Skip
-    # training-mode parity until the bwd lands.
-    if arch_id in ("Gemma2ForCausalLM", "Gemma3ForCausalLM"):
-        print(f"\n=== SKIP {model_dir} ({arch_id}) — bwd is stubbed; needs handwritten bwd. See SESSION_NOTES. ===")
-        return {"status": "skip", "reason": "Gemma 2/3 bwd not yet implemented"}
+    # Gemma 2 / Gemma 3 dual-residual backward landed (verified
+    # block-level + engine fwd+bwd parity; see
+    # docs/internal/gemma3_status.md). Trajectory parity runs through
+    # the same code path as every other arch.
 
     # Skip full-FT mode for very large models that would OOM HF's
     # plain torch.optim.AdamW path (no offloading on the HF side).

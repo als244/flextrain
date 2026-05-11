@@ -58,6 +58,13 @@ class Row:
     batch_tokens: int = 65_536
     max_seq_len: int = 2048
     expected_curve: str = ""   # original table value, for side-by-side
+    # When True, pass --apply-chat-template to train.py so each record
+    # is rendered through the model's native chat template (e.g.
+    # Gemma 2/3's <start_of_turn>...). Used to demonstrate that the
+    # OOD-prompt-format penalty seen on instruction-tuned models with
+    # the generic Instruction:/Response: wrapper disappears when we
+    # train on the format the model was actually post-trained on.
+    apply_chat_template: bool = False
 
 
 _REPO_ROOT = str(Path(__file__).resolve().parents[1])
@@ -158,6 +165,146 @@ ROWS = {r.key: r for r in [
         model_path=f"{_MODELS_DIR}/Qwen3.5-35B-A3B", mode="lora",
         expected_curve="0.743 → 0.541",
     ),
+    # ---- Gemma 2 / Gemma 3 rows ----
+    Row(
+        key="gemma2_2b_lora",
+        label="Gemma-2-2B-Instruct", params="2B",
+        arch="dense, dual-residual norms, GELU-gated, attn+final softcap",
+        model_path=f"{_MODELS_DIR}/Gemma-2-2B-Instruct", mode="lora",
+        expected_curve="not re-verified",
+    ),
+    Row(
+        key="gemma2_2b_full",
+        label="Gemma-2-2B-Instruct", params="2B",
+        arch="dense, dual-residual norms, GELU-gated, attn+final softcap",
+        model_path=f"{_MODELS_DIR}/Gemma-2-2B-Instruct", mode="full",
+        expected_curve="not re-verified",
+    ),
+    Row(
+        key="gemma3_1b_lora",
+        label="Gemma-3-1B-Instruct", params="1B",
+        arch="dense, dual-residual norms, QK-norm, alt local/global RoPE",
+        model_path=f"{_MODELS_DIR}/Gemma-3-1B-Instruct", mode="lora",
+        expected_curve="not re-verified",
+    ),
+    Row(
+        key="gemma3_1b_full",
+        label="Gemma-3-1B-Instruct", params="1B",
+        arch="dense, dual-residual norms, QK-norm, alt local/global RoPE",
+        model_path=f"{_MODELS_DIR}/Gemma-3-1B-Instruct", mode="full",
+        expected_curve="not re-verified",
+    ),
+    Row(
+        key="gemma3_4b_lora",
+        label="Gemma-3-4B-Instruct", params="4B",
+        arch="dense, dual-residual, QK-norm, alt RoPE + linear scaling",
+        model_path=f"{_MODELS_DIR}/Gemma-3-4B-Instruct", mode="lora",
+        # Match the full-FT row's batch so step-0 losses are
+        # directly comparable (LoRA at init has A·B=0 → identical
+        # to base ↔ should give the same step-0 loss as full FT).
+        batch_tokens=32_768,
+        expected_curve="not re-verified",
+    ),
+    Row(
+        key="gemma3_4b_full",
+        label="Gemma-3-4B-Instruct", params="4B",
+        arch="dense, dual-residual, QK-norm, alt RoPE + linear scaling",
+        model_path=f"{_MODELS_DIR}/Gemma-3-4B-Instruct", mode="full",
+        batch_tokens=32_768,
+        expected_curve="not re-verified",
+    ),
+    Row(
+        key="gemma3_12b_lora",
+        label="Gemma-3-12B-Instruct", params="12B",
+        arch="dense, dual-residual, QK-norm, alt RoPE + linear scaling",
+        model_path=f"{_MODELS_DIR}/Gemma-3-12B-Instruct", mode="lora",
+        # Match the full-FT row's batch (see comment on 4B LoRA).
+        batch_tokens=16_384,
+        expected_curve="not re-verified",
+    ),
+    Row(
+        key="gemma3_12b_full",
+        label="Gemma-3-12B-Instruct", params="12B",
+        arch="dense, dual-residual, QK-norm, alt RoPE + linear scaling",
+        model_path=f"{_MODELS_DIR}/Gemma-3-12B-Instruct", mode="full",
+        # 12B full FT on a 32 GiB card needs heavy host offload; cap the
+        # microbatch tightly so activations + flash-attn scratch fit.
+        batch_tokens=16_384,
+        expected_curve="not re-verified",
+    ),
+    # ---- Chat-template variants: same models, render each record
+    # through ``tokenizer.apply_chat_template`` so the model sees
+    # its NATIVE format (Gemma's <start_of_turn>user...). Drops the
+    # OOD-prompt-format penalty that the generic Instruction:/Response:
+    # wrapper imposes on instruct-tuned bases. ----
+    Row(
+        key="gemma2_2b_lora_chat",
+        label="Gemma-2-2B-Instruct (chat tpl)", params="2B",
+        arch="dense, dual-residual norms, GELU-gated, attn+final softcap",
+        model_path=f"{_MODELS_DIR}/Gemma-2-2B-Instruct", mode="lora",
+        apply_chat_template=True,
+        expected_curve="not re-verified",
+    ),
+    Row(
+        key="gemma2_2b_full_chat",
+        label="Gemma-2-2B-Instruct (chat tpl)", params="2B",
+        arch="dense, dual-residual norms, GELU-gated, attn+final softcap",
+        model_path=f"{_MODELS_DIR}/Gemma-2-2B-Instruct", mode="full",
+        apply_chat_template=True,
+        expected_curve="not re-verified",
+    ),
+    Row(
+        key="gemma3_1b_lora_chat",
+        label="Gemma-3-1B-Instruct (chat tpl)", params="1B",
+        arch="dense, dual-residual, QK-norm, alt local/global RoPE",
+        model_path=f"{_MODELS_DIR}/Gemma-3-1B-Instruct", mode="lora",
+        apply_chat_template=True,
+        expected_curve="not re-verified",
+    ),
+    Row(
+        key="gemma3_1b_full_chat",
+        label="Gemma-3-1B-Instruct (chat tpl)", params="1B",
+        arch="dense, dual-residual, QK-norm, alt local/global RoPE",
+        model_path=f"{_MODELS_DIR}/Gemma-3-1B-Instruct", mode="full",
+        apply_chat_template=True,
+        expected_curve="not re-verified",
+    ),
+    Row(
+        key="gemma3_4b_lora_chat",
+        label="Gemma-3-4B-Instruct (chat tpl)", params="4B",
+        arch="dense, dual-residual, QK-norm, alt RoPE + linear scaling",
+        model_path=f"{_MODELS_DIR}/Gemma-3-4B-Instruct", mode="lora",
+        batch_tokens=32_768,
+        apply_chat_template=True,
+        expected_curve="not re-verified",
+    ),
+    Row(
+        key="gemma3_4b_full_chat",
+        label="Gemma-3-4B-Instruct (chat tpl)", params="4B",
+        arch="dense, dual-residual, QK-norm, alt RoPE + linear scaling",
+        model_path=f"{_MODELS_DIR}/Gemma-3-4B-Instruct", mode="full",
+        batch_tokens=32_768,
+        apply_chat_template=True,
+        expected_curve="not re-verified",
+    ),
+    Row(
+        key="gemma3_12b_lora_chat",
+        label="Gemma-3-12B-Instruct (chat tpl)", params="12B",
+        arch="dense, dual-residual, QK-norm, alt RoPE + linear scaling",
+        model_path=f"{_MODELS_DIR}/Gemma-3-12B-Instruct", mode="lora",
+        batch_tokens=16_384,
+        apply_chat_template=True,
+        expected_curve="not re-verified",
+    ),
+    Row(
+        key="gemma3_12b_full_chat",
+        label="Gemma-3-12B-Instruct (chat tpl)", params="12B",
+        arch="dense, dual-residual, QK-norm, alt RoPE + linear scaling",
+        model_path=f"{_MODELS_DIR}/Gemma-3-12B-Instruct", mode="full",
+        batch_tokens=16_384,
+        apply_chat_template=True,
+        expected_curve="not re-verified",
+    ),
 ]}
 
 
@@ -213,9 +360,22 @@ def parse_train_log(log_path: Path) -> list[dict]:
 
 N_STEPS = 5
 LEEWAY_GPU_GIB = 3.0
+# Some configs (Gemma 3 4B/12B full FT) need extra GPU-side leeway
+# beyond the default — the working-set solver fills to near capacity
+# and leaves no room for the transient (T, expert_dim) scratch the
+# gated-FFN bwd kernel allocates per layer.
+_LEEWAY_OVERRIDE = {
+    "gemma3_4b_full": 6.0,
+    "gemma3_12b_full": 8.0,
+    "gemma3_12b_lora": 4.0,
+    "gemma3_4b_full_chat": 6.0,
+    "gemma3_12b_full_chat": 8.0,
+    "gemma3_12b_lora_chat": 4.0,
+}
 
 
 def _build_train_cmd(row: Row, out_dir: Path) -> list[str]:
+    leeway = _LEEWAY_OVERRIDE.get(row.key, LEEWAY_GPU_GIB)
     cmd = [
         sys.executable, "-u", _TRAIN_PY,
         "--model", row.model_path,
@@ -226,7 +386,7 @@ def _build_train_cmd(row: Row, out_dir: Path) -> list[str]:
         "--data-source", "json_sft",
         "--dataset", _DATASET,
         "--output-dir", str(out_dir / "train_out"),
-        "--leeway-gpu-mem-gib", str(LEEWAY_GPU_GIB),
+        "--leeway-gpu-mem-gib", str(leeway),
         # Match the LR the verified-table runs were originally measured
         # at (3e-5 across both modes). train.py defaults differ per
         # mode — overriding here keeps the curves comparable.
@@ -234,6 +394,8 @@ def _build_train_cmd(row: Row, out_dir: Path) -> list[str]:
     ]
     if row.mode == "lora":
         cmd += ["--lora-rank", "16", "--lora-alpha", "16.0"]
+    if row.apply_chat_template:
+        cmd += ["--apply-chat-template"]
     return cmd
 
 
