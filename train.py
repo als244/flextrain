@@ -91,6 +91,7 @@ def _arch_module_for(hf_config: dict[str, Any]):
         "Qwen3_5MoeForConditionalGeneration": "qwen3_5_moe",
         "OlmoeForCausalLM": "olmoe",
         "Gemma2ForCausalLM": "gemma2",
+        "Gemma3ForCausalLM": "gemma3",
         "Gemma3ForConditionalGeneration": "gemma3",
     }
     if arch_id in overrides:

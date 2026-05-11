@@ -110,6 +110,14 @@ class WeightMapEntry:
     ``hf_name`` may contain the placeholder ``{i}`` for a backbone-layer
     index; :func:`_render_hf_name` substitutes.
 
+    ``hf_name_alternates`` is a tuple of alternate templates the loader
+    will try if ``hf_name`` is absent from the checkpoint. First name
+    present in the shards wins. Used by archs whose HF safetensor
+    layout depends on the wrapping class — e.g. Gemma 3:
+    ``Gemma3ForCausalLM`` (1B) saves weights under ``model.layers.*``
+    while ``Gemma3ForConditionalGeneration`` (4B/12B) saves them under
+    ``language_model.model.layers.*``. One ArchSpec, two prefixes.
+
     ``optional=True`` marks an entry that may be absent on disk for
     SOME layers (heterogeneous backbones — e.g. Qwen3-Next where
     ``self_attn.*`` exists only on full-attn layers and ``linear_attn.*``
@@ -121,6 +129,7 @@ class WeightMapEntry:
     hf_name: str
     transform: Transform = Transform.NONE
     optional: bool = False
+    hf_name_alternates: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -303,25 +312,40 @@ def load_hf_safetensors(
     # ``optional_pairs`` collects HF names from entries marked
     # ``optional=True``; they are excluded from the strict
     # "must-have-been-consumed" check (heterogeneous backbones).
+    #
+    # For entries with ``hf_name_alternates``, we register one pair per
+    # candidate name, all pointing at the same dest slot. The loader's
+    # idempotent ``copy_()`` populates from whichever name happens to
+    # be in the shards; only one is ever expected to be present.
+    # ``alternate_groups`` tracks "at least one of these names must
+    # have been consumed" so strict mode rejects truly-missing entries
+    # without flagging the unused alternates as missing.
     pairs: list[tuple[str, tuple[str, str], Transform]] = []
     optional_hf_names: set[str] = set()
-    for entry in arch.embed:
-        hf = _render_hf_name(entry.hf_name, None)
-        pairs.append((hf, ("embed", entry.flextrain_name), entry.transform))
-        if entry.optional:
-            optional_hf_names.add(hf)
-    for entry in arch.head:
-        hf = _render_hf_name(entry.hf_name, None)
-        pairs.append((hf, ("head", entry.flextrain_name), entry.transform))
-        if entry.optional:
-            optional_hf_names.add(hf)
-    for i in range(num_layers):
-        scope = f"layer_{i}"
-        for entry in arch.layer:
-            hf = _render_hf_name(entry.hf_name, i)
+    alternate_groups: list[tuple[str, list[str]]] = []  # (label, names_for_strict_check)
+
+    def _add_entry(entry: WeightMapEntry, scope: str, layer_idx: int | None) -> None:
+        primary = _render_hf_name(entry.hf_name, layer_idx)
+        candidates = [primary] + [
+            _render_hf_name(alt, layer_idx) for alt in entry.hf_name_alternates
+        ]
+        for hf in candidates:
             pairs.append((hf, (scope, entry.flextrain_name), entry.transform))
             if entry.optional:
                 optional_hf_names.add(hf)
+        if not entry.optional:
+            alternate_groups.append(
+                (f"{scope}/{entry.flextrain_name}", candidates)
+            )
+
+    for entry in arch.embed:
+        _add_entry(entry, "embed", None)
+    for entry in arch.head:
+        _add_entry(entry, "head", None)
+    for i in range(num_layers):
+        scope = f"layer_{i}"
+        for entry in arch.layer:
+            _add_entry(entry, scope, i)
 
     # Route each expected HF tensor to its shard file.
     by_shard: dict[str, list[tuple[str, tuple[str, str], Transform]]] = {}
@@ -373,14 +397,23 @@ def load_hf_safetensors(
                 _consume_shard(shard_path, wanted)
 
     if strict:
-        missing = [
-            hf for hf, *_ in pairs
-            if hf not in consumed and hf not in optional_hf_names
+        # A required entry is satisfied iff AT LEAST ONE of its
+        # candidate names (primary + alternates) was consumed. Entries
+        # marked optional via ``optional_hf_names`` are not in the
+        # alternate-groups list.
+        missing_groups = [
+            (label, candidates)
+            for label, candidates in alternate_groups
+            if not any(c in consumed for c in candidates)
         ]
-        if missing:
+        if missing_groups:
+            sample = [
+                f"{lbl} (tried {cands[:2]}{'...' if len(cands)>2 else ''})"
+                for lbl, cands in missing_groups[:5]
+            ]
             raise KeyError(
-                f"{len(missing)} expected HF tensors not found in shards. "
-                f"First missing: {missing[:5]}"
+                f"{len(missing_groups)} expected HF entries not satisfied. "
+                f"First missing: {sample}"
             )
 
     # Arch-specific post-load hook (MoE expert stacking, etc.). Runs

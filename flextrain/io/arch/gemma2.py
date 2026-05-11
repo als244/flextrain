@@ -248,6 +248,7 @@ def hf_config_to_hyperparams(hf_config: Any) -> dict:
         if not isinstance(hf_config, dict)
         else hf_config.get
     )
+    hidden = int(get("hidden_size"))
     return {
         "rms_norm_eps": get("rms_norm_eps", 1e-6),
         "rope_theta": get("rope_theta", 10_000.0),
@@ -256,6 +257,9 @@ def hf_config_to_hyperparams(hf_config: Any) -> dict:
         "final_logit_softcap": get("final_logit_softcapping", 30.0),
         "query_pre_attn_scalar": get("query_pre_attn_scalar"),
         "sliding_window": get("sliding_window") or 4096,
+        # Gemma multiplies input embeddings by ``sqrt(hidden_size)``
+        # before the first decoder layer.
+        "embed_scale": hidden ** 0.5,
         # ``layer_types`` is a list of "global_attention" / "sliding_attention"
         # one per layer. Default: alternate (every odd layer is sliding).
         "layer_types": get("layer_types"),

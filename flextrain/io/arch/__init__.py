@@ -36,12 +36,12 @@ __all__ = [
 # Short-name registry used by ``flextrain.from_dims``. Each entry maps
 # a user-facing arch name to the ``flextrain.io.arch.*`` module that
 # exposes ``ARCH_NAME``, ``expand_dims``, ``default_hyperparams``, and
-# ``BLOCK_BUILDER``. Gemma3 has an ArchSpec but no block builder
-# registered yet, so it's still excluded.
+# ``BLOCK_BUILDER``.
 ARCH_MODULES = {
     "llama": llama,
     "mistral": mistral,
     "gemma2": gemma2,
+    "gemma3": gemma3,
     "qwen2": qwen2,
     "qwen3": qwen3,
     "olmoe": olmoe,

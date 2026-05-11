@@ -157,11 +157,16 @@ def _select_block_builder(hf_config: Mapping) -> BlockBuilder:
 # ---------------------------------------------------------------------------
 
 
-def _build_embed(dims: Mapping, *, compute, master, grad):
+def _build_embed(
+    dims: Mapping, hp: Mapping | None = None, *, compute, master, grad,
+):
     from flextrain.nn.embed import TokenEmbedConfig, TokenEmbedLayer
     return TokenEmbedLayer(TokenEmbedConfig(
         vocab_size=int(dims["vocab_size"]),
         d_model=int(dims["d_model"]),
+        # Gemma 2 / 3 set embed_scale = sqrt(d_model) via hyperparams.
+        # All other arches leave this None (no scaling).
+        embed_scale=(hp.get("embed_scale") if hp is not None else None),
         compute_dtype=compute, master_dtype=master, grad_dtype=grad,
     ))
 
@@ -173,6 +178,8 @@ def _build_head(dims: Mapping, hp: Mapping, *, compute, master, grad, norm_grad)
         vocab_size=int(dims["vocab_size"]),
         rms_norm_eps=float(hp.get("rms_norm_eps", 1e-5)),
         head_chunk_size=int(hp.get("head_chunk_size", 1024)),
+        # Gemma 2 final-logit softcap (None for all other archs).
+        final_logit_softcap=hp.get("final_logit_softcap"),
         compute_dtype=compute, master_dtype=master, grad_dtype=grad,
         norm_grad_dtype=norm_grad,
     ))
@@ -444,7 +451,8 @@ def _build_active_model(
 
     # Build embed + head + backbone.
     embed = _build_embed(
-        dims, compute=compute_dtype, master=master_dtype, grad=grad_dtype,
+        dims, hyperparams,
+        compute=compute_dtype, master=master_dtype, grad=grad_dtype,
     )
     head = _build_head(
         {**dims, "head_chunk_size": head_chunk_size},
@@ -820,6 +828,7 @@ _ARCH_MODULE_OVERRIDES: dict[str, str] = {
     "OlmoeForCausalLM": "olmoe",
     "Gemma2ForCausalLM": "gemma2",
     "Gemma3ForCausalLM": "gemma3",
+    "Gemma3ForConditionalGeneration": "gemma3",
 }
 
 

@@ -56,6 +56,10 @@ class TokenEmbedConfig:
     compute_dtype: torch.dtype = torch.bfloat16
     master_dtype: torch.dtype | None = None  # defaults to compute_dtype
     grad_dtype: torch.dtype | None = None  # defaults to compute_dtype
+    # Gemma 2 / Gemma 3 scale the embedding output by ``sqrt(d_model)``
+    # before feeding it into the first decoder layer. Other arches
+    # (Llama, Qwen, Mistral) use 1.0 (no scaling). ``None`` ≡ 1.0.
+    embed_scale: float | None = None
 
 
 class TokenEmbedLayer:
@@ -118,12 +122,17 @@ class TokenEmbedLayer:
         weights: Mapping[str, torch.Tensor],
         ctx: LayerContext,  # noqa: ARG002  -- not consumed; kept for Protocol
     ) -> torch.Tensor:
-        """Return ``weights["w_tok_embeddings"][token_ids, :]`` (a copy).
+        """Return ``weights["w_tok_embeddings"][token_ids, :]`` (a copy),
+        optionally scaled by ``cfg.embed_scale`` (Gemma's
+        ``sqrt(d_model)`` knob).
 
         Mirrors ``orig/awsm_transformer/embed.py:12-18``.
         """
         table = weights["w_tok_embeddings"]
-        return table[token_ids, :]
+        out = table[token_ids, :]
+        if self.cfg.embed_scale is not None and self.cfg.embed_scale != 1.0:
+            out = out.mul_(self.cfg.embed_scale)
+        return out
 
     def backward(
         self,
@@ -134,7 +143,7 @@ class TokenEmbedLayer:
         grads: MutableMapping[str, torch.Tensor],
         ctx: LayerContext,  # noqa: ARG002  -- not consumed; kept for Protocol
     ) -> None:
-        """Scatter-add ``dx`` into ``grads["g_tok_embeddings"]``.
+        """Scatter-add ``dx * embed_scale`` into ``grads["g_tok_embeddings"]``.
 
         Skipped under LoRA (the embed table is frozen, ``grads`` does
         not contain ``g_tok_embeddings``).
@@ -144,7 +153,11 @@ class TokenEmbedLayer:
         g = grads.get("g_tok_embeddings")
         if g is None:
             return
-        flextrain_embedding_bwd(dx, token_ids, g, scale=1.0)
+        scale = (
+            float(self.cfg.embed_scale)
+            if self.cfg.embed_scale is not None else 1.0
+        )
+        flextrain_embedding_bwd(dx, token_ids, g, scale=scale)
 
     def compute_cost(self, chunk: ChunkMeta) -> ComputeCost:
         """Gather (forward) + scatter-add (backward) are both bandwidth-

@@ -74,6 +74,10 @@ class LMHeadConfig:
     # Micro-chunk size along the token axis. Bounds the peak (T', V)
     # logits buffer. Orig default = 1024 (see head.py:110).
     head_chunk_size: int = 1024
+    # Gemma 2 final-logit softcap: ``logits := tanh(logits / cap) * cap``
+    # before the loss. Disable by setting to ``None`` (default; Gemma 3,
+    # Llama, Qwen, etc.). Gemma 2 sets ``cap = 30.0`` in the HF config.
+    final_logit_softcap: float | None = None
 
     compute_dtype: torch.dtype = torch.bfloat16
     master_dtype: torch.dtype | None = None  # defaults to compute_dtype
@@ -255,6 +259,22 @@ class LMHead:
             # ---- fwd: head projection matmul -> (T', V) logits ----
             logits = torch.mm(head_proj_in, w_head_proj)
 
+            # ---- optional: Gemma 2 final-logit softcap ----
+            # ``logits_capped = tanh(logits / cap) * cap``. Save the
+            # softcap-derivative gate ``g = sech^2(logits / cap) =
+            # 1 - (logits_capped / cap)^2`` so we can multiply ``dZ``
+            # by it after the loss returns ``dloss/d(logits_capped)``.
+            cap = cfg.final_logit_softcap
+            softcap_gate: torch.Tensor | None = None
+            if cap is not None and cap > 0.0:
+                inv_cap = 1.0 / float(cap)
+                # Apply in-place to avoid a second (T', V) allocation.
+                logits.mul_(inv_cap).tanh_().mul_(float(cap))
+                # Gate computed from the SOFTCAPPED logits: cheaper than
+                # recomputing tanh, no need to retain the raw logits.
+                ratio = logits * inv_cap
+                softcap_gate = (1.0 - ratio * ratio).to(logits.dtype)
+
             # ---- loss ----
             token_slice = token_ctx.slice_for(offset, t_prime)
             dZ, aux = loss_fn.compute(
@@ -263,6 +283,13 @@ class LMHead:
                 loss_scale=loss_scale,
                 per_token_loss_out=per_token_loss[offset : offset + t_prime],
             )
+
+            # Chain the softcap derivative into dZ. CE returns
+            # ``dloss/d(logits_capped)``; we need ``dloss/d(logits_raw)``
+            # for the head_proj wgrad / dX matmuls.
+            if softcap_gate is not None:
+                dZ.mul_(softcap_gate)
+                del softcap_gate
             # logits buffer may be the same as dZ (CE reuses it). Either
             # way, drop the local name so it can be freed next iter.
             del logits
