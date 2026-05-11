@@ -692,6 +692,100 @@ def report_table(runs_dir: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def compare(
+    baseline_dir: str, rerun_dir: str,
+    *,
+    loss_atol: float = 1e-4,
+    throughput_rel_tol: float = 0.05,
+) -> int:
+    """Diff two ``run-grid`` output directories. Used as a regression
+    check after big engine changes — re-run the grid, then compare
+    against a frozen baseline (typically the dir whose numbers landed
+    in docs/verified_runs.md).
+
+    For every row present in BOTH dirs, compare:
+      * full per-step loss curve  (atol = ``loss_atol``)
+      * step-3 tok/sec            (relative tol = ``throughput_rel_tol``)
+
+    Loss is the deterministic correctness check (deterministic data
+    + deterministic kernels = bit-identical losses re-run-to-re-run).
+    Throughput is allowed to wobble within ±``throughput_rel_tol`` since
+    GPU temperature, neighbor-process noise, etc. all affect it.
+
+    Returns the number of rows with at least one mismatch. ``0`` means
+    a clean re-verify.
+    """
+    base = Path(baseline_dir)
+    cur = Path(rerun_dir)
+    mismatches = 0
+    matched_rows = 0
+    missing_rerun: list[str] = []
+    print(f"baseline: {base}")
+    print(f"rerun:    {cur}")
+    print()
+    print(
+        f"{'row':<28} {'losses':<7} {'tok/s drift':<14} status"
+    )
+    print("-" * 70)
+    for key, row in ROWS.items():
+        bf = base / key / "final.json"
+        rf = cur / key / "final.json"
+        if not bf.is_file():
+            continue
+        if not rf.is_file():
+            missing_rerun.append(key)
+            continue
+        b = json.loads(bf.read_text())
+        r = json.loads(rf.read_text())
+        matched_rows += 1
+
+        # Loss curve check.
+        loss_ok = True
+        loss_max_diff = 0.0
+        if len(b["losses"]) != len(r["losses"]):
+            loss_ok = False
+        else:
+            for li, ri in zip(b["losses"], r["losses"]):
+                d = abs(li - ri)
+                if d > loss_max_diff:
+                    loss_max_diff = d
+                if d > loss_atol:
+                    loss_ok = False
+
+        # Throughput check (step-3 tok/sec).
+        def _step3_tps(d: dict) -> float | None:
+            s = next((s for s in d.get("steps", []) if s.get("step") == 3), None)
+            return s.get("tok_per_s") if s else None
+        b_tps = _step3_tps(b)
+        r_tps = _step3_tps(r)
+        if b_tps and r_tps:
+            tps_rel = abs(r_tps - b_tps) / max(b_tps, 1e-9)
+            tps_ok = tps_rel <= throughput_rel_tol
+            tps_label = f"{(r_tps - b_tps)/b_tps*100:+.1f}%"
+        else:
+            tps_rel = 0.0
+            tps_ok = True
+            tps_label = "n/a"
+
+        ok = loss_ok and tps_ok
+        if not ok:
+            mismatches += 1
+        status = "OK" if ok else "DRIFT"
+        loss_label = f"Δ{loss_max_diff:.4f}" if loss_max_diff > 0 else "exact"
+        print(f"{key:<28} {loss_label:<7} {tps_label:<14} {status}")
+
+    print()
+    if missing_rerun:
+        print(
+            f"missing from rerun ({len(missing_rerun)}): "
+            f"{', '.join(missing_rerun[:5])}"
+            + (" ..." if len(missing_rerun) > 5 else "")
+        )
+    print(f"summary: {matched_rows - mismatches}/{matched_rows} rows match "
+          f"({mismatches} drift, {len(missing_rerun)} missing)")
+    return mismatches
+
+
 def main():
     p = argparse.ArgumentParser()
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -708,6 +802,18 @@ def main():
     p3 = sub.add_parser("report")
     p3.add_argument("--runs-dir", required=True)
 
+    p4 = sub.add_parser(
+        "compare",
+        help="Diff two run-grid output dirs (regression check).",
+    )
+    p4.add_argument("--baseline", required=True,
+                    help="Directory of the trusted prior run (the one "
+                         "whose numbers landed in docs/verified_runs.md).")
+    p4.add_argument("--rerun", required=True,
+                    help="Directory of the new run.")
+    p4.add_argument("--loss-atol", type=float, default=1e-4)
+    p4.add_argument("--throughput-rel-tol", type=float, default=0.05)
+
     args = p.parse_args()
     if args.cmd == "run-one":
         run_one(ROWS[args.row], args.out)
@@ -715,6 +821,13 @@ def main():
         run_grid(args.out, only=args.only)
     elif args.cmd == "report":
         report_table(args.runs_dir)
+    elif args.cmd == "compare":
+        nbad = compare(
+            args.baseline, args.rerun,
+            loss_atol=args.loss_atol,
+            throughput_rel_tol=args.throughput_rel_tol,
+        )
+        sys.exit(1 if nbad > 0 else 0)
 
 
 if __name__ == "__main__":

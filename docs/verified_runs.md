@@ -297,6 +297,55 @@ across all 5 steps, end-to-end. That's the strongest evidence the
 Gemma 2 / Gemma 3 engine path produces the right gradients — same
 sequences in, same loss trajectory out.
 
+## Re-verify protocol (post big-engine-change regression check)
+
+Wrap script: ``bash experiments/reverify_gemma.sh`` — re-runs the 16
+Gemma rows + a Llama-3.2-1B-LoRA smoke row (catches shared-code
+regressions in api.py / head.py / embed.py / hf_weights.py), then
+diffs the rerun against the committed baseline at
+``runs/verified_gemma/`` via ``verified_runs.py compare``. Exits 0
+when every row matches loss bit-exactly and throughput within ±5%;
+non-zero on any drift.
+
+Expectations on a clean run on the same hardware:
+
+* **Losses**: bit-identical to ``runs/verified_gemma/<row>/final.json``
+  for every row, every step. Engine code is deterministic given
+  deterministic data + deterministic kernels.
+* **Throughput**: within ±5% of the per-row step-3 tok/s. The few
+  exceptions seen during the post-Gemma-engine-integration reverify
+  were all on the "baseline" side (conservative measurement during
+  GPU warm-up); reruns at steady state run +5-15% faster.
+* **CUDA non-determinism caveat**: on 4B/12B with bf16 activations
+  through flash-attn + LoRA-adapter grads (atomic accumulators),
+  individual run-to-run drift of ~0.001-0.01 in losses is possible
+  but uncommon. Rare numerical blowups under aggressive LR cooldown
+  on 5-step toy runs can saturate the cross-entropy clamp
+  (``loss=100.0`` sentinel in ``flextrain_cross_entropy_loss``) —
+  re-running the row typically lands clean. If a row's loss
+  consistently differs from baseline across **two** clean reruns,
+  there's a real regression.
+
+When a re-verify detects drift, the bisect order is:
+
+1. ``tests/test_gemma3_block_parity.py`` — per-layer math. If this
+   breaks, the issue is in the activation kernel / dual-residual
+   bwd / forward_recompute. Look at commits 1 and 2.
+2. ``tests/test_gemma3_full_forward_parity.py`` — full-model fwd
+   bypassing the engine. If this breaks but block-parity passes,
+   the issue is in the manual driver or HF-weight remap. Unlikely
+   to bisect engine bugs.
+3. ``tests/test_engine_fwd_bwd_parity.py`` — engine fwd+bwd vs HF on
+   a fixed prompt. If this breaks but block-parity passes, the
+   issue is in the engine wiring (block builder, post_load_permute,
+   embed/head, ARCH_MODULES). Look at commit 3.
+4. ``tests/test_arch_parity.py`` — 5-step optimizer trajectory. If
+   all the above pass but this drifts on a NEW model not previously
+   tested, the bug is mode-specific (e.g. LoRA-only). The lr=0
+   forward-only baseline + LoRA target audit (documented in
+   ``flextrain/nn/layers/gemma3.py:289``) are the next-level
+   triage.
+
 ## RTX 3090 (24 GiB, 117 GiB host) — historical reference
 
 Pre-2026-05 sweep. Most rows were skipped on this hardware due to
