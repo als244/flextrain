@@ -2,19 +2,20 @@
 
 An alternative single-GPU training engine for transformer LLMs,
 optimised for the tight-memory and long-context regimes where
-mainstream engines (FSDP, DeepSpeed ZeRO) require multiple GPUs or
-fall back to high-overhead offloading. A working-set planner + DP
-solver schedules every tensor (parameters, gradients, optimizer
-state, activations) between GPU and host RAM. You declare GPU and
-host RAM budgets at model construction; the planner derives the
-working-set schedule — which tensors live on device, which offload,
-what recomputes — and auto-tunes activation save-tiers and chunk
-sizes to that budget, with no manual offload-band tuning. On a 32 GiB
-GPU + 192 GiB host: **a 9B dense model full-fine-tunes at 80% of an
-RTX 5090's bf16 peak throughput**; **12B dense full-fine-tunes** on
-the same card; **27B-parameter LoRA tuning** hits **78% of peak** —
-all on one GPU. See [`docs/verified_runs.md`](docs/verified_runs.md)
-for the full table.
+mainstream engines (DeepSpeed ZeRO, FSDP, Megatron-LM, Unsloth)
+either lose throughput to idle stalls and excessive recomputation or
+require additional GPUs (more aggregate VRAM) to fit the model in
+the first place. A working-set planner + DP solver schedules every
+tensor (parameters, gradients, optimizer state, activations) between
+GPU and host RAM. You declare GPU and host RAM budgets at model
+construction; the planner automatically parameterizes a unified
+data-sizing, offloading, and recomputation policy that fits those
+budgets — no manual tuning required. On a 32 GiB GPU + 192 GiB host:
+**a 9B dense model full-fine-tunes at 80% of an RTX 5090's bf16 peak
+throughput**; **12B dense full-fine-tunes** on the same card;
+**27B-parameter LoRA tuning** hits **78% of peak** — all on one GPU.
+See [`docs/verified_runs.md`](docs/verified_runs.md) for the full
+table.
 
 **Scope.** Single-GPU only. No distributed / multi-GPU support — the
 working-set solver is the value proposition, not data or tensor
