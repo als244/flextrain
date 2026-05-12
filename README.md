@@ -20,10 +20,12 @@ throughput**; **12B dense full-fine-tunes** on the same card;
 See [`docs/verified_runs.md`](docs/verified_runs.md) for the full
 table.
 
-**Scope.** Single-GPU only. No distributed / multi-GPU support — the
-working-set solver is the value proposition, not data or tensor
-parallelism. The CUDA path is the only supported execution backend.
-Tests are standalone scripts (no `pytest` runner yet).
+**Scope.** Currently single-GPU; multi-GPU support is in active
+development. The working-set solver — which determines what fits on
+the GPU and at what throughput — is the core value proposition and
+remains the differentiator independent of device count. The CUDA path
+is the only supported execution backend. Tests are standalone scripts
+(no `pytest` runner yet).
 
 **Supported architectures.** Llama 2 / 3 / 3.1+, Mistral, Qwen2,
 Qwen3 (dense + MoE), Qwen3.5 (dense + MoE) / Qwen3.6, Qwen3-Next,
