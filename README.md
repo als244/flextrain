@@ -5,10 +5,14 @@ optimised for the tight-memory and long-context regimes where
 mainstream engines (FSDP, DeepSpeed ZeRO) require multiple GPUs or
 fall back to high-overhead offloading. A working-set planner + DP
 solver schedules every tensor (parameters, gradients, optimizer
-state, activations) between GPU and host RAM so a 9B dense model
-full-fine-tunes at **80% of an RTX 5090's bf16 peak throughput** on
-a single 32 GiB card; **12B dense full-fine-tunes** on the same
-hardware, and **27B-parameter LoRA tuning** hits **78% of peak** —
+state, activations) between GPU and host RAM. You declare GPU and
+host RAM budgets at model construction; the planner derives the
+working-set schedule — which tensors live on device, which offload,
+what recomputes — and auto-tunes activation save-tiers and chunk
+sizes to that budget, with no manual offload-band tuning. On a 32 GiB
+GPU + 192 GiB host: **a 9B dense model full-fine-tunes at 80% of an
+RTX 5090's bf16 peak throughput**; **12B dense full-fine-tunes** on
+the same card; **27B-parameter LoRA tuning** hits **78% of peak** —
 all on one GPU. See [`docs/verified_runs.md`](docs/verified_runs.md)
 for the full table and [`docs/gemma_runs.md`](docs/gemma_runs.md) for
 the Gemma 2 / Gemma 3 sweep.
