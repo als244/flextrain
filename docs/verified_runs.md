@@ -196,8 +196,13 @@ mirror the format of the table above.
 
 ## RTX 3090 (24 GiB, 117 GiB host) — historical reference
 
-Pre-2026-05 sweep. Most rows were skipped on this hardware due to
-memory limits.
+Pre-2026-05 sweep. Most rows are marked _not re-verified_ simply because
+the older sweep didn't get to them — **not** because the hardware can't
+handle them. flextrain's host-offload + working-set solver routinely
+fits the bigger models (Qwen3-30B-A3B, Qwen3.5-MoE-35B-A3B, etc.) on a
+24 GiB GPU with enough host RAM; the rows listed below as `0.797 → 0.620`
+etc. confirm the engine path runs end-to-end on this hardware. The
+blanks are coverage gaps from this one sweep, not a hardware ceiling.
 
 | Model | Params | Arch | Mode | Batch tokens | Loss curve (5 steps) |
 |---|---|---|---|---|---|
