@@ -17,46 +17,56 @@ zeros) so older numbers are not directly comparable.
 
 ## How to reproduce this table
 
-One wrapper script regenerates the whole sweep and (optionally) diffs
-against a baseline:
+The 13 rows below regenerate with a single wrapper script:
 
 ```bash
-# Reproduce just the 13 rows in this file (no Gemma). Writes to
-# runs/reverify_<UTC timestamp>/. Takes ~25 min on a single RTX 5090.
+# Default: the 13 rows in this file (no Gemma).
+# Writes to runs/reverify_<UTC timestamp>/. ~25 min on a single RTX 5090.
 bash experiments/reverify.sh
+```
 
-# Also include the 16 Gemma 2 / Gemma 3 rows from docs/gemma_runs.md.
-# Total runtime ~50 min.
-bash experiments/reverify.sh --include-gemma
+Optionally diff the rerun against a trusted baseline directory; the
+script exits non-zero if any row's per-step loss differs from baseline
+or throughput drifts more than ±5%:
 
-# Diff against a known-good baseline (loss bit-exactness, throughput ±5%).
-# The script exits non-zero on any drift.
+```bash
 bash experiments/reverify.sh --baseline runs/<trusted_baseline_dir>
+```
 
-# Combine: full sweep + diff.
-bash experiments/reverify.sh --include-gemma --baseline runs/<trusted_baseline_dir>
+Override the output dir if the default timestamp path isn't what you
+want:
 
-# Pick a specific output dir.
+```bash
 bash experiments/reverify.sh --out runs/my_reverify_2026_05_12
 ```
 
-Default output goes to `runs/reverify_<UTC timestamp>/`. Each row's
-artifacts land at `<out>/<row>/{train.log, final.json, train_out/}`;
-the wrapper also writes a freshly-formatted table to
-`<out>/new_table.md`.
-
-Run this script before committing any change that could affect training
+Run the wrapper before committing any change that could affect training
 numerics (kernels, optimizer, working-set solver, mem-budget logic).
-The `--baseline` diff is the regression gate — it asserts every row's
-per-step loss is bit-identical to baseline and throughput is within ±5%.
+The `--baseline` diff is the regression gate. Each row's artifacts
+land at `<out>/<row>/{train.log, final.json, train_out/}`; the wrapper
+also writes a freshly-formatted table at `<out>/new_table.md`.
 
-Direct CLI (no wrapper) for one-off runs:
+### Also regenerating the Gemma table
+
+The Gemma 2 / Gemma 3 rows in [`gemma_runs.md`](gemma_runs.md) are
+toggled in by `--include-gemma` — same wrapper, broader scope (~50 min
+total instead of ~25):
 
 ```bash
-# All 29 rows.
-python experiments/verified_runs.py run-grid --out runs/<dir>
+# Reproduces this file's 13 rows AND the 16 Gemma rows in gemma_runs.md.
+bash experiments/reverify.sh --include-gemma
 
-# Just specific rows.
+# Same, with a baseline diff covering all 29 rows.
+bash experiments/reverify.sh --include-gemma --baseline runs/<trusted_baseline_dir>
+```
+
+### Direct CLI (no wrapper)
+
+Useful for one-off subsets or comparing arbitrary run dirs:
+
+```bash
+# A specific subset of rows (any of the 29 row names from
+# experiments/verified_runs.py's registry).
 python experiments/verified_runs.py run-grid --out runs/<dir> \
     --only llama_3_2_1b_lora qwen3_8b_full
 
@@ -64,6 +74,8 @@ python experiments/verified_runs.py run-grid --out runs/<dir> \
 python experiments/verified_runs.py compare \
     --baseline runs/<old> --rerun runs/<new>
 ```
+
+### Path overrides
 
 Per-row defaults assume HF snapshots at `<repo>/models/<name>` and
 the SFT dataset at `<repo>/datasets/mathinstruct.jsonl`. Override via:
