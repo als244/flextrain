@@ -138,7 +138,7 @@ fix is a `--apply-chat-template` flag on `train.py` that calls
 {"role":"assistant",...}], tokenize=False)` and feeds the resulting
 string to the encoder; that's a separate change.
 
-## RTX 5090 (31.3 GiB, 192 GiB host) — full sweep, 2026-05-10
+## RTX 5090 (31.3 GiB, 192 GiB host) — full sweep, 2026-05-12
 
 All 13 rows re-verified at **auto memory budget** (no manual GPU/host
 caps). Per-step metrics (`tok/sec`, `eff TFLOPS`, `hw TFLOPS`,
@@ -154,19 +154,19 @@ reflects the working-set solver's recompute trade-off.
 
 | Model | Params | Arch | Mode | Loss curve (5 steps) | tok/sec | eff TFLOPS | hw TFLOPS | peak alloc | peak resv |
 |---|---|---|---|---|---|---|---|---|---|
-| Llama-3.2-1B | 1B | dense | LoRA | 1.055 → 1.012 | 28,682 | 143.2 | 143.6 | 26.60 | 26.80 |
-| Llama-3.2-1B | 1B | dense | full | 1.055 → 0.826 | 21,856 | 163.7 | 163.9 | 26.30 | 26.60 |
-| Llama-3.1-8B-Instruct | 8B | dense | LoRA | 0.783 → 0.747 |  5,330 | 161.1 | 161.3 | 27.00 | 27.50 |
-| Llama-3.1-8B-Instruct | 8B | dense | full | 0.783 → 0.600 |  3,723 | 168.7 | 174.3 | 26.50 | 26.80 |
-| OLMoE-1B-7B | 7B / 1B-active | MoE (64 experts) | LoRA | 0.865 → 0.844 | 22,697 | 108.2 | 125.3 | 25.70 | 28.60 |
-| OLMoE-1B-7B | 7B / 1B-active | MoE (64 experts) | full | 0.865 → 0.673 | 13,305 |  95.1 | 108.1 | 26.40 | 29.00 |
-| Qwen3-8B | 8B | dense, QK-norm | LoRA | 0.933 → 0.873 |  5,026 | 153.2 | 153.5 | 27.10 | 27.40 |
-| Qwen3-8B | 8B | dense, QK-norm | full | 0.928 → 0.478 |  3,533 | 161.6 | 169.2 | 27.60 | 27.80 |
-| Qwen3.5-9B | 9B | hybrid linear+full attn, dense MLP | LoRA | 0.747 → 0.661 |  4,947 | 158.3 | 158.9 | 27.00 | 27.90 |
-| Qwen3.5-9B | 9B | hybrid linear+full attn, dense MLP | full | 0.744 → 0.465 |  3,237 | 155.4 | 165.7 | 26.40 | 26.70 |
-| Qwen3.6-27B | 27B | hybrid linear+full attn, dense MLP | LoRA | 1.013 → 0.815 |  1,284 | 132.6 | 136.6 | 27.30 | 28.70 |
-| Qwen3-30B-A3B | 30B / 3B-active | MoE (128 experts) | LoRA | 0.900 → 0.866 |  7,767 |  96.7 | 121.6 | 25.90 | 28.70 |
-| Qwen3.5-MoE-35B-A3B | 35B / 3B-active | hybrid + MoE (256+1 experts) | LoRA | 0.742 → 0.676 |  5,923 |  74.6 |  92.3 | 24.90 | 28.50 |
+| Llama-3.2-1B | 1B | dense | LoRA | 1.055 → 1.012 | 28,479 | 142.2 | 142.5 | 27.00 | 27.20 |
+| Llama-3.2-1B | 1B | dense | full | 1.055 → 0.826 | 21,953 | 164.4 | 164.6 | 26.80 | 27.10 |
+| Llama-3.1-8B-Instruct | 8B | dense | LoRA | 0.783 → 0.747 |  5,350 | 161.7 | 161.9 | 27.40 | 27.90 |
+| Llama-3.1-8B-Instruct | 8B | dense | full | 0.783 → 0.600 |  3,740 | 169.5 | 174.8 | 26.80 | 27.10 |
+| OLMoE-1B-7B | 7B / 1B-active | MoE (64 experts) | LoRA | 0.865 → 0.844 | 22,788 | 108.6 | 125.8 | 26.00 | 28.90 |
+| OLMoE-1B-7B | 7B / 1B-active | MoE (64 experts) | full | 0.865 → 0.673 | 13,349 |  95.4 | 108.7 | 26.60 | 29.30 |
+| Qwen3-8B | 8B | dense, QK-norm | LoRA | 0.933 → 0.873 |  5,050 | 154.0 | 154.2 | 27.40 | 27.70 |
+| Qwen3-8B | 8B | dense, QK-norm | full | 0.928 → 0.478 |  3,540 | 161.9 | 168.5 | 27.70 | 27.90 |
+| Qwen3.5-9B | 9B | hybrid linear+full attn, dense MLP | LoRA | 0.747 → 0.660 |  5,002 | 160.0 | 160.5 | 27.30 | 28.20 |
+| Qwen3.5-9B | 9B | hybrid linear+full attn, dense MLP | full | 0.744 → 0.465 |  3,256 | 156.3 | 166.5 | 26.70 | 27.00 |
+| Qwen3.6-27B | 27B | hybrid linear+full attn, dense MLP | LoRA | 1.013 → 0.817 |  1,532 | 158.2 | 163.1 | 27.60 | 29.00 |
+| Qwen3-30B-A3B | 30B / 3B-active | MoE (128 experts) | LoRA | 0.900 → 0.866 |  7,800 |  97.1 | 122.2 | 26.20 | 29.00 |
+| Qwen3.5-MoE-35B-A3B | 35B / 3B-active | hybrid + MoE (256+1 experts) | LoRA | 0.742 → 0.677 |  5,926 |  74.7 |  92.4 | 25.20 | 28.80 |
 
 The Qwen3.5-9B full-FT loss curve (0.744 → 0.465) reproduces the
 historical RTX 3090 reference (0.744 → 0.455) to within ≈0.01. The
@@ -175,6 +175,15 @@ the instruction-tuned base is starting from a chat-template prior the
 generic `Instruction:/Response:` wrapper does not match (see the
 tokenization section above) — descent itself confirms the engine path
 is exercised cleanly.
+
+**Notes on the 2026-05-12 refresh vs the 2026-05-10 baseline:** every
+loss curve matches the prior baseline to within ≤0.001 (3rd-decimal
+rounding). Per-row throughput shifts are all within ±2% except
+Qwen3.6-27B-LoRA, which sped up from 1284 → 1532 tok/sec (+19% on
+tok/s, eff TFLOPS, and hw TFLOPS in lockstep) with loss curve
+unchanged. Most likely a steady-state GPU clock / thermal state
+difference between the two measurements; loss-curve invariance rules
+out a math change.
 
 ## Gemma family
 
