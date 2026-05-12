@@ -1,10 +1,15 @@
 # FlexTrain
 
-Train transformer LLMs on hardware where the model doesn't fit in GPU
-memory. FlexTrain rotates parameters, gradients, optimizer state, and
-activations between GPU and host RAM via a working-set planner + DP
-solver, so an 8B model trains end-to-end on a 24 GiB GPU without
-DeepSpeed or FSDP.
+An alternative single-GPU training engine for transformer LLMs,
+optimised for the tight-GPU-memory and long-context regimes where
+mainstream engines (FSDP, DeepSpeed ZeRO, etc.) either OOM, fall back
+to expensive sharding, or thrash on host-offload. A working-set
+planner + DP solver schedules parameters, gradients, optimizer state,
+and activations between GPU and host RAM so the entire model fits
+without slicing it across devices — an 8B model trains end-to-end on
+a 24 GiB GPU, and longer-context / larger-model workloads scale
+further than what comparable host-offload setups achieve at the same
+throughput.
 
 **Scope.** Single-GPU only. No distributed / multi-GPU support — the
 working-set solver is the value proposition, not data or tensor
