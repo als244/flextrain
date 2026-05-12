@@ -14,8 +14,7 @@ GPU + 192 GiB host: **a 9B dense model full-fine-tunes at 80% of an
 RTX 5090's bf16 peak throughput**; **12B dense full-fine-tunes** on
 the same card; **27B-parameter LoRA tuning** hits **78% of peak** —
 all on one GPU. See [`docs/verified_runs.md`](docs/verified_runs.md)
-for the full table and [`docs/gemma_runs.md`](docs/gemma_runs.md) for
-the Gemma 2 / Gemma 3 sweep.
+for the full table.
 
 **Scope.** Single-GPU only. No distributed / multi-GPU support — the
 working-set solver is the value proposition, not data or tensor
