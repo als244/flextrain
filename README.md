@@ -1,15 +1,17 @@
 # FlexTrain
 
 An alternative single-GPU training engine for transformer LLMs,
-optimised for the tight-GPU-memory and long-context regimes where
-mainstream engines (FSDP, DeepSpeed ZeRO, etc.) either OOM, fall back
-to expensive sharding, or thrash on host-offload. A working-set
-planner + DP solver schedules parameters, gradients, optimizer state,
-and activations between GPU and host RAM so the entire model fits
-without slicing it across devices — an 8B model trains end-to-end on
-a 24 GiB GPU, and longer-context / larger-model workloads scale
-further than what comparable host-offload setups achieve at the same
-throughput.
+optimised for the tight-memory and long-context regimes where
+mainstream engines (FSDP, DeepSpeed ZeRO) require multiple GPUs or
+fall back to high-overhead offloading. A working-set planner + DP
+solver schedules every tensor (parameters, gradients, optimizer
+state, activations) between GPU and host RAM so a 9B dense model
+full-fine-tunes at **80% of an RTX 5090's bf16 peak throughput** on
+a single 32 GiB card; **12B dense full-fine-tunes** on the same
+hardware, and **27B-parameter LoRA tuning** hits **78% of peak** —
+all on one GPU. See [`docs/verified_runs.md`](docs/verified_runs.md)
+for the full table and [`docs/gemma_runs.md`](docs/gemma_runs.md) for
+the Gemma 2 / Gemma 3 sweep.
 
 **Scope.** Single-GPU only. No distributed / multi-GPU support — the
 working-set solver is the value proposition, not data or tensor
@@ -18,10 +20,12 @@ Tests are standalone scripts (no `pytest` runner yet).
 
 **Supported architectures.** Llama 2 / 3 / 3.1+, Mistral, Qwen2,
 Qwen3 (dense + MoE), Qwen3.5 (dense + MoE) / Qwen3.6, Qwen3-Next,
-OLMoE — see [`docs/architectures.md`](docs/architectures.md). Each
-arch has forward + backward + HF safetensors load. End-to-end smoke
-runs on a 24 GiB GPU + 117 GiB host workstation are recorded in
-[`docs/verified_runs.md`](docs/verified_runs.md).
+OLMoE, Gemma 2 (dense), Gemma 3 (dense, text-only path) — see
+[`docs/architectures.md`](docs/architectures.md). Each arch has
+forward + backward + HF safetensors load. End-to-end smoke runs are
+recorded in [`docs/verified_runs.md`](docs/verified_runs.md) (Llama,
+Qwen, OLMoE families) and [`docs/gemma_runs.md`](docs/gemma_runs.md)
+(Gemma family).
 
 ## Install
 
