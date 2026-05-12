@@ -224,6 +224,7 @@ download.py  pre-stage models/datasets for air-gapped nodes
 | [optimizers.md](docs/optimizers.md) | AdamW / Muon / HybridMuonAdamW |
 | [export.md](docs/export.md) | export to vLLM / sGLang / HF (full, LoRA adapter, merged) |
 | [verified_runs.md](docs/verified_runs.md) | end-to-end smoke runs on the reference workstation |
+| [gemma_runs.md](docs/gemma_runs.md) | Gemma 2 / Gemma 3 verified runs + 5-step parity vs HF + re-verify protocol |
 
 ## Tests
 
