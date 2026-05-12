@@ -10,6 +10,11 @@ Smoke-test record from training a handful of supported models end-to-end.
 - **Generation**: greedy generation also verified — coherent output, hits
   EOS naturally.
 
+Loss values reflect mean cross-entropy over response tokens (positions
+where `targets != -100`); prior versions of this table reported a
+different convention (mean over all tokens, including prompt-position
+zeros) so older numbers are not directly comparable.
+
 ## How to reproduce this table
 
 One wrapper script regenerates the whole sweep and (optionally) diffs
@@ -71,11 +76,6 @@ the SFT dataset at `<repo>/datasets/mathinstruct.jsonl`. Override via:
 Per-row hardware tweaks (`--leeway-gpu-mem-gib`, `--max-global-batch-tokens`,
 etc.) are baked into `experiments/verified_runs.py`'s row registry; edit
 that file rather than passing flags to `reverify.sh`.
-
-Loss values reflect mean cross-entropy over response tokens (positions
-where `targets != -100`); prior versions of this table reported a
-different convention (mean over all tokens, including prompt-position
-zeros) so older numbers are not directly comparable.
 
 ## Tokenization & prompt format
 
