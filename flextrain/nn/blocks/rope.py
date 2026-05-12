@@ -142,34 +142,63 @@ def build_partial_rope_inv_freq(
     rot_dim: int,
     rope_base: float,
     rope_scaling: Mapping | None = None,
+    *,
+    head_dim: int | None = None,
 ) -> torch.Tensor:
     """Compute ``inv_freq`` of length ``rot_dim/2`` for partial-rotary RoPE.
 
-    Note: divides by ``rot_dim``, NOT full ``head_dim`` — this matches HF's
-    Qwen3-Next ``compute_default_rope_parameters`` which builds ``inv_freq``
-    over the partial sub-dim:
+    Default convention (Qwen3-Next/3.5/3.6, rope_type ``'default'``):
+    divides by ``rot_dim``, not full ``head_dim`` — matches HF's
+    ``compute_default_rope_parameters`` over the partial sub-dim:
 
         inv_freq[i] = base ** (-2i / rot_dim)        for i in [0, rot_dim/2)
 
-    Currently Qwen3-Next/3.5/3.6 use ``rope_type='default'`` for the
-    partial path, so ``rope_scaling`` is unused beyond verifying that
-    the type is one of None/'default'. If a YARN-style partial variant
-    appears we'll handle it here.
+    Proportional convention (Gemma 4, rope_type ``'proportional'``):
+    divides by ``head_dim`` instead of ``rot_dim``. HF's
+    ``_compute_proportional_rope_parameters`` (see
+    ``modeling_rope_utils.py``). Caller must pass ``head_dim`` as a kwarg:
+
+        inv_freq[i] = base ** (-2i / head_dim)       for i in [0, rot_dim/2)
+
+    The kernel side (``apply_rope_partial_fwd/bwd``) is unchanged; it just
+    consumes whatever inv_freq curve we hand it. Channels [rot_dim:head_dim]
+    pass through unrotated either way.
     """
     factor = 1.0
+    rope_type = "default"
     if rope_scaling is not None:
-        rope_type = rope_scaling.get("rope_type") or rope_scaling.get("type") or "default"
+        rope_type = (
+            rope_scaling.get("rope_type")
+            or rope_scaling.get("type")
+            or "default"
+        )
         if rope_type == "linear":
             factor = float(rope_scaling.get("factor", 1.0))
-        elif rope_type not in ("default", None):
+        elif rope_type not in ("default", "proportional", None):
             import warnings
             warnings.warn(
                 f"build_partial_rope_inv_freq: rope_type={rope_type!r} not "
                 "implemented for partial-rotary; falling back to vanilla.",
                 stacklevel=2,
             )
+            rope_type = "default"
     half = rot_dim // 2
-    inv = 1.0 / (rope_base ** (torch.arange(0, half, dtype=torch.float32) * 2.0 / rot_dim))
+    if rope_type == "proportional":
+        if head_dim is None:
+            raise ValueError(
+                "build_partial_rope_inv_freq with rope_type='proportional' "
+                "requires the head_dim kwarg (denominator differs from "
+                "rot_dim under Gemma 4's proportional convention)."
+            )
+        inv = 1.0 / (
+            rope_base
+            ** (torch.arange(0, half, dtype=torch.float32) * 2.0 / head_dim)
+        )
+    else:
+        inv = 1.0 / (
+            rope_base
+            ** (torch.arange(0, half, dtype=torch.float32) * 2.0 / rot_dim)
+        )
     if factor != 1.0:
         inv = inv / factor
     return inv

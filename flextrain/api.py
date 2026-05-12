@@ -829,6 +829,8 @@ _ARCH_MODULE_OVERRIDES: dict[str, str] = {
     "Gemma2ForCausalLM": "gemma2",
     "Gemma3ForCausalLM": "gemma3",
     "Gemma3ForConditionalGeneration": "gemma3",
+    "Gemma4ForCausalLM": "gemma4",
+    "Gemma4ForConditionalGeneration": "gemma4",
 }
 
 

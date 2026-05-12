@@ -16,6 +16,7 @@ registration happens once.
 
 from . import gemma2  # noqa: F401
 from . import gemma3  # noqa: F401
+from . import gemma4  # noqa: F401
 from . import llama  # noqa: F401
 from . import mistral  # noqa: F401
 from . import olmoe  # noqa: F401
@@ -27,7 +28,7 @@ from . import qwen3_moe  # noqa: F401
 from . import qwen3_next  # noqa: F401
 
 __all__ = [
-    "gemma2", "gemma3", "llama", "mistral", "olmoe", "qwen2",
+    "gemma2", "gemma3", "gemma4", "llama", "mistral", "olmoe", "qwen2",
     "qwen3", "qwen3_5", "qwen3_5_moe", "qwen3_moe", "qwen3_next",
     "ARCH_MODULES", "get_arch_module", "expand_layer_pattern",
 ]
@@ -42,6 +43,7 @@ ARCH_MODULES = {
     "mistral": mistral,
     "gemma2": gemma2,
     "gemma3": gemma3,
+    "gemma4": gemma4,
     "qwen2": qwen2,
     "qwen3": qwen3,
     "olmoe": olmoe,
