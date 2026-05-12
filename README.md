@@ -1,17 +1,20 @@
 # FlexTrain
 
-An alternative single-GPU training engine for transformer LLMs,
-optimised for the tight-memory and long-context regimes where
-mainstream engines (DeepSpeed ZeRO, FSDP, Megatron-LM, Unsloth)
-either lose throughput to idle stalls and excessive recomputation or
-require additional GPUs (more aggregate VRAM) to fit the model in
-the first place. A working-set planner + DP solver schedules every
-tensor (parameters, gradients, optimizer state, activations) between
-GPU and host RAM. You declare GPU and host RAM budgets at model
-construction; the planner automatically parameterizes a unified
-data-sizing, offloading, and recomputation policy that fits those
-budgets — no manual tuning required. On a 32 GiB GPU + 192 GiB host:
-**a 9B dense model full-fine-tunes at 80% of an RTX 5090's bf16 peak
+A high-efficiency training engine for transformer LLMs in
+tight-GPU-memory and long-context regimes — the operating points
+where mainstream engines (DeepSpeed ZeRO, FSDP, Megatron-LM,
+Unsloth) either lose throughput to idle stalls and excessive
+recomputation or require additional GPUs (more aggregate VRAM) to
+fit the model in the first place. A working-set planner + DP solver
+schedules every tensor (parameters, gradients, optimizer state,
+activations) between GPU and host RAM. You declare GPU and host RAM
+budgets at model construction; the planner automatically
+parameterizes a unified data-sizing, offloading, and recomputation
+policy that fits those budgets — no manual tuning required.
+
+The single-GPU engine is fully implemented today; multi-GPU support
+is in active development. On a 32 GiB GPU + 192 GiB host: **a 9B
+dense model full-fine-tunes at 80% of an RTX 5090's bf16 peak
 throughput**; **12B dense full-fine-tunes** on the same card;
 **27B-parameter LoRA tuning** hits **78% of peak** — all on one GPU.
 See [`docs/verified_runs.md`](docs/verified_runs.md) for the full
