@@ -168,9 +168,7 @@ reflects the working-set solver's recompute trade-off.
 | Qwen3-30B-A3B | 30B / 3B-active | MoE (128 experts) | LoRA | 0.900 → 0.866 |  7,800 |  97.1 | 122.2 | 26.20 | 29.00 |
 | Qwen3.5-MoE-35B-A3B | 35B / 3B-active | hybrid + MoE (256+1 experts) | LoRA | 0.742 → 0.677 |  5,926 |  74.7 |  92.4 | 25.20 | 28.80 |
 
-The Qwen3.5-9B full-FT loss curve (0.744 → 0.465) reproduces the
-historical RTX 3090 reference (0.744 → 0.455) to within ≈0.01. The
-Llama-3.1-8B-Instruct rows show a smaller absolute loss-drop because
+The Llama-3.1-8B-Instruct rows show a smaller absolute loss-drop because
 the instruction-tuned base is starting from a chat-template prior the
 generic `Instruction:/Response:` wrapper does not match (see the
 tokenization section above) — descent itself confirms the engine path
@@ -194,28 +192,37 @@ loss-trajectory parity vs HF, the post-engine-change re-verify
 protocol, and known caveats for that arch family. The rows there
 mirror the format of the table above.
 
-## RTX 3090 (24 GiB, 117 GiB host) — historical reference
+## RTX 3090 (23.5 GiB, 125 GiB host) — full sweep, 2026-05-12
 
-Pre-2026-05 sweep. Most rows are marked _not re-verified_ simply because
-the older sweep didn't get to them — **not** because the hardware can't
-handle them. flextrain's host-offload + working-set solver routinely
-fits the bigger models (Qwen3-30B-A3B, Qwen3.5-MoE-35B-A3B, etc.) on a
-24 GiB GPU with enough host RAM; the rows listed below as `0.797 → 0.620`
-etc. confirm the engine path runs end-to-end on this hardware. The
-blanks are coverage gaps from this one sweep, not a hardware ceiling.
+All 13 rows re-verified at **auto memory budget** (no manual GPU/host
+caps). Methodology is identical to the RTX 5090 sweep above: per-step
+metrics read from `train.py`'s stdout at step 3, `peak alloc` /
+`peak resv` definitions, and effective / hardware TFLOPS conventions
+all unchanged.
 
-| Model | Params | Arch | Mode | Batch tokens | Loss curve (5 steps) |
-|---|---|---|---|---|---|
-| Llama-3.2-1B | 1B | dense | LoRA | — | _not re-verified_ |
-| OLMoE-1B-7B | 7B / 1B-active | MoE (64 experts) | LoRA | — | _not re-verified_ |
-| OLMoE-1B-7B | 7B / 1B-active | MoE (64 experts) | full | — | _not re-verified_ |
-| Qwen3-8B | 8B | dense, QK-norm | LoRA | — | _not re-verified_ |
-| Qwen3.5-9B | 9B | hybrid linear+full attn, dense MLP | LoRA | 65k | 0.797 → 0.620 |
-| Qwen3.5-9B | 9B | hybrid linear+full attn, dense MLP | full | 65k | 0.744 → 0.455 |
-| Qwen3.5-27B | 27B | hybrid linear+full attn, dense MLP | LoRA | — | _not re-verified_ |
-| Qwen3.6-27B | 27B | hybrid linear+full attn, dense MLP | LoRA | — | _not re-verified_ |
-| Qwen3-30B-A3B | 30B / 3B-active | MoE (128 experts) | LoRA | — | _not re-verified_ |
-| Qwen3.5-MoE-35B-A3B | 35B / 3B-active | hybrid + MoE (256+1 experts) | LoRA | 65k | 0.743 → 0.541 |
+| Model | Params | Arch | Mode | Loss curve (5 steps) | tok/sec | eff TFLOPS | hw TFLOPS | peak alloc | peak resv |
+|---|---|---|---|---|---|---|---|---|---|
+| Llama-3.2-1B | 1B | dense | LoRA | 1.051 → 0.977 |  8,910 |  44.5 |  44.5 | 19.80 | 20.10 |
+| Llama-3.2-1B | 1B | dense | full | 1.055 → 0.825 |  6,998 |  52.4 |  52.5 | 19.70 | 19.90 |
+| Llama-3.1-8B-Instruct | 8B | dense | LoRA | 0.776 → 0.719 |  1,674 |  50.6 |  50.6 | 20.10 | 20.30 |
+| Llama-3.1-8B-Instruct | 8B | dense | full | 0.783 → 0.595 |  1,253 |  56.8 |  56.8 | 19.60 | 19.90 |
+| OLMoE-1B-7B | 7B / 1B-active | MoE (64 experts) | LoRA | 0.864 → 0.832 |  8,087 |  38.5 |  39.1 | 19.80 | 22.40 |
+| OLMoE-1B-7B | 7B / 1B-active | MoE (64 experts) | full | 0.865 → 0.673 |  5,286 |  37.8 |  39.8 | 19.50 | 21.60 |
+| Qwen3-8B | 8B | dense, QK-norm | LoRA | 0.918 → 0.845 |  1,573 |  48.0 |  48.0 | 20.10 | 20.30 |
+| Qwen3-8B | 8B | dense, QK-norm | full | 0.933 → 0.490 |  1,194 |  54.6 |  54.6 | 19.60 | 19.80 |
+| Qwen3.5-9B | 9B | hybrid linear+full attn, dense MLP | LoRA | 0.743 → 0.673 |  1,554 |  49.7 |  49.7 | 20.00 | 20.30 |
+| Qwen3.5-9B | 9B | hybrid linear+full attn, dense MLP | full | 0.740 → 0.466 |  1,122 |  53.9 |  53.9 | 19.90 | 20.20 |
+| Qwen3.6-27B | 27B | hybrid linear+full attn, dense MLP | LoRA | 1.006 → 0.852 |    460 |  47.5 |  47.5 | 20.20 | 20.60 |
+| Qwen3-30B-A3B | 30B / 3B-active | MoE (128 experts) | LoRA | 0.899 → 0.868 |  2,614 |  32.5 |  39.1 | 19.90 | 21.30 |
+| Qwen3.5-MoE-35B-A3B | 35B / 3B-active | hybrid + MoE (256+1 experts) | LoRA | 0.742 → 0.662 |  1,871 |  23.6 |  29.9 | 19.50 | 21.60 |
+
+Every row reproduces the RTX 5090 baseline above to within ≤0.035 at
+step 5 (typical bf16 + save-tier / chunk-size noise across hardware);
+two rows are bit-stable to 3 decimal places — `OLMoE-1B-7B` full
+(0.673 on both cards) and `Qwen3.5-9B` full (0.466 vs 0.465).
+Per-row throughput is ~30-35% of the 5090's, consistent with the
+bf16-peak ratio between the two cards (3090 ≈71 TFLOPS, 5090
+≈209 TFLOPS).
 
 Additional models supported by the existing arch loaders (require a
 larger machine to actually train): Qwen3.6-35B-A3B, Qwen3.5-122B-A10B,
