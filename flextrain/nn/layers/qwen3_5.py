@@ -65,6 +65,13 @@ class Qwen3_5LayerConfig:
     rope_base: float = 10_000_000.0
     is_causal: bool = True
     partial_rotary_factor: float = 0.25
+    # MRoPE (Qwen-VL family): set ``mrope_section`` (length-3 tuple
+    # summing to ``rot_dim // 2``) to enable 3-axis RoPE dispatch. The
+    # block falls back to standard partial-RoPE when chunks carry 1-D
+    # ``seq_positions`` (text-only training), so leaving these set for
+    # text-only runs is a no-op numerically.
+    mrope_section: tuple[int, int, int] | None = None
+    mrope_interleaved: bool = False
 
     compute_dtype: torch.dtype = torch.bfloat16
     master_dtype: torch.dtype | None = None
@@ -133,6 +140,8 @@ class Qwen3_5FullLayer:
                 qk_norm_master_dtype=cfg.norm_master_dtype,
                 qk_norm_grad_dtype=cfg.norm_grad_dtype,
                 partial_rotary_factor=cfg.partial_rotary_factor,
+                mrope_section=cfg.mrope_section,
+                mrope_interleaved=cfg.mrope_interleaved,
                 compute_dtype=cfg.compute_dtype,
                 master_dtype=cfg.master_dtype,
                 grad_dtype=cfg.grad_dtype,

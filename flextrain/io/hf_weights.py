@@ -150,6 +150,23 @@ class ArchSpec:
     layer
         Weight-map entries under scope ``"layer_{i}"``. Names contain
         ``{i}`` for the layer index.
+    vision_embed
+        Optional weight-map entries for one-shot vision-encoder weights
+        (patch embed, position embed, multi-modal projector, post-encoder
+        norm). Loaded under scope ``"embed"`` -- they share buffer
+        residency with the text-embed table because they are part of
+        :class:`MultimodalInputLayer`'s merged ``param_spec``. Each
+        entry's ``flextrain_name`` is expected to be prefixed
+        ``f"{modality}{encoder_id}_"`` (e.g. ``"image0_patch_embed_w"``)
+        to avoid collisions with the text-embed table's tensors and with
+        sibling encoders. Empty for text-only archs.
+    vision_layer
+        Optional weight-map entries for per-vision-layer weights (q/k/v/o
+        projections, layer norms, MLP). Each entry's ``hf_name`` AND
+        ``flextrain_name`` may contain ``{i}`` for the vision-layer index;
+        the loader substitutes for ``i in range(num_vision_layers)``.
+        Same scope (``"embed"``) and same prefix convention as
+        ``vision_embed``. Empty for text-only archs.
     post_load_hook
         Optional callable invoked after per-tensor copies complete. Used
         by architectures whose HF weights don't map 1:1 to a single
@@ -188,6 +205,8 @@ class ArchSpec:
     embed: tuple[WeightMapEntry, ...]
     head: tuple[WeightMapEntry, ...]
     layer: tuple[WeightMapEntry, ...]
+    vision_embed: tuple[WeightMapEntry, ...] = ()
+    vision_layer: tuple[WeightMapEntry, ...] = ()
     post_load_hook: Callable[[str, Mapping, int], None] | None = None
     pre_export_hook: Callable[[Any, MutableMapping, int], None] | None = None
 
@@ -264,6 +283,27 @@ def _render_hf_name(template: str, layer_idx: int | None) -> str:
     return template
 
 
+def _render_fx_name(template: str, layer_idx: int | None) -> str:
+    """Render a FlexTrain dest name.
+
+    Same ``{i}`` substitution rule as :func:`_render_hf_name`. Most
+    backbone entries do NOT have ``{i}`` in their flextrain_name (the
+    scope ``f"layer_{i}"`` carries the layer index instead). Vision-
+    encoder entries DO use ``{i}`` in flextrain_name because they all
+    share scope ``"embed"`` (the multimodal input layer's merged
+    param_spec) and need a per-layer name to avoid collisions:
+    ``"image0_layer_{i}_w_q"`` -> ``"image0_layer_0_w_q"``, ...,
+    ``"image0_layer_23_w_q"``.
+    """
+    if "{i}" in template:
+        if layer_idx is None:
+            raise ValueError(
+                f"flextrain_name {template!r} has {{i}} but no layer_idx supplied"
+            )
+        return template.format(i=layer_idx)
+    return template
+
+
 # ---------------------------------------------------------------------------
 # Public: load / export.
 # ---------------------------------------------------------------------------
@@ -275,6 +315,7 @@ def load_hf_safetensors(
     dest: MutableMapping[tuple[str, str], torch.Tensor],
     num_layers: int,
     *,
+    num_vision_layers: int = 0,
     strict: bool = True,
     device: str = "cpu",
 ) -> list[str]:
@@ -292,6 +333,10 @@ def load_hf_safetensors(
         copy-in-place with ``copy_()``.
     num_layers
         Backbone layer count. Used to instantiate the per-layer template.
+    num_vision_layers
+        Vision-tower layer count for the multimodal input layer (0 means
+        the arch is text-only or multimodal is disabled). Drives the
+        ``{i}`` substitution in ``arch.vision_layer`` entries. Default 0.
     strict
         Raise on any missing HF tensor. Set False when loading partial
         checkpoints (e.g. LoRA adapters).
@@ -329,13 +374,17 @@ def load_hf_safetensors(
         candidates = [primary] + [
             _render_hf_name(alt, layer_idx) for alt in entry.hf_name_alternates
         ]
+        # Vision-encoder entries embed ``{i}`` in flextrain_name too; backbone
+        # entries don't (their scope carries the layer index). This helper
+        # supports both.
+        fx_name = _render_fx_name(entry.flextrain_name, layer_idx)
         for hf in candidates:
-            pairs.append((hf, (scope, entry.flextrain_name), entry.transform))
+            pairs.append((hf, (scope, fx_name), entry.transform))
             if entry.optional:
                 optional_hf_names.add(hf)
         if not entry.optional:
             alternate_groups.append(
-                (f"{scope}/{entry.flextrain_name}", candidates)
+                (f"{scope}/{fx_name}", candidates)
             )
 
     for entry in arch.embed:
@@ -346,6 +395,17 @@ def load_hf_safetensors(
         scope = f"layer_{i}"
         for entry in arch.layer:
             _add_entry(entry, scope, i)
+    # Multimodal: vision-encoder weights live in the merged ``embed_param_spec``
+    # of the :class:`MultimodalInputLayer`, so they all land in scope
+    # ``"embed"``. Per-vision-layer entries differentiate via the
+    # ``{i}``-substituted ``flextrain_name`` (e.g. ``image0_layer_3_w_q``).
+    # Skipped entirely when ``num_vision_layers == 0`` AND the arch has no
+    # vision_embed entries (text-only path is bit-for-bit unchanged).
+    for entry in arch.vision_embed:
+        _add_entry(entry, "embed", None)
+    for i in range(num_vision_layers):
+        for entry in arch.vision_layer:
+            _add_entry(entry, "embed", i)
 
     # Route each expected HF tensor to its shard file.
     by_shard: dict[str, list[tuple[str, tuple[str, str], Transform]]] = {}
@@ -434,6 +494,7 @@ def export_hf_safetensors(
     src: Mapping[tuple[str, str], torch.Tensor],
     num_layers: int,
     *,
+    num_vision_layers: int = 0,
     out_filename: str = "model.safetensors",
 ) -> str:
     """Write a single-shard safetensors file at ``out_dir/out_filename``
@@ -448,7 +509,8 @@ def export_hf_safetensors(
     def _emit(scope: str, entries, layer_idx: int | None) -> None:
         for entry in entries:
             hf_name = _render_hf_name(entry.hf_name, layer_idx)
-            tensor = src[(scope, entry.flextrain_name)]
+            fx_name = _render_fx_name(entry.flextrain_name, layer_idx)
+            tensor = src[(scope, fx_name)]
             tensor = _apply_export_transform(tensor.detach(), entry.transform)
             out[hf_name] = tensor.contiguous().cpu()
 
@@ -456,6 +518,12 @@ def export_hf_safetensors(
     _emit("head", arch.head, None)
     for i in range(num_layers):
         _emit(f"layer_{i}", arch.layer, i)
+    # Vision entries: share scope ``"embed"`` with text embed (they live
+    # in the multimodal input layer's merged param_spec). No-op when
+    # ``vision_embed`` / ``vision_layer`` are empty.
+    _emit("embed", arch.vision_embed, None)
+    for i in range(num_vision_layers):
+        _emit("embed", arch.vision_layer, i)
 
     path = os.path.join(out_dir, out_filename)
     _save_safetensors(out, path)

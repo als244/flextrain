@@ -454,6 +454,153 @@ def _qwen3_5_pre_export_hook(am, dst, num_layers: int) -> None:
         dst.pop("lm_head.weight", None)
 
 
+# ---------------------------------------------------------------------------
+# Vision-tower weight map (Qwen3.5/3.6 multimodal). HF stores them under
+# ``model.visual.*``. Flextrain places them in scope ``"embed"`` with the
+# encoder-id prefix ``"image0_"`` so they live in the merged
+# ``MultimodalInputLayer.param_spec`` (which the engine maps to the
+# always-on-GPU ``gpu_embed_params`` dict). All entries are
+# ``Transform.NONE`` -- the Qwen-VL vision encoder consumes HF's
+# native ``(out, in)`` Linear weight layout via ``F.linear``.
+# ``optional=True`` keeps the loader from faulting when the encoder
+# isn't constructed (text-only mode).
+# ---------------------------------------------------------------------------
+
+
+_VISION_EMBED = (
+    WeightMapEntry(
+        flextrain_name="image0_patch_embed_proj_w",
+        hf_name="model.visual.patch_embed.proj.weight",
+        transform=Transform.NONE,
+        optional=True,
+    ),
+    WeightMapEntry(
+        flextrain_name="image0_patch_embed_proj_b",
+        hf_name="model.visual.patch_embed.proj.bias",
+        transform=Transform.NONE,
+        optional=True,
+    ),
+    WeightMapEntry(
+        flextrain_name="image0_pos_embed_w",
+        hf_name="model.visual.pos_embed.weight",
+        transform=Transform.NONE,
+        optional=True,
+    ),
+    WeightMapEntry(
+        flextrain_name="image0_merger_norm_w",
+        hf_name="model.visual.merger.norm.weight",
+        transform=Transform.NONE,
+        optional=True,
+    ),
+    WeightMapEntry(
+        flextrain_name="image0_merger_norm_b",
+        hf_name="model.visual.merger.norm.bias",
+        transform=Transform.NONE,
+        optional=True,
+    ),
+    WeightMapEntry(
+        flextrain_name="image0_merger_fc1_w",
+        hf_name="model.visual.merger.linear_fc1.weight",
+        transform=Transform.NONE,
+        optional=True,
+    ),
+    WeightMapEntry(
+        flextrain_name="image0_merger_fc1_b",
+        hf_name="model.visual.merger.linear_fc1.bias",
+        transform=Transform.NONE,
+        optional=True,
+    ),
+    WeightMapEntry(
+        flextrain_name="image0_merger_fc2_w",
+        hf_name="model.visual.merger.linear_fc2.weight",
+        transform=Transform.NONE,
+        optional=True,
+    ),
+    WeightMapEntry(
+        flextrain_name="image0_merger_fc2_b",
+        hf_name="model.visual.merger.linear_fc2.bias",
+        transform=Transform.NONE,
+        optional=True,
+    ),
+)
+
+
+_VISION_LAYER = (
+    WeightMapEntry(
+        flextrain_name="image0_layer_{i}_norm1_w",
+        hf_name="model.visual.blocks.{i}.norm1.weight",
+        transform=Transform.NONE,
+        optional=True,
+    ),
+    WeightMapEntry(
+        flextrain_name="image0_layer_{i}_norm1_b",
+        hf_name="model.visual.blocks.{i}.norm1.bias",
+        transform=Transform.NONE,
+        optional=True,
+    ),
+    WeightMapEntry(
+        flextrain_name="image0_layer_{i}_norm2_w",
+        hf_name="model.visual.blocks.{i}.norm2.weight",
+        transform=Transform.NONE,
+        optional=True,
+    ),
+    WeightMapEntry(
+        flextrain_name="image0_layer_{i}_norm2_b",
+        hf_name="model.visual.blocks.{i}.norm2.bias",
+        transform=Transform.NONE,
+        optional=True,
+    ),
+    WeightMapEntry(
+        flextrain_name="image0_layer_{i}_qkv_w",
+        hf_name="model.visual.blocks.{i}.attn.qkv.weight",
+        transform=Transform.NONE,
+        optional=True,
+    ),
+    WeightMapEntry(
+        flextrain_name="image0_layer_{i}_qkv_b",
+        hf_name="model.visual.blocks.{i}.attn.qkv.bias",
+        transform=Transform.NONE,
+        optional=True,
+    ),
+    WeightMapEntry(
+        flextrain_name="image0_layer_{i}_proj_w",
+        hf_name="model.visual.blocks.{i}.attn.proj.weight",
+        transform=Transform.NONE,
+        optional=True,
+    ),
+    WeightMapEntry(
+        flextrain_name="image0_layer_{i}_proj_b",
+        hf_name="model.visual.blocks.{i}.attn.proj.bias",
+        transform=Transform.NONE,
+        optional=True,
+    ),
+    WeightMapEntry(
+        flextrain_name="image0_layer_{i}_mlp_fc1_w",
+        hf_name="model.visual.blocks.{i}.mlp.linear_fc1.weight",
+        transform=Transform.NONE,
+        optional=True,
+    ),
+    WeightMapEntry(
+        flextrain_name="image0_layer_{i}_mlp_fc1_b",
+        hf_name="model.visual.blocks.{i}.mlp.linear_fc1.bias",
+        transform=Transform.NONE,
+        optional=True,
+    ),
+    WeightMapEntry(
+        flextrain_name="image0_layer_{i}_mlp_fc2_w",
+        hf_name="model.visual.blocks.{i}.mlp.linear_fc2.weight",
+        transform=Transform.NONE,
+        optional=True,
+    ),
+    WeightMapEntry(
+        flextrain_name="image0_layer_{i}_mlp_fc2_b",
+        hf_name="model.visual.blocks.{i}.mlp.linear_fc2.bias",
+        transform=Transform.NONE,
+        optional=True,
+    ),
+)
+
+
 QWEN3_5_ARCH = ArchSpec(
     hf_arch_ids=("Qwen3_5ForCausalLM", "Qwen3_5ForConditionalGeneration"),
     embed=(
@@ -480,6 +627,8 @@ QWEN3_5_ARCH = ArchSpec(
         ),
     ),
     layer=_COMMON + _LINEAR_ATTN + _FULL_ATTN,
+    vision_embed=_VISION_EMBED,
+    vision_layer=_VISION_LAYER,
     post_load_hook=_qwen3_5_post_load_hook,
     pre_export_hook=_qwen3_5_pre_export_hook,
 )
@@ -691,18 +840,40 @@ def hf_config_to_hyperparams(hf_config: Any) -> dict:
     tc = _text_cfg(hf_config)
     g = (tc.get if isinstance(tc, dict) else lambda k, default=None: getattr(tc, k, default))
     rope_params = g("rope_parameters") or {}
+    is_rope_dict = isinstance(rope_params, dict)
     rope_theta = (
-        rope_params.get("rope_theta") if isinstance(rope_params, dict)
-        else None
+        rope_params.get("rope_theta") if is_rope_dict else None
     ) or g("rope_theta", 10_000_000.0)
     partial_rotary = (
         rope_params.get("partial_rotary_factor")
-        if isinstance(rope_params, dict) else None
+        if is_rope_dict else None
     ) or g("partial_rotary_factor", 0.25)
+    # MRoPE knobs -- Qwen3.5/3.6 multimodal. Present in text_config.
+    # ``mrope_section`` length-3 tuple summing to ``rot_dim // 2``.
+    # ``mrope_interleaved`` controls per-pair axis layout (HF interleaved
+    # variant vs contiguous sections). Both default to None / False;
+    # text-only training is unaffected (block dispatches on
+    # ``seq_positions.shape[-1]``, not on these fields).
+    mrope_section_raw = (
+        rope_params.get("mrope_section") if is_rope_dict else None
+    )
+    mrope_section: tuple[int, int, int] | None = None
+    if mrope_section_raw is not None:
+        if len(mrope_section_raw) != 3:
+            raise ValueError(
+                f"qwen3.5 mrope_section must have length 3, got "
+                f"{mrope_section_raw!r}"
+            )
+        mrope_section = tuple(int(x) for x in mrope_section_raw)
+    mrope_interleaved = bool(
+        rope_params.get("mrope_interleaved", False) if is_rope_dict else False
+    )
     return {
         "rms_norm_eps": g("rms_norm_eps", 1e-6),
         "rope_theta": rope_theta,
         "partial_rotary_factor": partial_rotary,
+        "mrope_section": mrope_section,
+        "mrope_interleaved": mrope_interleaved,
         "layer_types": g("layer_types"),
         "full_attention_interval": g("full_attention_interval"),
         "attn_output_gate": g("attn_output_gate", True),
@@ -744,6 +915,8 @@ def _qwen3_5_block_builder(layer_idx: int, ctx) -> object:
         rope_base=float(hp.get("rope_theta", 10_000_000.0)),
         is_causal=True,
         partial_rotary_factor=float(hp.get("partial_rotary_factor", 0.25)),
+        mrope_section=hp.get("mrope_section"),
+        mrope_interleaved=bool(hp.get("mrope_interleaved", False)),
         compute_dtype=ctx.compute_dtype,
         master_dtype=ctx.master_dtype,
         grad_dtype=ctx.grad_dtype,
@@ -950,3 +1123,105 @@ _register_builder()
 # hands to from_pretrained, exposed at module level so the dims path
 # can look it up by short name.
 BLOCK_BUILDER = _qwen3_5_block_builder
+
+
+# ---------------------------------------------------------------------------
+# Multimodal factories (Phase 1: Qwen-VL vision tower, frozen, ConcatSplice).
+#
+# ``hf_config_to_vision_dims`` returns a dims dict when the checkpoint
+# contains a vision_config; ``None`` for text-only saves. The api's
+# ``_build_active_model`` calls this to decide whether to construct a
+# :class:`MultimodalInputLayer` or fall through to the regular
+# :class:`TokenEmbedLayer`.
+# ---------------------------------------------------------------------------
+
+
+def hf_config_to_vision_dims(hf_config) -> dict | None:
+    """Extract vision-tower dims from an HF config, or return None.
+
+    Returns the same dataclass-style ``dict`` that
+    :func:`build_modality_encoders` consumes -- field names match
+    :class:`~flextrain.nn.encoders.qwen_vl_vit.QwenVLVisionConfig`.
+    """
+    if isinstance(hf_config, dict):
+        vc = hf_config.get("vision_config")
+    else:
+        vc = getattr(hf_config, "vision_config", None)
+    if vc is None:
+        return None
+    g = (
+        vc.get if isinstance(vc, dict)
+        else lambda k, default=None: getattr(vc, k, default)
+    )
+    # ``model_type`` is informational; for Qwen3.5/3.6 it's "qwen3_5"
+    # and for Qwen3-VL proper it's "qwen3_vl". Both use the same
+    # Qwen-VL vision tower architecture so they share this builder.
+    return {
+        "depth": int(g("depth", g("num_hidden_layers", 24))),
+        "hidden_size": int(g("hidden_size", 1024)),
+        "intermediate_size": int(g("intermediate_size", 4096)),
+        "num_heads": int(g("num_heads", g("num_attention_heads", 16))),
+        "in_channels": int(g("in_channels", 3)),
+        "patch_size": int(g("patch_size", 16)),
+        "spatial_merge_size": int(g("spatial_merge_size", 2)),
+        "temporal_patch_size": int(g("temporal_patch_size", 2)),
+        "out_hidden_size": int(g("out_hidden_size", 2048)),
+        "num_position_embeddings": int(g("num_position_embeddings", 2304)),
+        "hidden_act": str(g("hidden_act", "gelu_pytorch_tanh")),
+        "deepstack_visual_indexes": tuple(g("deepstack_visual_indexes", ()) or ()),
+    }
+
+
+def build_modality_encoders(
+    vision_dims: dict,
+    hyperparams: dict | None = None,
+    *,
+    compute_dtype=None,
+    frozen: bool = True,
+):
+    """Construct the tuple of :class:`ModalityEncoder` instances for
+    Qwen3.5/3.6 multimodal training.
+
+    Phase 1 returns exactly one encoder (image, encoder_id=0). The
+    tuple shape is used so multi-encoder configs (e.g. add an audio
+    encoder later) plug in additively.
+    """
+    import torch
+    from flextrain.nn.encoders import QwenVLVisionConfig, QwenVLVisionEncoder
+
+    _ = hyperparams  # currently unused; Qwen-VL ViT has no per-layer hp.
+    deepstack = tuple(int(i) for i in vision_dims.get("deepstack_visual_indexes", ()) or ())
+    if deepstack:
+        # Phase 2 fast-follow (Qwen3-VL proper has [8, 16, 24]).
+        raise NotImplementedError(
+            "Qwen-VL deepstack is a Phase 2 item; build_modality_encoders "
+            f"got deepstack_visual_indexes={deepstack!r}. Set them to [] "
+            "in the HF config (Qwen3.5/3.6 default) or wait for Phase 2."
+        )
+    cfg = QwenVLVisionConfig(
+        depth=int(vision_dims["depth"]),
+        hidden_size=int(vision_dims["hidden_size"]),
+        intermediate_size=int(vision_dims["intermediate_size"]),
+        num_heads=int(vision_dims["num_heads"]),
+        in_channels=int(vision_dims.get("in_channels", 3)),
+        patch_size=int(vision_dims["patch_size"]),
+        spatial_merge_size=int(vision_dims["spatial_merge_size"]),
+        temporal_patch_size=int(vision_dims["temporal_patch_size"]),
+        out_hidden_size=int(vision_dims["out_hidden_size"]),
+        num_position_embeddings=int(vision_dims["num_position_embeddings"]),
+        hidden_act=str(vision_dims.get("hidden_act", "gelu_pytorch_tanh")),
+        compute_dtype=compute_dtype or torch.bfloat16,
+        attn_implementation=str(vision_dims.get("attn_implementation", "sdpa")),
+    )
+    return (
+        QwenVLVisionEncoder(cfg, modality="image", encoder_id=0, frozen=frozen),
+    )
+
+
+def modality_splice_strategies(vision_dims: dict, hyperparams: dict | None = None):
+    """Return one ``(splice_fwd, splice_bwd)`` pair per encoder built
+    by :func:`build_modality_encoders`. Phase 1: ConcatSplice for the
+    single image encoder."""
+    _ = vision_dims, hyperparams  # unused for ConcatSplice
+    from flextrain.nn.splices import concat_splice_bwd, concat_splice_fwd
+    return ((concat_splice_fwd, concat_splice_bwd),)
