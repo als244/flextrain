@@ -390,6 +390,7 @@ def _baseline_gpu_activation_memory(
     *,
     training_config: Mapping | None,
     lora_active: bool = False,
+    mm_encoder_peak_bytes: int = 0,
 ) -> int:
     """Per-round GPU activation overhead: transition table + (fwd + bwd)
     context windows + per-chunk attn/MLP scratch space. Mirrors orig:168-212.
@@ -644,6 +645,13 @@ def _baseline_gpu_activation_memory(
     # Qwen3.5-2B = 2 × conv_dim × W × bf16) is small enough to fall
     # below the planner's resolution; not accounted here.
 
+    # Multimodal: per-round vision/audio encoder peak workspace. Phase 1
+    # uses a conservative upper bound supplied by the caller (e.g.
+    # ``MultimodalInputLayer.estimated_round_peak_bytes()``). Default 0
+    # for text-only training keeps this byte-identical to pre-multimodal
+    # planner output.
+    bytes_used += int(mm_encoder_peak_bytes)
+
     return bytes_used
 
 
@@ -682,6 +690,7 @@ def determine_working_set_config(
     embed_param_spec: object = None,
     head_param_spec: object = None,
     layer_schemas: Sequence | None = None,
+    mm_encoder_peak_bytes: int = 0,
 ) -> WorkingSetConfig:
     """Solve the working set: pick chunk size, tokens-per-round, and
     GPU-resident layer counts. Native v2 implementation -- no ``orig`` import.
@@ -1203,6 +1212,7 @@ def determine_working_set_config(
         min_act_slot_fn=_min_act_slot_bytes,
         full_act_slot_fn=_full_act_slot_bytes,
         lora_active=lora_active,
+        mm_encoder_peak_bytes=mm_encoder_peak_bytes,
     )
 
     if best_option is None:
@@ -1247,6 +1257,7 @@ def determine_working_set_config(
         model_dims, max_seq_len, target_chunk_size, target_num_chunks,
         training_config=training_config,
         lora_active=lora_active,
+        mm_encoder_peak_bytes=mm_encoder_peak_bytes,
     )
 
     est_total_gpu_bytes = (
@@ -1375,6 +1386,7 @@ def _pick_chunk_size(
     min_act_slot_fn=None,
     full_act_slot_fn=None,
     lora_active: bool = False,
+    mm_encoder_peak_bytes: int = 0,
 ) -> dict | None:
     """Greedy chunk-size selection. Mirrors orig:476-653.
 
@@ -1509,6 +1521,7 @@ def _pick_chunk_size(
             model_dims, max_seq_len, chunk_size, target_num_chunks,
             training_config=training_config,
             lora_active=lora_active,
+            mm_encoder_peak_bytes=mm_encoder_peak_bytes,
         )
         cur_gpu -= baseline_act
 
