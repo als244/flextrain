@@ -500,10 +500,361 @@ def prepare_training_chunks(
     if current:
         seq_groups.append(current)
 
+    # Multimodal extras (Phase 1: image only). Walks chunks in order,
+    # tracks the per-modality cumulative encoder-row offset across the
+    # round, and populates ``chunk.meta.extra["mm_*"]`` for each chunk
+    # that has any vision-placeholder positions. No-op for text-only
+    # rounds (sequences with empty / missing ``modality_inputs``).
+    _populate_mm_chunk_extras(pending, chunks, device=device)
+
     total_tokens = sum(c.meta.total_q for c in chunks)
     return PreparedRound(
         chunks=chunks, seq_groups=seq_groups, total_tokens=total_tokens
     )
+
+
+def _compute_mrope_position_ids(seq) -> torch.Tensor | None:
+    """Compute per-token 3-D MRoPE positions for one multimodal Sequence.
+
+    Mirrors HF ``Qwen3VLForConditionalGeneration.get_rope_index`` (in
+    ``transformers/models/qwen3_vl/modeling_qwen3_vl.py``). For each
+    token in ``seq.tokens``:
+
+    * **Text token** (NOT a placeholder for any image): position is
+      ``(p, p, p)`` where ``p`` is the global LLM position counter.
+      The counter advances by 1 per text token.
+    * **Image-placeholder token**: position is
+      ``(t_pos, t_pos + h_idx, t_pos + w_idx)`` where ``(h_idx, w_idx)``
+      is the patch's coordinate in the image's POST-merge grid and
+      ``t_pos`` is ``current_pos`` at the start of the image block.
+      The counter advances by ``max(merged_h, merged_w)`` after the
+      whole image block (not by the number of placeholders, which is
+      typically much larger).
+
+    Returns ``None`` if ``seq.modality_inputs`` is empty / missing (the
+    seq is text-only; caller leaves chunk.meta.seq_positions at K=1).
+
+    Returns ``(N, 3) int32`` otherwise where ``N == len(seq.tokens)``.
+
+    Notes
+    -----
+    * Phase 1 supports only images. Audio / video are Phase 2/3 -- the
+      walk over modality_inputs only consumes "image" entries.
+    * The "post-merge" grid dimensions are derived from
+      ``ImageInputCPU.placeholder_positions.numel()``: the number of
+      placeholder rows IS exactly the image's post-merge token count.
+      We pair them with the image's ``grid_thw`` (after dividing H/W by
+      ``spatial_merge_size``) to spread positions across the grid.
+    * The ``spatial_merge_size`` is NOT carried on the
+      ``ImageInputCPU`` -- we derive ``merged_h`` and ``merged_w`` from
+      ``sqrt(n_placeholders / T)`` when ``grid_thw[1] == grid_thw[2]``;
+      otherwise we fall back to a per-image attribute the data
+      adapter should set: ``ImageInputCPU.merged_grid_thw``. Phase 1
+      pilot images are Qwen-VL ``patch_size=16`` square images so the
+      sqrt branch is the common path.
+    """
+    mi = getattr(seq, "modality_inputs", None) or {}
+    if not mi:
+        return None
+    images = mi.get("image", []) or []
+    if not images:
+        return None
+
+    N = int(seq.tokens.numel())
+    pos = torch.zeros((N, 3), dtype=torch.int32)
+
+    # Sort images by the *first* placeholder position so we can walk
+    # ``input_ids`` once and assign image blocks in order. Each image's
+    # block in input_ids is contiguous (consecutive placeholders for
+    # the same image's post-merge tokens).
+    images_sorted = sorted(images, key=lambda it: int(it.placeholder_positions.min().item()))
+
+    cursor = 0          # next position in input_ids to assign
+    current_pos = 0     # the running LLM position counter
+
+    for img in images_sorted:
+        pp = img.placeholder_positions.to(torch.int64)
+        n_placeholders = int(pp.numel())
+        if n_placeholders == 0:
+            continue
+        img_start = int(pp.min().item())
+        img_end_exclusive = int(pp.max().item()) + 1
+        if img_end_exclusive - img_start != n_placeholders:
+            raise ValueError(
+                f"image's placeholder_positions are not contiguous "
+                f"[{img_start}, {img_end_exclusive}) but has "
+                f"{n_placeholders} entries -- chunk-prep MRoPE assumes "
+                "each image's block is a single contiguous slice of input_ids."
+            )
+
+        # Fill text positions from ``cursor`` up to ``img_start``.
+        for k in range(cursor, img_start):
+            pos[k, 0] = current_pos
+            pos[k, 1] = current_pos
+            pos[k, 2] = current_pos
+            current_pos += 1
+
+        # Derive merged-grid dims from grid_thw + n_placeholders.
+        # grid_thw stores PRE-merge (T, H, W). Post-merge token count
+        # is T * (H // merge) * (W // merge) = n_placeholders.
+        T = int(img.grid_thw[0].item())
+        H_pre = int(img.grid_thw[1].item())
+        W_pre = int(img.grid_thw[2].item())
+        per_frame_post = n_placeholders // max(T, 1)
+        # We need merged_h, merged_w. Try the square-image fast-path
+        # (Qwen-VL pilot images are typically square), then fall back
+        # to factoring from (H_pre / W_pre) ratio if rectangular.
+        if H_pre == W_pre:
+            import math
+            side = int(round(math.sqrt(per_frame_post)))
+            if side * side != per_frame_post:
+                raise ValueError(
+                    f"image is square (H=W={H_pre}) but per-frame post-merge "
+                    f"count {per_frame_post} is not a perfect square; cannot "
+                    "derive merged grid."
+                )
+            merged_h = merged_w = side
+        else:
+            # H_pre / merge : W_pre / merge with the same merge.
+            # Per-frame count = merged_h * merged_w; ratio constrained
+            # by H_pre : W_pre, so merge = gcd-like derivation:
+            # merged_h = H_pre // merge, merged_w = W_pre // merge.
+            # Solve: (H_pre * W_pre) / merge**2 == per_frame_post.
+            import math
+            denom = H_pre * W_pre
+            if denom % per_frame_post != 0:
+                raise ValueError(
+                    f"rectangular image grid ({H_pre} x {W_pre}) does not "
+                    f"divide evenly into per-frame post-merge count "
+                    f"{per_frame_post}; cannot derive merged grid."
+                )
+            merge_sq = denom // per_frame_post
+            merge = int(round(math.sqrt(merge_sq)))
+            if merge * merge != merge_sq:
+                raise ValueError(
+                    f"derived merge**2 = {merge_sq} is not a perfect square "
+                    f"for image grid ({H_pre} x {W_pre}) and per-frame post-"
+                    f"merge count {per_frame_post}."
+                )
+            merged_h = H_pre // merge
+            merged_w = W_pre // merge
+
+        # Generate 3-D positions per HF ``get_vision_position_ids``:
+        # post-merge tokens iterate t outer, h middle, w inner.
+        # All share ``t_pos = current_pos`` (image temporal axis is a
+        # single value at start_position).
+        t_pos_start = current_pos
+        ph_cursor = 0
+        for t_frame in range(T):
+            for h_idx in range(merged_h):
+                for w_idx in range(merged_w):
+                    abs_pos = img_start + ph_cursor
+                    pos[abs_pos, 0] = t_pos_start
+                    pos[abs_pos, 1] = t_pos_start + h_idx
+                    pos[abs_pos, 2] = t_pos_start + w_idx
+                    ph_cursor += 1
+        # Advance the global counter by max(merged_h, merged_w).
+        current_pos = t_pos_start + max(merged_h, merged_w)
+        cursor = img_end_exclusive
+
+    # Trailing text tokens.
+    for k in range(cursor, N):
+        pos[k, 0] = current_pos
+        pos[k, 1] = current_pos
+        pos[k, 2] = current_pos
+        current_pos += 1
+    return pos
+
+
+def _populate_mm_chunk_extras(
+    pending: list[_PendingChunk],
+    chunks: list[TrainingChunk],
+    *,
+    device: torch.device | str,
+) -> None:
+    """Walk packed chunks in order; populate per-modality placeholder
+    positions and round-level image-row assignments on each chunk's
+    ``meta.extra``.
+
+    Contract (consumed by :mod:`flextrain.nn.splices.concat`):
+
+    * ``extra["mm_placeholder_positions"]["image"][encoder_id]`` --
+      ``(N_in_chunk,) int64`` chunk-local token indices that the
+      encoder output should be scattered onto.
+    * ``extra["mm_image_assignment"]["image"][encoder_id]`` --
+      ``(N_in_chunk,) int64`` index into the round's flat encoder
+      output for each placeholder.
+
+    The round's flat encoder output is the concatenation of every
+    image's post-merge tokens in the order they appear across
+    sequences in the round; we track ``image_row_offset_per_modality``
+    as we walk the chunks. ``encoder_id`` is always 0 in Phase 1
+    (single image encoder).
+
+    For text-only rounds (no sequence carries ``modality_inputs``),
+    this is a fast O(N_chunks) walk that detects emptiness early and
+    writes nothing to ``extra`` -- the existing tests stay
+    bit-identical.
+    """
+    # Fast bail: if no sequence in any chunk has modality_inputs, do
+    # nothing. This keeps the text-only path byte-identical.
+    has_any = False
+    for chunk in chunks:
+        for ref in chunk.seqs:
+            mi = getattr(ref.seq, "modality_inputs", None)
+            if mi:
+                has_any = True
+                break
+        if has_any:
+            break
+    if not has_any:
+        return
+
+    # Per-modality round-level row offset into the encoder output.
+    # Indexed by modality name; Phase 1 only uses "image".
+    row_offset_per_modality: dict[str, int] = {}
+    # Track which sequence-image pairs have already had their row
+    # offsets assigned this round (a sequence's image may straddle
+    # multiple chunks via large-seq chunking; the row offset is
+    # consistent across chunks because it's tied to the seq+image
+    # identity, not the chunk).
+    image_row_by_id: dict[tuple[int, int, str], int] = {}
+
+    # Per-sequence MRoPE 3-D positions, computed lazily on first
+    # encounter of a multimodal sequence (a sequence may contribute
+    # to multiple chunks via large-seq chunking, so we cache per id).
+    mrope_pos_by_seq: dict[int, torch.Tensor] = {}
+
+    for chunk in chunks:
+        # Per-(modality, encoder_id) lists of (chunk_local_pos, image_row)
+        # pairs we'll accumulate while walking this chunk's seqs.
+        positions_per_enc: dict[tuple[str, int], list[int]] = {}
+        assignment_per_enc: dict[tuple[str, int], list[int]] = {}
+
+        for ref in chunk.seqs:
+            mi = getattr(ref.seq, "modality_inputs", None) or {}
+            if not mi:
+                continue
+            seq_start_in_chunk = ref.chunk_range[0]
+            seq_lo_in_seq = ref.seq_range[0]
+            seq_hi_in_seq = ref.seq_range[1]
+            seq_id_key = id(ref.seq)
+            for modality, items in mi.items():
+                if not items:
+                    continue
+                # Phase 1: single encoder per modality.
+                encoder_id = 0
+                key = (modality, encoder_id)
+                positions_per_enc.setdefault(key, [])
+                assignment_per_enc.setdefault(key, [])
+                for img_idx_in_seq, item in enumerate(items):
+                    pp = getattr(item, "placeholder_positions", None)
+                    if pp is None or pp.numel() == 0:
+                        continue
+                    pp_host = pp.to(torch.int64).tolist()
+                    # Filter to placeholder positions that fall inside
+                    # this chunk's [seq_lo_in_seq, seq_hi_in_seq) window
+                    # of the underlying sequence, and translate to
+                    # chunk-local indices via seq_start_in_chunk.
+                    local_positions: list[int] = []
+                    intra_image_offsets: list[int] = []
+                    for intra_idx, abs_pos in enumerate(pp_host):
+                        if seq_lo_in_seq <= abs_pos < seq_hi_in_seq:
+                            local_positions.append(
+                                seq_start_in_chunk + (abs_pos - seq_lo_in_seq)
+                            )
+                            intra_image_offsets.append(intra_idx)
+                    if not local_positions:
+                        continue
+                    # Assign a round-level row offset for this image
+                    # once (consistent across chunks that share it).
+                    img_id_key = (seq_id_key, img_idx_in_seq, modality)
+                    if img_id_key not in image_row_by_id:
+                        image_row_by_id[img_id_key] = row_offset_per_modality.get(
+                            modality, 0
+                        )
+                        row_offset_per_modality[modality] = (
+                            image_row_by_id[img_id_key] + len(pp_host)
+                        )
+                    base = image_row_by_id[img_id_key]
+                    positions_per_enc[key].extend(local_positions)
+                    assignment_per_enc[key].extend(
+                        base + off for off in intra_image_offsets
+                    )
+
+        if not positions_per_enc:
+            continue
+        # Materialize per-encoder int64 device tensors and stash in
+        # ``chunk.meta.extra``. Use a fresh dict for ``extra`` to avoid
+        # aliasing with other code that might mutate it.
+        extra = dict(chunk.meta.extra)
+        pos_map: dict[str, dict[int, torch.Tensor]] = {}
+        asn_map: dict[str, dict[int, torch.Tensor]] = {}
+        for (modality, encoder_id), positions in positions_per_enc.items():
+            pos_map.setdefault(modality, {})[encoder_id] = torch.tensor(
+                positions, dtype=torch.int64, device=device,
+            )
+            asn_map.setdefault(modality, {})[encoder_id] = torch.tensor(
+                assignment_per_enc[(modality, encoder_id)],
+                dtype=torch.int64,
+                device=device,
+            )
+        extra["mm_placeholder_positions"] = pos_map
+        extra["mm_image_assignment"] = asn_map
+
+        # ---- Build 3-D MRoPE seq_positions for this chunk ----
+        # For each contributing seq, slice its per-seq 3-D positions
+        # at ``[seq_range[0]:seq_range[1])`` (seq-local), concat in
+        # chunk-local order. Text-only contributing seqs (no
+        # modality_inputs) get degenerate (p, p, p) computed on the
+        # fly from their seq_positions slice. The final tensor is
+        # ``(total_q, 3) int32`` on the chunk's device.
+        chunk_3d_parts: list[torch.Tensor] = []
+        for ref in chunk.seqs:
+            seq = ref.seq
+            seq_lo, seq_hi = ref.seq_range
+            seq_id_key = id(seq)
+            if getattr(seq, "modality_inputs", None):
+                if seq_id_key not in mrope_pos_by_seq:
+                    seq_pos = _compute_mrope_position_ids(seq)
+                    # May still be None if modality_inputs map is empty
+                    # for every modality; treat as text-only fallback.
+                    if seq_pos is None:
+                        seq_len = int(seq.tokens.numel())
+                        seq_pos = torch.arange(
+                            seq_len, dtype=torch.int32,
+                        ).reshape(-1, 1).expand(seq_len, 3).contiguous()
+                    mrope_pos_by_seq[seq_id_key] = seq_pos
+                seq_pos = mrope_pos_by_seq[seq_id_key]
+            else:
+                # Text-only contributing seq under a multimodal chunk:
+                # build degenerate (p, p, p) positions for this slice.
+                # Use the same arange the engine would have produced.
+                seq_len = int(seq.tokens.numel())
+                seq_pos = (
+                    torch.arange(seq_len, dtype=torch.int32)
+                    .reshape(-1, 1)
+                    .expand(seq_len, 3)
+                    .contiguous()
+                )
+            # Slice and append.
+            chunk_3d_parts.append(seq_pos[seq_lo:seq_hi].contiguous())
+        new_seq_positions = torch.cat(chunk_3d_parts, dim=0).to(
+            dtype=torch.int32, device=device,
+        )
+        if new_seq_positions.shape[0] != chunk.meta.total_q:
+            raise RuntimeError(
+                f"MRoPE chunk position concat produced "
+                f"{new_seq_positions.shape[0]} rows but chunk.total_q = "
+                f"{chunk.meta.total_q}; seq_range vs chunk_range mismatch."
+            )
+
+        # ChunkMeta is a dataclass with mutable ``extra`` Mapping;
+        # replace via dataclasses.replace to keep frozen-ness happy.
+        from dataclasses import replace as _replace
+        chunk.meta = _replace(
+            chunk.meta, extra=extra, seq_positions=new_seq_positions,
+        )
 
 
 __all__ = [
