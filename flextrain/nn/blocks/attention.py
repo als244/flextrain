@@ -104,6 +104,12 @@ class GQAAttentionConfig:
     rms_norm_eps: float = 1e-6  # Used only when qk_norm=True
     qk_norm_master_dtype: torch.dtype = torch.float32
     qk_norm_grad_dtype: torch.dtype = torch.float32
+    # Compute-side dtype for the QK-norm RMSNorm weight. Defaults to
+    # fp32 (same as master) so AdamW updates these tiny tensors at full
+    # precision -- the (1+w) storage convention pushes the param into
+    # the bf16 magnitude-1 regime where lr·sign(g) ≈ 3e-5 is below
+    # bf16 ULP. See ``flextrain/nn/blocks/norm.py`` for the design.
+    qk_norm_compute_dtype: torch.dtype = torch.float32
     # Default Qwen3-style PER-HEAD RMSNorm on Q/K (weight vector sized
     # head_dim, broadcast across heads, rstd shape (T, heads)). OLMoE
     # uses FULL-ROW RMSNorm (per_head=False; weight sized attn_dim/kv_dim,
@@ -196,13 +202,16 @@ class GQAAttentionBlock:
             else:
                 # OLMoE-style: weight (attn_dim,) / (kv_dim,), rstd (T, 1).
                 q_weight_dim, k_weight_dim = "attn_dim", "kv_dim"
+            # Use fp32 throughout for the qk_norm weight so AdamW can
+            # resolve lr·sign(g)-sized updates above bf16 ULP. See the
+            # ``norm_compute_dtype`` note in Qwen3_5LayerConfig.
             self.q_norm = RMSNormBlock(
                 prefix="q_norm",
                 eps=cfg.rms_norm_eps,
                 per_head=cfg.qk_norm_per_head,
                 heads_dim_name="n_heads",
                 weight_dim_name=q_weight_dim,
-                param_compute_dtype=cfg.compute_dtype,
+                param_compute_dtype=cfg.qk_norm_compute_dtype,
                 param_master_dtype=cfg.qk_norm_master_dtype,
                 param_grad_dtype=cfg.qk_norm_grad_dtype,
             )
@@ -212,7 +221,7 @@ class GQAAttentionBlock:
                 per_head=cfg.qk_norm_per_head,
                 heads_dim_name="n_kv_heads",
                 weight_dim_name=k_weight_dim,
-                param_compute_dtype=cfg.compute_dtype,
+                param_compute_dtype=cfg.qk_norm_compute_dtype,
                 param_master_dtype=cfg.qk_norm_master_dtype,
                 param_grad_dtype=cfg.qk_norm_grad_dtype,
             )

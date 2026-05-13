@@ -59,6 +59,7 @@ class Gemma3BlockConfig:
     grad_dtype: torch.dtype | None = None
     norm_grad_dtype: torch.dtype = torch.float32
     norm_master_dtype: torch.dtype = torch.float32
+    norm_compute_dtype: torch.dtype = torch.float32  # fp32 throughout for RMSNorm weights -- the (1+w) storage convention pushes them into the bf16 magnitude-1 regime where AdamW lr*sign(g) is below ULP.
 
     def dims(self) -> dict[str, int]:
         return {
@@ -88,6 +89,7 @@ def _build_attn(cfg: Gemma3BlockConfig):
                 qk_norm=True,
                 rms_norm_eps=cfg.rms_norm_eps,
                 qk_norm_master_dtype=cfg.norm_master_dtype,
+                qk_norm_compute_dtype=cfg.norm_compute_dtype,
                 qk_norm_grad_dtype=cfg.norm_grad_dtype,
                 window_size_left=cfg.window_size_left,
                 attn_logit_softcap=softcap,
@@ -107,6 +109,7 @@ def _build_attn(cfg: Gemma3BlockConfig):
             qk_norm=True,
             rms_norm_eps=cfg.rms_norm_eps,
             qk_norm_master_dtype=cfg.norm_master_dtype,
+            qk_norm_compute_dtype=cfg.norm_compute_dtype,
             qk_norm_grad_dtype=cfg.norm_grad_dtype,
             attn_logit_softcap=softcap,
             compute_dtype=cfg.compute_dtype,
@@ -128,25 +131,25 @@ class Gemma3Block:
 
         self.pre_attn_norm = RMSNormBlock(
             prefix="pre_attn_norm", eps=cfg.rms_norm_eps,
-            param_compute_dtype=cfg.compute_dtype,
+            param_compute_dtype=cfg.norm_compute_dtype,
             param_master_dtype=cfg.norm_master_dtype,
             param_grad_dtype=cfg.norm_grad_dtype,
         )
         self.post_attn_norm = RMSNormBlock(
             prefix="post_attn_norm", eps=cfg.rms_norm_eps,
-            param_compute_dtype=cfg.compute_dtype,
+            param_compute_dtype=cfg.norm_compute_dtype,
             param_master_dtype=cfg.norm_master_dtype,
             param_grad_dtype=cfg.norm_grad_dtype,
         )
         self.pre_ffn_norm = RMSNormBlock(
             prefix="pre_ffn_norm", eps=cfg.rms_norm_eps,
-            param_compute_dtype=cfg.compute_dtype,
+            param_compute_dtype=cfg.norm_compute_dtype,
             param_master_dtype=cfg.norm_master_dtype,
             param_grad_dtype=cfg.norm_grad_dtype,
         )
         self.post_ffn_norm = RMSNormBlock(
             prefix="post_ffn_norm", eps=cfg.rms_norm_eps,
-            param_compute_dtype=cfg.compute_dtype,
+            param_compute_dtype=cfg.norm_compute_dtype,
             param_master_dtype=cfg.norm_master_dtype,
             param_grad_dtype=cfg.norm_grad_dtype,
         )

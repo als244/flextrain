@@ -89,6 +89,11 @@ class RMSNormBlock:
     param_compute_dtype: torch.dtype = torch.bfloat16
     param_master_dtype: torch.dtype | None = None
     param_grad_dtype: torch.dtype = torch.float32
+    # Default to fp32 AdamW moments too: bf16 m/v at the (1+w) storage
+    # magnitude lose enough precision to compound visibly over training
+    # (see ``Qwen3_5LayerConfig.norm_compute_dtype`` for the broader
+    # bf16 precision-loss issue on RMSNorm params).
+    param_opt_state_dtype: torch.dtype = torch.float32
 
     @property
     def rstd_name(self) -> str:
@@ -131,6 +136,7 @@ class RMSNormBlock:
                     compute_dtype=self.param_compute_dtype,
                     master_dtype=self.param_master_dtype,
                     grad_dtype=self.param_grad_dtype,
+                    opt_state_dtype=self.param_opt_state_dtype,
                 ),
             )
         )

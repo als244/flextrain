@@ -77,7 +77,7 @@ class Qwen2Block(LlamaBlock):
         self.attn_norm = RMSNormBlock(
             prefix="attn_norm",
             eps=cfg.rms_norm_eps,
-            param_compute_dtype=cfg.compute_dtype,
+            param_compute_dtype=cfg.norm_compute_dtype,
             param_master_dtype=cfg.norm_master_dtype,
             param_grad_dtype=cfg.norm_grad_dtype,
         )
@@ -99,7 +99,7 @@ class Qwen2Block(LlamaBlock):
         self.ffn_norm = RMSNormBlock(
             prefix="ffn_norm",
             eps=cfg.rms_norm_eps,
-            param_compute_dtype=cfg.compute_dtype,
+            param_compute_dtype=cfg.norm_compute_dtype,
             param_master_dtype=cfg.norm_master_dtype,
             param_grad_dtype=cfg.norm_grad_dtype,
         )

@@ -66,6 +66,7 @@ class OLMoEBlockConfig:
     grad_dtype: torch.dtype | None = None
     norm_grad_dtype: torch.dtype = torch.float32
     norm_master_dtype: torch.dtype = torch.float32
+    norm_compute_dtype: torch.dtype = torch.float32  # fp32 throughout for RMSNorm weights -- the (1+w) storage convention pushes them into the bf16 magnitude-1 regime where AdamW lr*sign(g) is below ULP.
 
     def dims(self) -> dict[str, int]:
         return {
@@ -112,7 +113,7 @@ class OLMoEBlock:
         self.attn_norm = RMSNormBlock(
             prefix="attn_norm",
             eps=cfg.rms_norm_eps,
-            param_compute_dtype=cfg.compute_dtype,
+            param_compute_dtype=cfg.norm_compute_dtype,
             param_master_dtype=cfg.norm_master_dtype,
             param_grad_dtype=cfg.norm_grad_dtype,
         )
@@ -132,6 +133,7 @@ class OLMoEBlock:
                 qk_norm=True,
                 rms_norm_eps=cfg.rms_norm_eps,
                 qk_norm_master_dtype=cfg.norm_master_dtype,
+                qk_norm_compute_dtype=cfg.norm_compute_dtype,
                 qk_norm_grad_dtype=cfg.norm_grad_dtype,
                 qk_norm_per_head=False,
                 compute_dtype=cfg.compute_dtype,
@@ -142,7 +144,7 @@ class OLMoEBlock:
         self.ffn_norm = RMSNormBlock(
             prefix="ffn_norm",
             eps=cfg.rms_norm_eps,
-            param_compute_dtype=cfg.compute_dtype,
+            param_compute_dtype=cfg.norm_compute_dtype,
             param_master_dtype=cfg.norm_master_dtype,
             param_grad_dtype=cfg.norm_grad_dtype,
         )

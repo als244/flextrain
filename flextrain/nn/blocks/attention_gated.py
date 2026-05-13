@@ -122,13 +122,17 @@ class GQAAttentionGatedBlock:
                 q_weight_dim, k_weight_dim = "head_dim", "head_dim"
             else:
                 q_weight_dim, k_weight_dim = "attn_dim", "kv_dim"
+            # Use fp32 throughout for the qk_norm weight (see
+            # ``norm_compute_dtype`` note in Qwen3_5LayerConfig). Avoids
+            # the bf16-magnitude-1 precision loss the (1+w) storage
+            # convention triggers for AdamW on small lr·sign(g) updates.
             self.q_norm = RMSNormBlock(
                 prefix="q_norm",
                 eps=cfg.rms_norm_eps,
                 per_head=cfg.qk_norm_per_head,
                 heads_dim_name="n_heads",
                 weight_dim_name=q_weight_dim,
-                param_compute_dtype=cfg.compute_dtype,
+                param_compute_dtype=cfg.qk_norm_compute_dtype,
                 param_master_dtype=cfg.qk_norm_master_dtype,
                 param_grad_dtype=cfg.qk_norm_grad_dtype,
             )
@@ -138,7 +142,7 @@ class GQAAttentionGatedBlock:
                 per_head=cfg.qk_norm_per_head,
                 heads_dim_name="n_kv_heads",
                 weight_dim_name=k_weight_dim,
-                param_compute_dtype=cfg.compute_dtype,
+                param_compute_dtype=cfg.qk_norm_compute_dtype,
                 param_master_dtype=cfg.qk_norm_master_dtype,
                 param_grad_dtype=cfg.qk_norm_grad_dtype,
             )

@@ -86,6 +86,12 @@ class LMHeadConfig:
     norm_grad_dtype: torch.dtype = torch.float32
     # fp32 master for the final_norm weight: tiny cost, avoids rounding.
     norm_master_dtype: torch.dtype = torch.float32
+    # fp32 compute for the final_norm weight too -- otherwise the GPU
+    # param slot bf16-casts the fp32 master, AdamW updates on the bf16
+    # copy lose lr·sign(g) precision (<= bf16 ULP at magnitude 1), and
+    # the GPU->host offload then overwrites the fp32 master with the
+    # bf16-quantized value. See ``flextrain/nn/blocks/norm.py``.
+    norm_compute_dtype: torch.dtype = torch.float32
 
 
 class LMHead:
@@ -128,7 +134,7 @@ class LMHead:
                 TensorSpec(
                     name="w_final_norm",
                     shape_fn=_norm_shape,
-                    compute_dtype=cfg.compute_dtype,
+                    compute_dtype=cfg.norm_compute_dtype,
                     master_dtype=cfg.norm_master_dtype,
                     grad_dtype=cfg.norm_grad_dtype,
                 ),

@@ -294,9 +294,17 @@ def main() -> None:
             # (so callers can do grad-accumulation across multiple
             # ``fwd_bwd`` calls before stepping). For per-step parity we
             # take a fresh step after each fwd_bwd.
-            stats = am.fwd_bwd([ft_seq])
-            am.step()
+            #
+            # CRITICAL: pass ``loss_scale_factor=1/active`` so flextrain
+            # returns gradients of the MEAN loss (HF's convention), not
+            # the SUM (flextrain's documented default). Without this
+            # every gradient is N× larger than HF's. AdamW is supposed
+            # to be scale-invariant in steady state, but step 1's
+            # bias-correction kick + the eps term break that invariance,
+            # and the resulting trajectory divergence compounds.
             ft_active = ft_seq.active_token_count
+            stats = am.fwd_bwd([ft_seq], loss_scale_factor=1.0/max(ft_active, 1))
+            am.step()
             loss_ft = stats.total_loss / max(ft_active, 1)
 
             abs_err = abs(loss_hf - loss_ft)

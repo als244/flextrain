@@ -78,6 +78,14 @@ class Qwen3_5LayerConfig:
     grad_dtype: torch.dtype | None = None
     norm_grad_dtype: torch.dtype = torch.float32
     norm_master_dtype: torch.dtype = torch.float32
+    # RMSNorm weights are tiny (~2048 elements each, ~250K total across
+    # the whole 24-layer model = ~1MB at fp32). Keeping them fp32
+    # throughout (master + GPU compute + grad + opt-state) avoids the
+    # precision-loss bug where the (1+w) storage convention pushes the
+    # parameter into the bf16 magnitude-1 regime, where an AdamW step
+    # of lr·sign(g) ≈ 3e-5 is below bf16 ULP (≈8e-3 near 1.0). Linear
+    # layers (which dominate param count) keep bf16 compute as before.
+    norm_compute_dtype: torch.dtype = torch.float32
 
     def dims(self) -> dict[str, int]:
         return {
@@ -123,7 +131,7 @@ class Qwen3_5FullLayer:
         self.attn_norm = RMSNormBlock(
             prefix="attn_norm",
             eps=cfg.rms_norm_eps,
-            param_compute_dtype=cfg.compute_dtype,
+            param_compute_dtype=cfg.norm_compute_dtype,
             param_master_dtype=cfg.norm_master_dtype,
             param_grad_dtype=cfg.norm_grad_dtype,
         )
@@ -139,6 +147,7 @@ class Qwen3_5FullLayer:
                 rms_norm_eps=cfg.rms_norm_eps,
                 qk_norm_master_dtype=cfg.norm_master_dtype,
                 qk_norm_grad_dtype=cfg.norm_grad_dtype,
+                qk_norm_compute_dtype=cfg.norm_compute_dtype,
                 partial_rotary_factor=cfg.partial_rotary_factor,
                 mrope_section=cfg.mrope_section,
                 mrope_interleaved=cfg.mrope_interleaved,
@@ -151,7 +160,7 @@ class Qwen3_5FullLayer:
         self.ffn_norm = RMSNormBlock(
             prefix="ffn_norm",
             eps=cfg.rms_norm_eps,
-            param_compute_dtype=cfg.compute_dtype,
+            param_compute_dtype=cfg.norm_compute_dtype,
             param_master_dtype=cfg.norm_master_dtype,
             param_grad_dtype=cfg.norm_grad_dtype,
         )
@@ -387,7 +396,7 @@ class Qwen3_5LinearLayer:
         self.attn_norm = RMSNormBlock(
             prefix="attn_norm",
             eps=cfg.rms_norm_eps,
-            param_compute_dtype=cfg.compute_dtype,
+            param_compute_dtype=cfg.norm_compute_dtype,
             param_master_dtype=cfg.norm_master_dtype,
             param_grad_dtype=cfg.norm_grad_dtype,
         )
@@ -408,7 +417,7 @@ class Qwen3_5LinearLayer:
         self.ffn_norm = RMSNormBlock(
             prefix="ffn_norm",
             eps=cfg.rms_norm_eps,
-            param_compute_dtype=cfg.compute_dtype,
+            param_compute_dtype=cfg.norm_compute_dtype,
             param_master_dtype=cfg.norm_master_dtype,
             param_grad_dtype=cfg.norm_grad_dtype,
         )
