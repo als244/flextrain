@@ -763,11 +763,22 @@ class ActiveModel:
             for name, t in layer_host.items():
                 dest[(scope, name)] = t
 
+        # Vision encoder layer count for the multimodal input layer (0
+        # for text-only or non-multimodal arches). The input layer
+        # advertises this via the ``num_vision_layers`` attribute on
+        # :class:`MultimodalInputLayer`; text-only ``TokenEmbedLayer``
+        # doesn't set it -> getattr default of 0 keeps the existing
+        # text-only path unchanged.
+        num_vision_layers = int(
+            getattr(self.embed, "num_vision_layers", 0)
+        )
+
         leftover = load_hf_safetensors(
             hf_path=hf_path,
             arch=arch,
             dest=dest,
             num_layers=num_layers,
+            num_vision_layers=num_vision_layers,
             strict=strict,
             device="cpu",
         )
@@ -999,8 +1010,22 @@ class ActiveModel:
 
         # 3. Embed every chunk into the transition table on the compute stream.
         embed_ctx = self._layer_context()
+        # Multimodal: attach the embed weights dict so
+        # ``MultimodalInputLayer.setup_round`` can read encoder weights
+        # without a protocol-level kwarg. Harmless for text-only paths
+        # (TokenEmbedLayer doesn't consume ctx._mm_weights).
+        embed_ctx._mm_weights = self.buffers.gpu_embed_params
+        embed_ctx._mm_grads = self.buffers.gpu_embed_grads
         self.buffers.transitions.clear()
         with torch.cuda.stream(self.streams.compute):
+            # Optional round-level setup hook (multimodal: run frozen
+            # vision/audio encoders ONCE per round before the per-chunk
+            # embed loop). Text-only ``TokenEmbedLayer`` does not
+            # implement ``setup_round`` — the hasattr guard keeps the
+            # text-only path bit-for-bit unchanged. See
+            # ``flextrain/core/layer.py:InputLayer.setup_round``.
+            if hasattr(self.embed, "setup_round"):
+                self.embed.setup_round(prepared, embed_ctx)
             for chunk in prepared.chunks:
                 emb = self.embed.forward(
                     chunk.token_ids,
@@ -1615,6 +1640,15 @@ class ActiveModel:
                     self.buffers.gpu_embed_grads,
                     ctx,
                 )
+            # Optional round-level finalize hook (multimodal Phase 3:
+            # accumulate frozen-encoder grads after every chunk has run
+            # its splice-bwd). Phase 1 multimodal: no-op (encoders are
+            # frozen). Text-only path: ``TokenEmbedLayer`` does not
+            # implement ``finalize_round`` so the hasattr guard is a
+            # zero-overhead skip. See
+            # ``flextrain/core/layer.py:InputLayer.finalize_round``.
+            if hasattr(self.embed, "finalize_round"):
+                self.embed.finalize_round(prepared, ctx)
 
     # ==================================================================
     # Internal helpers
