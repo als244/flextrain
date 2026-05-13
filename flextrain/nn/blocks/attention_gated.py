@@ -44,8 +44,11 @@ from .attention import GQAAttentionConfig
 from .rope import (
     apply_rope_bwd,
     apply_rope_fwd,
+    apply_rope_mrope_bwd,
+    apply_rope_mrope_fwd,
     apply_rope_partial_bwd,
     apply_rope_partial_fwd,
+    build_mrope_axis_assignment,
     build_partial_rope_inv_freq,
     build_rope_inv_freq,
 )
@@ -58,9 +61,22 @@ class GQAAttentionGatedConfig(GQAAttentionConfig):
     Adds ``partial_rotary_factor`` (Qwen3-Next/3.5/3.6 default 0.25):
     fraction of ``head_dim`` that receives RoPE; the remaining channels
     pass through unrotated. ``1.0`` (default) reproduces full RoPE.
+
+    MRoPE (Qwen3.5/3.6/3-VL multimodal): when ``mrope_section`` is not
+    None, the block can dispatch to multi-axis RoPE at runtime based on
+    ``chunk.seq_positions.shape[-1]``. For text-only chunks (positions
+    are ``(T, 1)``) it falls through to the standard partial-RoPE path
+    -- numerically identical to non-MRoPE blocks. For multimodal chunks
+    (positions ``(T, 3)``) it invokes MRoPE with the configured
+    ``mrope_section`` / ``mrope_interleaved`` knobs. Leaving
+    ``mrope_section=None`` (default) disables the runtime dispatch
+    entirely -- 3-D positions would raise; the block remains
+    bit-identical to its pre-MRoPE behavior.
     """
 
     partial_rotary_factor: float = 1.0
+    mrope_section: tuple[int, int, int] | None = None
+    mrope_interleaved: bool = False
 
 
 class GQAAttentionGatedBlock:
@@ -93,6 +109,11 @@ class GQAAttentionGatedBlock:
         # The output gate is implicit from the block class.
         self.cfg = cfg
         self._rope_inv_freq_cache: torch.Tensor | None = None
+        # MRoPE axis-assignment table (Qwen-VL family). Built lazily on
+        # the first MRoPE call -- moves to the right device on demand.
+        # When ``cfg.mrope_section`` is None the table stays None and
+        # any 3-D ``seq_positions`` will raise at runtime.
+        self._mrope_axis_assignment: torch.Tensor | None = None
         # Qwen3-style per-head QK-norm. Owned internally so the modeling
         # layer doesn't need to wire up parallel RMSNormBlocks.
         if cfg.qk_norm:
@@ -285,7 +306,45 @@ class GQAAttentionGatedBlock:
             )
         return self._rope_inv_freq_cache
 
+    def _mrope_table(self, device: torch.device) -> torch.Tensor:
+        """Lazy-build the per-pair axis-assignment table for MRoPE.
+
+        Returns None if the block isn't MRoPE-configured. Caches on
+        first build and migrates to the requested device on subsequent
+        calls. Only used when ``chunk.seq_positions.shape[-1] == 3``.
+        """
+        mrope_section = getattr(self.cfg, "mrope_section", None)
+        if mrope_section is None:
+            return None
+        if (
+            self._mrope_axis_assignment is None
+            or self._mrope_axis_assignment.device != device
+        ):
+            self._mrope_axis_assignment = build_mrope_axis_assignment(
+                mrope_section,
+                getattr(self.cfg, "mrope_interleaved", False),
+                device=device,
+            )
+        return self._mrope_axis_assignment
+
     def _rope_fwd(self, tensors, seq_positions, rope_theta):
+        # MRoPE dispatch: 3-D ``seq_positions`` route through MRoPE.
+        # 1-D (or 2-D with trailing 1) routes through the historical
+        # partial / full RoPE kernels -- byte-identical to pre-MRoPE.
+        if seq_positions.dim() == 2 and seq_positions.shape[-1] == 3:
+            axis_assignment = self._mrope_table(seq_positions.device)
+            if axis_assignment is None:
+                raise ValueError(
+                    "Got 3-D seq_positions but block is not MRoPE-configured. "
+                    "Set cfg.mrope_section in the block builder."
+                )
+            return apply_rope_mrope_fwd(
+                tensors,
+                seq_positions,
+                rope_theta,
+                self._rot_dim,
+                axis_assignment,
+            )
         if self._is_partial_rotary:
             return apply_rope_partial_fwd(
                 tensors, seq_positions, rope_theta, self._rot_dim,
@@ -293,6 +352,20 @@ class GQAAttentionGatedBlock:
         return apply_rope_fwd(tensors, seq_positions, rope_theta)
 
     def _rope_bwd(self, grad_tensors, seq_positions, rope_theta):
+        if seq_positions.dim() == 2 and seq_positions.shape[-1] == 3:
+            axis_assignment = self._mrope_table(seq_positions.device)
+            if axis_assignment is None:
+                raise ValueError(
+                    "Got 3-D seq_positions but block is not MRoPE-configured. "
+                    "Set cfg.mrope_section in the block builder."
+                )
+            return apply_rope_mrope_bwd(
+                grad_tensors,
+                seq_positions,
+                rope_theta,
+                self._rot_dim,
+                axis_assignment,
+            )
         if self._is_partial_rotary:
             return apply_rope_partial_bwd(
                 grad_tensors, seq_positions, rope_theta, self._rot_dim,
