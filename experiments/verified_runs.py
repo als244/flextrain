@@ -392,6 +392,15 @@ def _build_train_cmd(row: Row, out_dir: Path) -> list[str]:
         # mode — overriding here keeps the curves comparable.
         "--lr", "3.0e-5",
     ]
+    # Optional memory-budget overrides via env vars. Useful for
+    # smaller-GPU sweeps (e.g. a 5090 forced to behave like a 24 GiB
+    # card) without editing this script per-row.
+    max_gpu = os.environ.get("FLEXTRAIN_MAX_GPU_MEM_GIB")
+    if max_gpu:
+        cmd += ["--max-gpu-mem-gib", str(max_gpu)]
+    max_host = os.environ.get("FLEXTRAIN_MAX_HOST_MEM_GIB")
+    if max_host:
+        cmd += ["--max-host-mem-gib", str(max_host)]
     if row.mode == "lora":
         cmd += ["--lora-rank", "16", "--lora-alpha", "16.0"]
     if row.apply_chat_template:
