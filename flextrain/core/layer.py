@@ -50,6 +50,12 @@ from typing import (
 import torch
 
 from .activation_schema import ActivationSchema, ActivationSlot
+from .modality import (
+    InputsSummary,
+    ModalityEmbeddings,
+    ModalityGradInputs,
+    ModalityInputs,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -331,7 +337,13 @@ class ChunkMeta:
     total_k: int
     # per-sequence new lengths (host list; no device tensor in orig)
     seq_lens_host: Sequence[int]
-    # per-sequence positions within each sequence, shape (total_q, 1) int32
+    # per-sequence positions within each sequence, shape (total_q, K) int32.
+    # K=1 for standard 1-axis RoPE (every arch except MRoPE-multimodal).
+    # K>=2 for multi-axis RoPE — e.g. K=3 for Qwen-VL MRoPE where each
+    # token carries (t_pos, h_pos, w_pos). The K=1 path is the historical
+    # default and is bit-identical to a single ``arange`` per sequence
+    # reshaped as ``(T, 1)``. Layers that don't care about K just slice
+    # ``seq_positions[:, 0]``; layers that consume MRoPE slice per-axis.
     seq_positions: torch.Tensor
     # cu_seqlens-style offsets for flash-attn varlen (device int32 tensors)
     q_seq_offsets: torch.Tensor
@@ -379,14 +391,29 @@ class ChunkMeta:
     def build(
         cls,
         seq_lens: Sequence[int],
-        seq_positions: Sequence[int],
+        seq_positions: "Sequence[int] | Sequence[Sequence[int]] | torch.Tensor",
         prior_seq_lens: Sequence[int],
         prior_seq_offsets: Sequence[int],
         *,
         device: torch.device | str,
         has_more_chunks: Sequence[bool] | None = None,
     ) -> "ChunkMeta":
-        """Mirrors ``dense_layer.py:707`` ``make_chunk_metadata``."""
+        """Mirrors ``dense_layer.py:707`` ``make_chunk_metadata``.
+
+        ``seq_positions`` may be either:
+
+        * ``Sequence[int]`` of length ``total_q`` -- the standard 1-axis
+          position list. Produces a ``(total_q, 1) int32`` tensor (the
+          historical layout). Existing call sites all pass this form.
+        * ``Sequence[Sequence[int]]`` or ``torch.Tensor`` of shape
+          ``(total_q, K)`` -- the multi-axis form, used by MRoPE for
+          Qwen-VL multimodal where K=3 (t, h, w). Produces a
+          ``(total_q, K) int32`` tensor.
+
+        For K=1 the output is byte-identical to the pre-multimodal
+        implementation; for K>=2 it carries the extra axes through to
+        the attention RoPE.
+        """
         import numpy as np
 
         num_seqs = len(seq_lens)
@@ -438,9 +465,38 @@ class ChunkMeta:
         max_seqlen_k = int(
             max(prior_seq_lens[i] + seq_lens[i] for i in range(num_seqs))
         )
-        seq_positions_t = torch.tensor(
-            list(seq_positions), dtype=torch.int32, device=device
-        ).reshape(-1, 1)
+        # ``seq_positions`` may be 1-D (standard RoPE) or 2-D (MRoPE).
+        # Detect the form and produce a ``(total_q, K) int32`` tensor.
+        # The 1-D path uses ``.reshape(-1, 1)`` and is byte-identical to
+        # the historical pre-multimodal layout (K=1).
+        if isinstance(seq_positions, torch.Tensor):
+            assert seq_positions.dim() in (1, 2), (
+                f"seq_positions tensor must be 1-D or 2-D, got "
+                f"shape={tuple(seq_positions.shape)}"
+            )
+            seq_positions_t = seq_positions.to(
+                device=device, dtype=torch.int32
+            )
+            if seq_positions_t.dim() == 1:
+                seq_positions_t = seq_positions_t.reshape(-1, 1)
+        else:
+            pos_list = list(seq_positions)
+            # Heuristic: empty list, or list of ints → 1-D path; list of
+            # lists/tuples/tensors → 2-D path.
+            is_2d = (
+                len(pos_list) > 0
+                and not isinstance(pos_list[0], (int, np.integer))
+            )
+            seq_positions_t = torch.tensor(
+                pos_list, dtype=torch.int32, device=device
+            )
+            if not is_2d:
+                seq_positions_t = seq_positions_t.reshape(-1, 1)
+            else:
+                assert seq_positions_t.dim() == 2, (
+                    f"2-D seq_positions must produce a 2-D tensor, got "
+                    f"shape={tuple(seq_positions_t.shape)}"
+                )
 
         return cls(
             total_q=total_q,
@@ -792,6 +848,24 @@ class InputLayer(Protocol):
     because its "activation" is the ``token_ids`` tensor, already owned by
     :class:`ChunkMeta`. Its schema is still present (for symmetry with
     :class:`Layer`) but typically has ``max_tier=0`` and no fields.
+
+    Multimodal extension (optional)
+    -------------------------------
+    Implementations MAY also expose two round-level hooks that the engine
+    calls before and after the per-chunk fwd/bwd embed loop. The text-only
+    :class:`~flextrain.nn.embed.TokenEmbedLayer` does not implement them;
+    the engine guards each call with ``hasattr(...)`` so the existing
+    text-only path is bit-for-bit unchanged.
+
+    A :class:`~flextrain.nn.multimodal_input.MultimodalInputLayer` uses
+    these hooks to run its frozen modality encoders once per round, cache
+    the resulting embeddings, and (in Phase 3) accumulate encoder
+    gradients after all chunks have run their backward.
+
+    The hooks are intentionally untyped re: ``prepared`` (the engine's
+    :class:`~flextrain.engine.schedule.PreparedRound`) -- ``core/`` must
+    not import from ``engine/``, so the signature uses ``object`` and the
+    multimodal implementation does the local cast.
     """
 
     schema: ActivationSchema
@@ -821,6 +895,164 @@ class InputLayer(Protocol):
         ...
 
     def compute_cost(self, chunk: ChunkMeta) -> ComputeCost:
+        ...
+
+    # ------------------------------------------------------------------
+    # Optional round-level hooks. Default not implemented; the engine
+    # tests ``hasattr(self.embed, "setup_round")`` before calling.
+    # ------------------------------------------------------------------
+
+    def setup_round(
+        self,
+        prepared: object,
+        ctx: LayerContext,
+    ) -> None:
+        """Run any once-per-round forward-side setup.
+
+        For :class:`MultimodalInputLayer`: gather pixel_values across all
+        sequences in the round, DMA to GPU, invoke each modality encoder's
+        ``forward_round``, stash the result on a private per-round cache.
+
+        Called by the engine BEFORE the per-chunk embed-forward loop in
+        :meth:`ActiveModel._setup_round`.
+        """
+        ...
+
+    def finalize_round(
+        self,
+        prepared: object,
+        ctx: LayerContext,
+    ) -> None:
+        """Run any once-per-round backward-side teardown.
+
+        For :class:`MultimodalInputLayer`: invoke each (non-frozen) modality
+        encoder's ``backward_round`` to accumulate encoder param grads from
+        the per-chunk splice-bwd accumulator. Phase 1 (all encoders frozen)
+        is a no-op.
+
+        Called by the engine AFTER the per-chunk embed-backward loop in
+        :meth:`ActiveModel._embed_backward`.
+        """
+        ...
+
+
+# ---------------------------------------------------------------------------
+# ModalityEncoder Protocol -- the sub-model that turns raw modality data
+# (pixel_values, audio waveform, ...) into d_model embeddings.
+#
+# Phase 1: forward only; backward is a no-op because all tensors are
+# ``TensorSpec(frozen=True)`` and the engine skips grad/opt-state for
+# frozen tensors. The Protocol is shaped to support trainable encoders
+# in Phase 3 with no signature changes.
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class ModalityEncoder(Protocol):
+    """Self-contained sub-model: raw modality data -> d_model embeddings.
+
+    Lifecycle
+    ---------
+    Invoked ONCE PER ROUND from
+    :meth:`MultimodalInputLayer.setup_round` (NOT per chunk). The
+    encoder's output is cached on the input layer for the duration of
+    the round; per-chunk forward only slices/scatters from the cache.
+
+    Parameter residency
+    -------------------
+    The encoder's ``param_spec`` is merged into
+    :attr:`MultimodalInputLayer.param_spec`. Encoder tensor names must
+    be prefixed by ``f"{modality}{encoder_id}_"`` to avoid collisions
+    with the text-embed table (``w_tok_embeddings``) and with sibling
+    encoders.
+
+    Phase 1: every tensor is ``TensorSpec(frozen=True)``. The engine's
+    existing frozen-skip paths in
+    :func:`flextrain.engine.buffers.param_spec_byte_size` cover grad
+    and opt-state allocation automatically.
+
+    Activation accounting
+    ---------------------
+    :meth:`peak_workspace_bytes` reports the encoder's GPU peak (params
+    aside) so the working-set planner can subtract that from the GPU
+    budget before sizing activation rings. Phase 1 encoders run their
+    forward under ``torch.inference_mode()`` so no autograd state is
+    retained.
+    """
+
+    modality: str
+    """Modality name (``"image"``, ``"audio"``, ``"video"``). Used by
+    :class:`MultimodalInputLayer` to key the round cache and route
+    backward grads. Multiple encoders for the same modality may
+    coexist (e.g., two image encoders with different patch sizes for
+    deepstack); disambiguated by :attr:`encoder_id`."""
+
+    encoder_id: int
+    """Disambiguating id within a modality; ``0`` for single-encoder
+    configs. Used to construct the param-name prefix
+    ``f"{modality}{encoder_id}_"``."""
+
+    schema: ActivationSchema
+    """Phase 1: empty schema (``max_tier=0``, no fields). The encoder
+    has no per-chunk activation slot in Phase 1 because its output is
+    cached per-round, not per-chunk. Phase 3 trainable encoders may
+    declare fields for activation-tier planning of internal layers."""
+
+    param_spec: ParamSpec
+    """All encoder weights with the ``f"{modality}{encoder_id}_"``
+    prefix on each ``TensorSpec.name``. Phase 1: every tensor has
+    ``frozen=True``."""
+
+    def forward_round(
+        self,
+        inputs: ModalityInputs,
+        weights: Mapping[str, torch.Tensor],
+        ctx: LayerContext,
+    ) -> ModalityEmbeddings:
+        """Encode one round's modality data into ``d_model`` embeddings.
+
+        Phase 1 implementations should wrap the body in
+        ``torch.inference_mode()`` since every weight is frozen.
+        """
+        ...
+
+    def backward_round(
+        self,
+        d_embeddings: ModalityGradInputs,
+        inputs: ModalityInputs,
+        weights: Mapping[str, torch.Tensor],
+        grads: MutableMapping[str, torch.Tensor],
+        ctx: LayerContext,
+    ) -> None:
+        """Accumulate encoder param gradients from
+        ``d_embeddings.d_embeds``.
+
+        Phase 1: no-op (all weights frozen; engine never allocates the
+        grad accumulator or calls this).
+        Phase 3: real backward pass through encoder layers.
+        Returns no upstream gradient -- the modality input
+        (pixel_values, audio) is a leaf.
+        """
+        ...
+
+    def peak_workspace_bytes(self, inputs_summary: InputsSummary) -> int:
+        """GPU peak (activations + transient) for one round-level
+        forward of ``inputs_summary``.
+
+        Consumed by :func:`determine_working_set_config` to subtract
+        from the GPU budget before sizing activation rings. Does NOT
+        include the encoder's parameter bytes (those are covered by
+        ``param_spec.byte_size(...)`` via the merged embed param spec).
+        """
+        ...
+
+    def compute_cost_round(self, inputs_summary: InputsSummary) -> ComputeCost:
+        """Aggregate forward FLOPs for one round's encoder forward.
+
+        Currently informational only -- the DP solver does not include
+        the encoder. Surfaced for TFLOPS reporting and future use when
+        trainable encoders enter the planner.
+        """
         ...
 
 
