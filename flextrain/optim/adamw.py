@@ -37,8 +37,50 @@ class AdamWHyperparams:
     check_error: bool = False
 
 
+class AdamWStateSpec(OptimizerStateSpec):
+    """OptimizerStateSpec for AdamW that honors per-tensor
+    ``TensorSpec.opt_state_dtype`` overrides.
+
+    Default behavior: use the optimizer's uniform ``state_dtype`` (set
+    at construction) for every parameter. Per-parameter override: if a
+    ``TensorSpec`` sets ``opt_state_dtype`` explicitly (e.g. RMSNorm γ
+    setting fp32 so AdamW updates aren't lost to bf16 quantization at
+    magnitude ~1.0), that dtype is used for ``o_adam_m`` / ``o_adam_v``
+    on that tensor.
+
+    This mirrors :class:`flextrain.optim.hybrid.HybridStateSpec`'s
+    pattern: the engine's allocator calls ``per_param_state_tensors``
+    if present, falling back to ``self.tensors`` (uniform).
+    """
+
+    def per_param_state_tensors(
+        self, param, dims: Mapping[str, int]
+    ):
+        # Use the per-tensor opt_state_dtype when set; otherwise fall
+        # back to the optimizer's default (self.tensors[0].dtype).
+        dtype = (
+            param.opt_state_dtype
+            if param.opt_state_dtype is not None
+            else self.tensors[0].dtype
+        )
+        return (
+            OptStateTensor(name="o_adam_m", dtype=dtype),
+            OptStateTensor(name="o_adam_v", dtype=dtype),
+        )
+
+    def byte_size_for(
+        self, param_spec, dims: Mapping[str, int],
+    ) -> int:
+        total = 0
+        for p in param_spec.tensors:
+            numel = p.numel(dims)
+            for st in self.per_param_state_tensors(p, dims):
+                total += numel * st.dtype.itemsize
+        return total
+
+
 def _make_adamw_state_spec(dtype: torch.dtype) -> OptimizerStateSpec:
-    return OptimizerStateSpec(
+    return AdamWStateSpec(
         tensors=(
             OptStateTensor(name="o_adam_m", dtype=dtype),  # first moment
             OptStateTensor(name="o_adam_v", dtype=dtype),  # second moment
