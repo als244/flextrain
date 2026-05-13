@@ -171,6 +171,84 @@ def _build_embed(
     ))
 
 
+def _build_input_layer(
+    arch_module,
+    hf_config: Mapping[str, Any],
+    dims: Mapping,
+    hyperparams: Mapping,
+    *,
+    enable_multimodal,
+    freeze_modality_encoders: bool,
+    compute,
+    master,
+    grad,
+):
+    """Build either a plain :class:`TokenEmbedLayer` or a
+    :class:`MultimodalInputLayer` wrapping it, based on the arch
+    module's optional multimodal factories and the user's opt-in flag.
+
+    Decision matrix:
+
+    * ``enable_multimodal=False`` -> always text-only (the legacy path;
+      byte-identical to pre-multimodal flextrain regardless of whether
+      the checkpoint carries a vision tower).
+    * ``enable_multimodal=True`` -> require the arch module to expose
+      ``hf_config_to_vision_dims`` AND return non-None for this
+      checkpoint, else raise.
+    * ``enable_multimodal="auto"`` (default) -> multimodal iff the
+      arch module exposes the factories AND
+      ``hf_config_to_vision_dims(hf_config)`` returns non-None.
+
+    The arch contract (Phase 1, implemented for Qwen3.5/3.6):
+
+    * ``hf_config_to_vision_dims(hf_config) -> dict | None``.
+    * ``build_modality_encoders(vision_dims, hyperparams, frozen=True)
+      -> tuple[ModalityEncoder, ...]``.
+    * ``modality_splice_strategies(vision_dims, hyperparams)
+      -> tuple[tuple[SpliceForward, SpliceBackward], ...]``.
+
+    Arches without these factories never get a multimodal input layer.
+    """
+    text_embed = _build_embed(
+        dims, hyperparams,
+        compute=compute, master=master, grad=grad,
+    )
+    if enable_multimodal is False:
+        return text_embed
+    fn_vision_dims = getattr(arch_module, "hf_config_to_vision_dims", None)
+    fn_build = getattr(arch_module, "build_modality_encoders", None)
+    fn_splices = getattr(arch_module, "modality_splice_strategies", None)
+    if not (fn_vision_dims and fn_build and fn_splices):
+        if enable_multimodal is True:
+            raise ValueError(
+                f"arch {type(arch_module).__name__!s} does not implement the "
+                "multimodal factories (hf_config_to_vision_dims, "
+                "build_modality_encoders, modality_splice_strategies); "
+                "set enable_multimodal=False or 'auto'."
+            )
+        return text_embed
+    vision_dims = fn_vision_dims(hf_config)
+    if vision_dims is None:
+        if enable_multimodal is True:
+            raise ValueError(
+                "enable_multimodal=True but the HF config has no "
+                "vision_config; refusing to build a multimodal input layer."
+            )
+        return text_embed
+    encoders = fn_build(
+        vision_dims, hyperparams,
+        compute_dtype=compute,
+        frozen=freeze_modality_encoders,
+    )
+    splice_strategies = fn_splices(vision_dims, hyperparams)
+    from flextrain.nn.multimodal_input import MultimodalInputLayer
+    return MultimodalInputLayer(
+        text_embed=text_embed,
+        encoders=encoders,
+        splice_strategies=splice_strategies,
+    )
+
+
 def _build_head(dims: Mapping, hp: Mapping, *, compute, master, grad, norm_grad):
     from flextrain.nn.head import LMHead, LMHeadConfig
     return LMHead(LMHeadConfig(
@@ -227,6 +305,8 @@ def from_pretrained(
     min_chunk_size: int | None = None,
     max_chunk_size: int | None = None,
     moe_backend: object | None = None,
+    enable_multimodal: object = "auto",
+    freeze_modality_encoders: bool = True,
 ) -> ActiveModel:
     """Build a configured :class:`ActiveModel` for an HF model directory.
 
@@ -309,6 +389,7 @@ def from_pretrained(
         hyperparams=hyperparams,
         build_block=build_block,
         hf_config=hf_config,
+        arch_module=arch_module,
         optimizer=optimizer,
         max_seq_len=max_seq_len,
         max_global_batch_tokens=max_global_batch_tokens,
@@ -335,6 +416,8 @@ def from_pretrained(
         min_chunk_size=min_chunk_size,
         max_chunk_size=max_chunk_size,
         moe_backend=moe_backend,
+        enable_multimodal=enable_multimodal,
+        freeze_modality_encoders=freeze_modality_encoders,
         device=device,
         verbose=verbose,
         verbose_label="from_pretrained",
@@ -407,6 +490,7 @@ def _build_active_model(
     hyperparams: Mapping,
     build_block: BlockBuilder,
     hf_config: Mapping[str, Any],
+    arch_module: object = None,
     optimizer: Optimizer,
     max_seq_len: int,
     max_global_batch_tokens: int,
@@ -433,6 +517,8 @@ def _build_active_model(
     min_chunk_size: int | None,
     max_chunk_size: int | None,
     moe_backend: object | None,
+    enable_multimodal: object = False,
+    freeze_modality_encoders: bool = True,
     device: str,
     verbose: bool,
     verbose_label: str,
@@ -450,10 +536,29 @@ def _build_active_model(
     n_layers = int(dims["n_layers"])
 
     # Build embed + head + backbone.
-    embed = _build_embed(
-        dims, hyperparams,
-        compute=compute_dtype, master=master_dtype, grad=grad_dtype,
-    )
+    # Multimodal dispatch: if the arch module exposes the multimodal
+    # factories AND the HF config has a vision tower (and the caller
+    # didn't pass ``enable_multimodal=False``), wrap the text embed in
+    # a MultimodalInputLayer. Otherwise fall through to the historical
+    # text-only TokenEmbedLayer -- byte-identical to pre-multimodal
+    # behavior.
+    if arch_module is None:
+        embed = _build_embed(
+            dims, hyperparams,
+            compute=compute_dtype, master=master_dtype, grad=grad_dtype,
+        )
+    else:
+        embed = _build_input_layer(
+            arch_module=arch_module,
+            hf_config=hf_config,
+            dims=dims,
+            hyperparams=hyperparams,
+            enable_multimodal=enable_multimodal,
+            freeze_modality_encoders=freeze_modality_encoders,
+            compute=compute_dtype,
+            master=master_dtype,
+            grad=grad_dtype,
+        )
     head = _build_head(
         {**dims, "head_chunk_size": head_chunk_size},
         hyperparams,
@@ -518,6 +623,18 @@ def _build_active_model(
         hw_cost = _probe_result.hw_cost
         if mem_bw_gbps is None:
             mem_bw_gbps = _probe_result.mem_bw_gbps
+    # Multimodal: rough upper bound on per-round encoder GPU peak.
+    # Phase 1 uses a coarse heuristic: ~256 MiB per modality encoder
+    # (Qwen-VL ViT at depth=24 / hidden=1024 with up to ~4 images of
+    # ~1024 patches each peaks at ~250 MiB of transient activations).
+    # The planner adds this to the baseline GPU activation memory so
+    # activation rings don't oversize.
+    # TODO(multimodal): swap this for a per-encoder
+    # ``estimated_round_peak_bytes()`` call once we have real-data
+    # measurements -- see docs/internal/multimodal_session_notes.md.
+    mm_encoder_peak_bytes = 0
+    if hasattr(embed, "encoders") and getattr(embed, "encoders", None):
+        mm_encoder_peak_bytes = 256 * (1 << 20) * len(embed.encoders)
     working_set = determine_working_set_config(
         model_dims=dims,
         max_seq_len=max_seq_len,
@@ -540,6 +657,7 @@ def _build_active_model(
         embed_param_spec=embed.param_spec,
         head_param_spec=head.param_spec,
         layer_schemas=[layer.schema for layer in backbone],
+        mm_encoder_peak_bytes=mm_encoder_peak_bytes,
     )
 
     # Build engine.

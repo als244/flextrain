@@ -55,6 +55,7 @@ class Sequence:
         loss_mask: torch.Tensor | None = None,
         advantages: torch.Tensor | None = None,
         ref_logprobs: torch.Tensor | None = None,
+        modality_inputs: dict | None = None,
         seq_id: Any = None,
         loss_function: Any = None,
         pin_per_token_loss: bool = True,
@@ -68,6 +69,13 @@ class Sequence:
         self.loss_mask = loss_mask
         self.advantages = advantages
         self.ref_logprobs = ref_logprobs
+        # Multimodal extension: keyed by modality name (e.g. "image",
+        # "audio", "video"). Each value is a list of CPU-side per-item
+        # bundles -- see :mod:`flextrain.core.modality` for the
+        # concrete dataclass shapes. None / empty dict means text-only;
+        # the engine treats it the same as the historical behavior.
+        # Phase 1 ships only the "image" key (Qwen-VL family).
+        self.modality_inputs: dict[str, list] = modality_inputs or {}
         self.loss_function = loss_function
         # ``active_token_count`` = number of positions that contribute
         # to the loss = positions where ``targets != -100``. Cached
