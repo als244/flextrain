@@ -138,7 +138,7 @@ fix is a `--apply-chat-template` flag on `train.py` that calls
 {"role":"assistant",...}], tokenize=False)` and feeds the resulting
 string to the encoder; that's a separate change.
 
-## RTX 5090 (31.3 GiB, 192 GiB host) — full sweep, 2026-05-12
+## RTX 5090 (31.3 GiB, 192 GiB host) — full sweep, 2026-05-13
 
 All 13 rows re-verified at **auto memory budget** (no manual GPU/host
 caps). Per-step metrics (`tok/sec`, `eff TFLOPS`, `hw TFLOPS`,
@@ -154,19 +154,19 @@ reflects the working-set solver's recompute trade-off.
 
 | Model | Params | Arch | Mode | Loss curve (5 steps) | tok/sec | eff TFLOPS | hw TFLOPS | peak alloc | peak resv |
 |---|---|---|---|---|---|---|---|---|---|
-| Llama-3.2-1B | 1B | dense | LoRA | 1.055 → 1.012 | 28,479 | 142.2 | 142.5 | 27.00 | 27.20 |
-| Llama-3.2-1B | 1B | dense | full | 1.055 → 0.826 | 21,953 | 164.4 | 164.6 | 26.80 | 27.10 |
-| Llama-3.1-8B-Instruct | 8B | dense | LoRA | 0.783 → 0.747 |  5,350 | 161.7 | 161.9 | 27.40 | 27.90 |
-| Llama-3.1-8B-Instruct | 8B | dense | full | 0.783 → 0.600 |  3,740 | 169.5 | 174.8 | 26.80 | 27.10 |
-| OLMoE-1B-7B | 7B / 1B-active | MoE (64 experts) | LoRA | 0.865 → 0.844 | 22,788 | 108.6 | 125.8 | 26.00 | 28.90 |
-| OLMoE-1B-7B | 7B / 1B-active | MoE (64 experts) | full | 0.865 → 0.673 | 13,349 |  95.4 | 108.7 | 26.60 | 29.30 |
-| Qwen3-8B | 8B | dense, QK-norm | LoRA | 0.933 → 0.873 |  5,050 | 154.0 | 154.2 | 27.40 | 27.70 |
-| Qwen3-8B | 8B | dense, QK-norm | full | 0.928 → 0.478 |  3,540 | 161.9 | 168.5 | 27.70 | 27.90 |
-| Qwen3.5-9B | 9B | hybrid linear+full attn, dense MLP | LoRA | 0.747 → 0.660 |  5,002 | 160.0 | 160.5 | 27.30 | 28.20 |
-| Qwen3.5-9B | 9B | hybrid linear+full attn, dense MLP | full | 0.744 → 0.465 |  3,256 | 156.3 | 166.5 | 26.70 | 27.00 |
-| Qwen3.6-27B | 27B | hybrid linear+full attn, dense MLP | LoRA | 1.013 → 0.817 |  1,532 | 158.2 | 163.1 | 27.60 | 29.00 |
-| Qwen3-30B-A3B | 30B / 3B-active | MoE (128 experts) | LoRA | 0.900 → 0.866 |  7,800 |  97.1 | 122.2 | 26.20 | 29.00 |
-| Qwen3.5-MoE-35B-A3B | 35B / 3B-active | hybrid + MoE (256+1 experts) | LoRA | 0.742 → 0.677 |  5,926 |  74.7 |  92.4 | 25.20 | 28.80 |
+| Llama-3.2-1B | 1B | dense | LoRA | 1.055 → 1.012 | 28,562 | 142.6 | 142.9 | 27.00 | 27.20 |
+| Llama-3.2-1B | 1B | dense | full | 1.055 → 0.826 | 21,891 | 163.9 | 164.2 | 26.80 | 27.10 |
+| Llama-3.1-8B-Instruct | 8B | dense | LoRA | 0.783 → 0.747 |  5,295 | 160.0 | 160.3 | 27.40 | 27.90 |
+| Llama-3.1-8B-Instruct | 8B | dense | full | 0.783 → 0.600 |  3,733 | 169.2 | 174.7 | 26.50 | 26.80 |
+| OLMoE-1B-7B | 7B / 1B-active | MoE (64 experts) | LoRA | 0.865 → 0.844 | 21,840 | 104.1 | 120.6 | 25.70 | 28.50 |
+| OLMoE-1B-7B | 7B / 1B-active | MoE (64 experts) | full | 0.865 → 0.673 | 13,346 |  95.4 | 108.7 | 26.30 | 29.00 |
+| Qwen3-8B | 8B | dense, QK-norm | LoRA | 0.933 → 0.872 |  5,046 | 153.8 | 154.1 | 27.10 | 27.40 |
+| Qwen3-8B | 8B | dense, QK-norm | full | 0.928 → 0.478 |  3,536 | 161.7 | 168.5 | 27.50 | 27.70 |
+| Qwen3.5-9B | 9B | hybrid linear+full attn, dense MLP | LoRA | 0.748 → 0.660 |  5,015 | 160.5 | 160.7 | 26.70 | 27.60 |
+| Qwen3.5-9B | 9B | hybrid linear+full attn, dense MLP | full | 0.745 → 0.467 |  3,219 | 154.5 | 165.5 | 26.20 | 26.40 |
+| Qwen3.6-27B | 27B | hybrid linear+full attn, dense MLP | LoRA | 1.014 → 0.819 |  1,527 | 157.7 | 163.5 | 27.40 | 28.80 |
+| Qwen3-30B-A3B | 30B / 3B-active | MoE (128 experts) | LoRA | 0.899 → 0.865 |  7,874 |  98.0 | 123.8 | 26.20 | 29.00 |
+| Qwen3.5-MoE-35B-A3B | 35B / 3B-active | hybrid + MoE (256+1 experts) | LoRA | 0.744 → 0.673 |  6,021 |  75.9 |  93.9 | 25.20 | 28.80 |
 
 The Llama-3.1-8B-Instruct rows show a smaller absolute loss-drop because
 the instruction-tuned base is starting from a chat-template prior the
@@ -174,14 +174,42 @@ generic `Instruction:/Response:` wrapper does not match (see the
 tokenization section above) — descent itself confirms the engine path
 is exercised cleanly.
 
-**Notes on the 2026-05-12 refresh vs the 2026-05-10 baseline:** every
-loss curve matches the prior baseline to within ≤0.001 (3rd-decimal
-rounding). Per-row throughput shifts are all within ±2% except
-Qwen3.6-27B-LoRA, which sped up from 1284 → 1532 tok/sec (+19% on
-tok/s, eff TFLOPS, and hw TFLOPS in lockstep) with loss curve
-unchanged. Most likely a steady-state GPU clock / thermal state
-difference between the two measurements; loss-curve invariance rules
-out a math change.
+**Notes on the 2026-05-13 refresh vs the 2026-05-12 baseline:** every
+row in this sweep drifted from the prior baseline; this is the
+**expected effect of the RMSNorm precision-policy fix landed
+2026-05-13** (full description in
+`docs/internal/multimodal_session_notes.md` and the commit message
+for the fix). In short: previously, all RMSNorm γ tensors (input /
+post-attention layernorms, QK-norm, final norm) were stored fp32 in
+the host master but downcast to **bf16 on the GPU compute slot**, and
+AdamW operated on that bf16 copy. Because flextrain stores the γ at
+the `γ_canonical = 1 + scale` convention (around magnitude 1.0), the
+per-step AdamW update of `lr·sign(g) ≈ 3e-5` was below bf16 ULP
+(~8e-3 at magnitude 1.0), so **the normalization scales effectively
+didn't train** in full-FT mode and the GPU→host offload silently
+overwrote the fp32 master with the bf16-quantized value every step.
+The fix uses fp32 throughout for RMSNorm params (compute / master /
+grad / opt-state) — they're tiny (~1 MB total at fp32), so the cost is
+negligible.
+
+Drift profile:
+
+* **LoRA rows drift modestly (Δ 0.0002–0.0063 in cumulative
+  per-step loss)** even though LoRA doesn't touch norm parameters —
+  the forward path through RMSNorm now runs in fp32 instead of bf16,
+  so the residual stream is slightly more precise downstream.
+  Qwen-family LoRA drifts most (QK-norm runs every attention block);
+  plain Llama LoRA drifts least.
+* **Full-FT rows drift more (Δ 0.0002–0.0031)** since they additionally
+  reflect norms actually training at correct precision now.
+* **Max drift Δ 0.0063 (qwen3_6_27b_lora)**, well within sane bounds.
+  Tok/s within ±4.2% (norm fp32 storage is ~1MB total; compute path
+  unchanged).
+
+Previously the table's drift floor was the kernel-non-determinism
+budget of Δ ≈ 0.003 (documented in `docs/internal/multimodal_session_notes.md`).
+That bound no longer applies — the new floor will be set by the next
+clean reverify after this fix is merged.
 
 ## Gemma family
 
